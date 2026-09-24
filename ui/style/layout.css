@@ -1,0 +1,165 @@
+/* ── App Shell ────────────────────────────────────────────────── */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ── Header ───────────────────────────────────────────────────── */
+
+.header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  /* .header-left is absolutely positioned (see below), so .header-right is the
+     only in-flow child and is pushed to the right edge. */
+  justify-content: flex-end;
+  /* Left inset clears the macOS traffic-light cluster (close/min/max) that the
+     Overlay title-bar style floats over this header. */
+  padding: 10px 16px 10px 76px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+  /* Chromium-only (Windows WebView2). On macOS WKWebView this property is
+     ignored — dragging there comes from `data-tauri-drag-region` on the
+     header element. */
+  -webkit-app-region: drag;
+}
+
+.header button, .header input, .header select, .tabs button {
+  -webkit-app-region: no-drag;
+}
+
+/* The title/brand is centred in the bar, independent of the left and right
+   clusters: absolutely positioned so the asymmetric traffic-light padding
+   cannot shift it off-centre.
+
+   Tauri's injected drag handler walks `event.composedPath()` and treats an
+   element as draggable under a bare `data-tauri-drag-region`, so clicks that
+   land on this overlay resolve to the header underneath it and the window
+   still drags. `pointer-events: none` keeps that resolution unambiguous.
+   (`data-tauri-drag-region="deep"` would also work; the header's is bare.) */
+.header-left {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.logo-text {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: .01em;
+}
+
+.logo-ver {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.status-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 4px 10px;
+  background: var(--surface2);
+  border-radius: 20px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: background .3s;
+}
+
+.status-dot.running {
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success);
+}
+
+.status-dot.stopped {
+  background: var(--error);
+}
+
+/* ── Tabs ─────────────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 8px 16px 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.tab {
+  padding: 7px 16px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  transition: color .15s, background .15s;
+}
+
+.tab:hover {
+  color: var(--text);
+  background: var(--surface2);
+}
+
+.tab.active {
+  color: var(--accent);
+  background: var(--surface);
+  border-bottom: 2px solid var(--accent);
+  font-weight: 500;
+}
+
+/* ── Tab Panes ────────────────────────────────────────────────── */
+/* Every view is a pane. Only `.active` renders; the rest stay out of flow, so
+   a hidden pane can never contribute height or steal a keystroke.
+
+   Views that manage their own scrolling (logs) set `overflow: hidden` on
+   themselves via `.tab-content--fill`. */
+
+.tab-content {
+  display: none;
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  min-height: 0;
+}
+
+.tab-content.active {
+  display: block;
+}
+
+.tab-content.active.tab-content--fill {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}

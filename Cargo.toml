@@ -1,0 +1,75 @@
+[package]
+name = "proxy-rs"
+version = "1.7.0"
+edition = "2021"
+authors = [
+    "yudong22 (孙东) <3cking@163.com>",
+    "m0n0x41d (Ivan Zakutnii) <zakutnii.ivan@gmail.com>",
+]
+description = "High-performance AI protocol proxy (Anthropic Messages / OpenAI Responses & Chat) to OpenAI-compatible endpoints"
+license = "MIT"
+repository = "https://github.com/yudong22/anthropic-proxy-rs"
+
+[lib]
+name = "proxy_rs"
+path = "src/lib.rs"
+
+[workspace]
+members = [
+    "src-tauri",
+]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "sync", "net"] }
+
+# Web framework
+axum = { version = "0.7", features = ["http2"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async utilities
+futures = "0.3"
+async-stream = "0.3"
+
+# Observability
+tracing = "0.1"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Substring/line sanitization of outbound request bodies (port of Go sanitize.go
+# rewrite table so fingerprints in user/assistant/tool content and reasoning are
+# neutralized before they reach the upstream content filter).
+regex = "1"
+
+# Environment variables
+dotenvy = "0.15"
+
+# Server utilities
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# Async streams
+bytes = "1.9"
+
+# SQLite persistence for daily statistics
+rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2.189"
+
+[profile.release]
+opt-level = "z"        # Optimize for size
+lto = true             # Enable Link Time Optimization
+codegen-units = 1      # Better optimization
+strip = true           # Strip symbols for smaller binary
+panic = "abort"        # Smaller binary
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

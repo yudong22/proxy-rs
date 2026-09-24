@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Proxy RS</title>
+  <link rel="icon" type="image/svg+xml" href="assets/logo.svg">
+
+  <!-- Stylesheets load in cascade order: tokens define the variables every
+       later file reads, then reset, shell, shared components, and finally the
+       view-specific rules that are allowed to override components. -->
+  <link rel="stylesheet" href="style/tokens.css">
+  <link rel="stylesheet" href="style/base.css">
+  <link rel="stylesheet" href="style/layout.css">
+  <link rel="stylesheet" href="style/components.css">
+  <link rel="stylesheet" href="style/views.css">
+</head>
+
+<!--
+  This file is the shell only: the window chrome and one empty mount point per
+  view. Every view's markup is built by its module in src/views/, and the
+  overlays (modals, toasts, palette) are created on demand by src/components/.
+  Nothing here should need editing to add a field, a column or a dialog.
+
+  What stays HTML, and why:
+
+    header / tabs   Fixed window chrome. It exists before any module runs, and
+                    `data-tauri-drag-region` on the header is what makes the
+                    window draggable — cheaper and more robust than building it
+                    from script on every load.
+
+    #overlays       A single empty host. Modals append themselves here on first
+                    open, so their markup cannot drift from the code that
+                    drives them.
+-->
+<body>
+  <div class="app">
+    <!-- Tauri's injected drag handler walks `event.composedPath()`, so a click
+         landing on an interactive child (button/input) is excluded and anything
+         else resolves to this header. See style/layout.css. -->
+    <header class="header" data-tauri-drag-region>
+      <div class="header-left">
+        <div class="logo">
+          <img class="logo-icon" src="assets/logo.svg" width="22" height="22" alt="">
+          <span class="logo-text">Proxy RS</span>
+          <span class="logo-ver" id="app-version"></span>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="status-badge" id="status-badge">
+          <span class="status-dot stopped" id="status-dot"></span>
+          <span id="status-text">未启动</span>
+        </div>
+        <button class="btn btn-small btn-primary" id="btn-toggle-service">启动服务</button>
+        <button class="btn btn-small btn-palette" id="btn-open-palette" title="快捷菜单 (⌘K)" aria-label="快捷菜单">⋮</button>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabs"></nav>
+
+    <!-- One mount point per view; main.js fills these at boot. -->
+    <main class="tab-content" id="tab-overview"></main>
+    <main class="tab-content tab-content--fill" id="tab-logs"></main>
+    <main class="tab-content" id="tab-settings"></main>
+  </div>
+
+  <!-- Overlays create themselves here on first use. -->
+  <div id="overlays"></div>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>

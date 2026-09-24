@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ["*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-tauri:
+    strategy:
+      matrix:
+        include:
+          # Apple Silicon only. The Intel leg (`macos-13`,
+          # x86_64-apple-darwin) was removed: GitHub's `macos-13` pool is
+          # deprecated and starved, so the job sat queued with no runner ever
+          # assigned. Because `release` needs this matrix to finish, one
+          # unrunnable leg held the whole release hostage — v1.3.0's GitHub
+          # Release was blocked by it.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: macos-aarch64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Tauri CLI
+        run: npm ci
+
+      - name: Build desktop app and installer
+        run: npm run build:dmg -- --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+
+  release:
+    needs: [build-tauri]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/*
+
+# The `publish` job (crates.io) was removed: `CARGO_REGISTRY_TOKEN` was never
+# configured in this repository, so every tag push failed the whole run with
+# "please provide a non-empty token". Re-add it once the secret actually
+# exists — crates.io is meanwhile stuck at 1.2.0 because of this.

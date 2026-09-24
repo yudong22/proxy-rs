@@ -1,0 +1,527 @@
+/* ── Reset & Element Defaults ──────────────────────────────────── */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* The `hidden` attribute is only `display: none` at UA-stylesheet weight, so
+   any rule that sets `display` (`.pane { display: flex }`, `.logs-filter-row`)
+   silently wins and a "hidden" element keeps taking up space — two log panes
+   then share the tab's flex height. This restores the intent globally. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  font-family: var(--font-ui);
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--font-size);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  /* The window is a fixed-size app shell: the individual panes scroll, not the
+     document, so the header and tabs never move. */
+  user-select: none;
+  overflow: hidden;
+}
+
+code, pre, .mono {
+  font-family: var(--mono);
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+}
+
+/* ── Buttons ──────────────────────────────────────────────────── */
+
+.btn {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 14px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+  transition: all .15s;
+}
+
+.btn:hover {
+  border-color: var(--accent);
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.btn-small {
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+.btn-danger {
+  color: var(--error);
+  border-color: var(--danger-border);
+}
+
+.btn-danger:hover {
+  background: var(--danger-tint);
+  border-color: var(--error);
+}
+
+/* Three-dot quick-actions menu button (opens the ⌘K palette). */
+.btn-palette {
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  padding: 3px 9px;
+}
+
+.btn-show-hide {
+  padding: 0 10px;
+}
+
+.btn:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+/* Small inline "复制" affordance attached to a value in a <dd>. */
+.btn-copy {
+  background: var(--surface2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.btn-copy:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* ── Form Controls ────────────────────────────────────────────── */
+/* Shared by the log filters and the settings form: same box, different size. */
+
+.log-select, .log-input {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.log-input { width: 160px; }
+
+.hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+/* ── Toggle Switch ────────────────────────────────────────────── */
+
+.toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 44px;
+  height: 26px;
+  cursor: pointer;
+  /* The switch is the direct sibling of the checkbox it mirrors, so the
+     input:checked + .toggle-slider rules below bind. */
+  flex: 0 0 auto;
+}
+
+.toggle input {
+  position: absolute;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+
+.toggle-slider {
+  position: relative;
+  width: 44px;
+  height: 26px;
+  background: var(--surface2);
+  border-radius: 13px;
+  border: 1px solid var(--border);
+  transition: background .2s, border-color .2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
+  transition: transform .2s;
+}
+
+input:checked + .toggle-slider {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+input:checked + .toggle-slider::before {
+  transform: translateX(18px);
+}
+
+/* ── Badges & Pills ───────────────────────────────────────────── */
+
+.badge-pill {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-pill.status-2xx {
+  background: var(--success-tint);
+  color: var(--success);
+  border: 1px solid var(--success-tint-border);
+}
+
+.status-pill.status-4xx {
+  background: var(--warning-tint);
+  color: var(--warning);
+  border: 1px solid var(--warning-tint-border);
+}
+
+.status-pill.status-5xx {
+  background: var(--error-tint);
+  color: var(--error);
+  border: 1px solid var(--error-tint-border);
+}
+
+.stream-pill.stream-true {
+  background: var(--accent-tint);
+  color: var(--accent);
+  border: 1px solid var(--accent-tint-border);
+}
+
+.stream-pill.stream-false {
+  background: var(--neutral-tint);
+  color: var(--muted);
+  border: 1px solid var(--neutral-tint-border);
+}
+
+/* One colour per client dialect, so a mixed log can be scanned by hue even
+   before the dropdown is touched. These hues are brand colours and are
+   deliberately not tokenised. */
+.client-pill {
+  background: rgba(120, 130, 150, .14);
+  color: var(--muted);
+  border: 1px solid rgba(120, 130, 150, .25);
+  font-size: 10px;
+  padding: 1px 6px;
+  flex: 0 0 auto;
+}
+
+.client-pill.client-codex {
+  background: rgba(16, 163, 127, .12);
+  color: #10a37f;
+  border-color: rgba(16, 163, 127, .3);
+}
+
+.client-pill.client-claude {
+  background: rgba(216, 119, 76, .14);
+  color: #d8774c;
+  border-color: rgba(216, 119, 76, .32);
+}
+
+.client-pill.client-dsh {
+  background: rgba(90, 130, 220, .14);
+  color: #5a82dc;
+  border-color: rgba(90, 130, 220, .32);
+}
+
+/* ── Overlays: Modal / Confirm / Toast / Palette ──────────────── */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim);
+  backdrop-filter: blur(4px);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-overlay.active {
+  display: flex;
+}
+
+.modal-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: 580px;
+  max-width: 90vw;
+  max-height: 85vh;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: modal-in .15s ease-out;
+}
+
+@keyframes modal-in {
+  from { opacity: 0; transform: scale(.97); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+}
+
+.modal-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.btn-close {
+  background: transparent;
+  border: none;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.btn-close:hover {
+  color: var(--text);
+}
+
+.modal-body {
+  padding: 16px 18px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--surface2);
+}
+
+/* Confirmation dialog: narrower than the detail modal, since it carries one
+   question and two buttons. */
+.confirm-card {
+  width: 380px;
+}
+
+.confirm-card .modal-body {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* Toasts: transient feedback, stacked bottom-right so they do not cover the
+   toolbar the action came from. */
+.toast-host {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 2000;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  min-width: 200px;
+  max-width: 360px;
+  padding: 9px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: var(--shadow);
+  animation: toast-in .16s ease-out;
+}
+
+.toast.toast-ok {
+  border-left: 3px solid var(--success);
+}
+
+.toast.toast-error {
+  border-left: 3px solid var(--error);
+}
+
+/* Action button inside a toast (e.g. a confirm step). Sits to the right of the
+   message; the host already sets pointer-events: none, so this re-enables
+   clicks on the button itself. */
+.toast-action {
+  margin-left: 12px;
+  padding: 3px 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.toast-action:hover {
+  background: var(--accent-hover);
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Command Palette (⌘K). Anchored near the top rather than centred, so the
+   list grows downward without the input moving. */
+.palette-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: var(--scrim-light);
+  z-index: 100;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+}
+
+.palette-overlay.open {
+  display: flex;
+}
+
+.palette {
+  width: 460px;
+  max-width: 90vw;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-palette);
+  overflow: hidden;
+}
+
+.palette-input {
+  width: 100%;
+  padding: 12px 14px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  font-family: inherit;
+  user-select: text;
+}
+
+.palette-list {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.palette-item {
+  padding: 9px 14px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+}
+
+.palette-item:hover, .palette-item.selected {
+  background: var(--surface2);
+}
+
+.palette-item kbd {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 2px 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--muted);
+}
+
+/* ── Utility ──────────────────────────────────────────────────── */
+
+/* Shown when a list has no rows to render. */
+.table-empty {
+  text-align: center;
+  padding: 40px 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.test-result {
+  margin-top: 10px;
+  font-size: 12px;
+  font-family: var(--mono);
+  min-height: 18px;
+}
+.test-result.ok { color: var(--success); }
+.test-result.err { color: var(--error); }
+
+.save-status {
+  font-size: 12px;
+  min-height: 16px;
+}
+.save-status.ok { color: var(--success); }
+.save-status.err { color: var(--error); }
+
+.log-count { font-size: 12px; color: var(--muted); }
+
+.auto-scroll-label {
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  /* Never let the flex row squeeze this: the checkbox and its label would
+     overlap their neighbours instead of wrapping. */
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.actions-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}

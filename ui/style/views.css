@@ -1,0 +1,240 @@
+/* Styles for the individual views. Anything genuinely shared lives in
+   components.css instead; this file is the seam a new view's styles go into. */
+
+/* ── Overview: cache-hit drill-down ───────────────────────────── */
+
+.stat-detail {
+  margin-top: -4px;
+}
+
+/* ── Settings: form ───────────────────────────────────────────── */
+
+.settings-form {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  box-shadow: var(--shadow-sm);
+}
+
+/* Each settings group is a <details>, so it collapses without any JS. The
+   native disclosure triangle is replaced by a rotating "▾" in the summary.
+   Written as `details.form-section` rather than `fieldset.form-section` so the
+   markup that `views/settings.js` builds matches the rules here. */
+details.form-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0;
+  margin-bottom: 14px;
+  overflow: hidden;
+  background: transparent;
+}
+
+details.form-section > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface2);
+  list-style: none;
+  user-select: none;
+}
+
+/* WebKit renders its own marker; remove it in favour of .form-section-caret. */
+details.form-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.form-section > summary:hover {
+  color: var(--text);
+}
+
+/* A CSS triangle rather than a glyph: "▾" renders at inconsistent sizes and
+   baselines across the fonts this app can land on (and in the webview's
+   fallback), so the marker is drawn instead of typed. Points right while
+   collapsed, down while open — the state reads without colour or weight. */
+.form-section-caret {
+  width: 0;
+  height: 0;
+  flex: 0 0 auto;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  transition: transform .15s;
+}
+
+.form-section[open] > summary .form-section-caret {
+  transform: rotate(90deg);
+}
+
+details.form-section[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+
+/* Appended to a collapsed group's title when it holds a non-default value, so
+   a changed setting is visible without expanding the group. */
+.form-section-badge {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--accent);
+  background: var(--accent-tint);
+  border: 1px solid var(--accent-tint-border);
+  border-radius: 10px;
+  padding: 1px 7px;
+}
+
+.form-section-body {
+  padding: 12px 14px;
+}
+
+.form-group {
+  margin-bottom: 10px;
+}
+
+.form-group:last-child {
+  margin-bottom: 0;
+}
+
+.form-group label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.form-group input, .form-group select {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  font-family: inherit;
+  user-select: text;
+}
+
+.form-group input:focus, .form-group select:focus {
+  border-color: var(--accent);
+}
+
+.form-row {
+  display: flex;
+  gap: 12px;
+}
+
+.form-row .half {
+  flex: 1;
+}
+
+.input-with-btn {
+  display: flex;
+  gap: 4px;
+  width: 100%;
+}
+
+.input-with-btn input {
+  flex: 1;
+}
+
+.setting-item-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.setting-item-inline:last-child {
+  padding-bottom: 0;
+}
+
+.setting-label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.setting-desc {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.models-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.model-chip {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+  font-size: 11px;
+  font-family: var(--mono);
+  cursor: pointer;
+  user-select: text;
+}
+
+.model-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.settings-save-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+/* ── Logs: console view ───────────────────────────────────────── */
+
+/* The logs tab is the one view whose toolbar is its own first row, so the
+   pane's 16px top padding reads as a gap between the tab bar and the toolbar
+   rather than as padding around content. Zero it and let the toolbar keep its
+   own bottom margin. */
+#tab-logs.tab-content {
+  padding-top: 0;
+}
+
+/* The console pane fills the logs tab below its own subbar. The `hidden`
+   attribute is what switches it off, and base.css's `[hidden]` rule outranks
+   the `display: flex` set here — without that, both log panes would share the
+   tab's flex height. */
+.logs-console-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Mirrors .logs-filter-row so both log views have the same two-row rhythm:
+   filters on the left, status and actions pushed to the right. */
+.console-subbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+/* Pushes 自动滚动 to the right edge of the subbar, matching .logs-actions. */
+.auto-scroll-label--end {
+  margin-left: auto;
+}
+
+/* The provider group's action buttons sit under its last field rather than
+   flush against it. */
+.form-actions {
+  margin-top: 8px;
+}

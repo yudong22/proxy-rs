@@ -1,0 +1,467 @@
+/* ── Metric Cards ─────────────────────────────────────────────── */
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.metric-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  box-shadow: var(--shadow-sm);
+}
+
+.metric-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.metric-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-card.running .metric-value { color: var(--success); }
+.metric-card.stopped .metric-value { color: var(--error); }
+
+/* A card that expands a detail panel below it (the cache-hit drill-down). */
+.metric-card.clickable {
+  cursor: pointer;
+  transition: border-color .15s, box-shadow .15s;
+}
+
+.metric-card.clickable:hover,
+.metric-card.clickable.active {
+  border-color: var(--accent);
+  box-shadow: var(--shadow);
+}
+
+.stat-caret {
+  display: inline-block;
+  font-size: 9px;
+  transition: transform .15s;
+}
+
+.metric-card.clickable.active .stat-caret {
+  transform: rotate(180deg);
+}
+
+/* ── Section & Key/Value List ─────────────────────────────────── */
+
+.section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 14px;
+}
+
+.section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .04em;
+  margin-bottom: 12px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 8px 16px;
+  font-size: 12px;
+}
+
+.kv dt {
+  color: var(--muted);
+  align-self: center;
+}
+
+.kv dd {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: text;
+}
+
+/* ── Log Pane Chrome (shared by the table and console views) ──── */
+/* Both log views are laid out the same way: a toolbar row, an optional
+   filter/action row, then one scrolling pane that fills the rest. */
+
+.logs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+.logs-filter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+.logs-filter-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Count + 实时刷新 + 清空记录, kept together and pushed to the right edge of
+   the filter row (margin-left:auto also right-aligns it if it wraps onto its
+   own line). */
+.logs-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+.view-mode-group {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--surface2);
+}
+
+.btn-toggle {
+  background: transparent;
+  border: none;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all .15s ease;
+}
+
+.btn-toggle.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ── Data Table ───────────────────────────────────────────────── */
+
+.pane {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  /* Fill the remaining tab height, with a floor so a short window still shows
+     a usable number of rows instead of collapsing to nothing. */
+  flex: 1;
+  min-height: 260px;
+}
+
+.table-responsive {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: auto;
+  min-height: 0;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 12px;
+  /* Fixed layout makes a cell obey its column width instead of widening to fit,
+     which is what lets every cell clip rather than paint over its neighbour.
+     The .col-* rules below carry the column widths and floors. */
+  table-layout: fixed;
+}
+
+.data-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface2);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  z-index: 2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 会话 column: width is bounded here rather than inline on the <th>. It scales
+   with the table (12%) but is clamped so it never leaves the 80–120px range —
+   wide enough for the client pill plus a short id, narrow enough to leave the
+   model column room. */
+.data-table thead th.col-session {
+  width: clamp(80px, 12%, 120px);
+}
+
+/* Input column: grows to 9% on a wide table but is never narrower than 120px.
+   `max()` rather than `min-width` because a fixed-layout table sizes columns
+   from `width`, so a bare min-width would not bind. */
+.data-table thead th.col-input {
+  width: max(120px, 9%);
+  text-align: right;
+}
+
+/* 模型 ID / 路径 keeps only a small floor — 80px, deliberately below the Input
+   column's 120px — so it is the first column to give up space on a narrow
+   window, while 18% keeps it roomy on a wide one. */
+.data-table thead th.col-model {
+  width: max(80px, 18%);
+}
+
+.data-table thead th.col-time { width: 10%; }
+.data-table thead th.col-output { width: 9%; text-align: right; }
+.data-table thead th.col-duration { width: 8%; text-align: right; }
+.data-table thead th.col-streamed { width: 10%; text-align: center; }
+.data-table thead th.col-status { width: 10%; text-align: center; }
+.data-table thead th.col-actions { width: 8%; text-align: center; }
+
+.data-table tbody tr {
+  border-bottom: 1px solid var(--border);
+  transition: background-color .1s ease;
+}
+
+.data-table tbody tr:hover {
+  background: var(--surface2);
+}
+
+.data-table tbody tr.row-error {
+  background: var(--error-row-bg);
+}
+
+.data-table tbody tr.row-error:hover {
+  background: var(--error-row-bg-hover);
+}
+
+/* Every cell clips to its column and renders the overflow as an ellipsis:
+   `table-layout: fixed` forbids a cell from widening, so without this an
+   over-long value would either paint over its neighbour or be hard-cut. */
+.data-table td {
+  padding: 8px 10px;
+  vertical-align: middle;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.data-table td.cell-center { text-align: center; }
+
+.cell-time {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.cell-model-box {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Fills its column and is allowed to shrink; the column width (the flexible
+     remainder of the header) decides how much room the model id gets. */
+  min-width: 0;
+  max-width: 100%;
+}
+
+.cell-model {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.cell-route {
+  font-size: 10px;
+  color: var(--muted);
+  font-family: var(--mono);
+  /* Must clip like the model id above it: a nowrap line with visible overflow
+     would paint straight across the next column. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The client pill keeps its natural size and the id ellipsizes beside it. There
+   is deliberately no min-width floor here — the box must fit inside its own
+   column instead of spilling over the model column. */
+.cell-session-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.cell-session {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Required so the flex item can shrink to its ellipsis instead of pushing
+     the column wider than its min-width. */
+  min-width: 0;
+}
+
+.cell-session-none {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.cell-num {
+  font-family: var(--mono);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cell-cache-hint {
+  font-size: 10px;
+  color: var(--muted);
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cell-duration {
+  font-family: var(--mono);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.btn-inspect {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--accent);
+  cursor: pointer;
+  transition: all .15s ease;
+}
+
+.btn-inspect:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.table-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--surface2);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.pagination-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+/* ── Console View ─────────────────────────────────────────────── */
+
+.logs-container {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  font: 12px/1.6 var(--mono);
+  user-select: text;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-line .ts { color: var(--muted); }
+.log-line .lvl { font-weight: 600; }
+.log-line.ERROR .lvl, .log-line.ERROR .msg { color: var(--error); }
+.log-line.WARN .lvl, .log-line.WARN .msg { color: var(--warning); }
+.log-line.INFO { opacity: .88; }
+
+/* ── Detail Table (request modal) ─────────────────────────────── */
+
+.detail-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.detail-table td {
+  padding: 6px 4px;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-table tr:last-child td {
+  border-bottom: none;
+}
+
+.detail-key {
+  width: 120px;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.detail-val {
+  color: var(--text);
+  font-family: var(--mono);
+  word-break: break-all;
+}
+
+.error-block {
+  margin-top: 8px;
+  padding: 10px;
+  background: var(--error-block-bg);
+  border: 1px solid var(--error-block-border);
+  border-radius: var(--radius-sm);
+  color: var(--error);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+}

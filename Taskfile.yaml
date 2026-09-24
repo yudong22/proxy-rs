@@ -1,0 +1,231 @@
+version: '3'
+
+vars:
+  APP_NAME: Proxy RS
+  APP_BIN: proxy-rs-gui
+  BUNDLE_DIR: target/release/bundle/macos
+  INSTALL_APP: /Applications/{{.APP_NAME}}.app
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  # ── Desktop app ──────────────────────────────────────────────────────────
+  setup:
+    desc: Install the pinned Tauri CLI (Node dev dependency)
+    sources:
+      - package.json
+      - package-lock.json
+    generates:
+      - node_modules/.package-lock.json
+    cmds:
+      - npm ci
+
+  dev:
+    desc: Start the Tauri 2 GUI in development mode, isolated from the installed app (port 3477)
+    aliases: [gui-dev]
+    deps: [setup]
+    cmds:
+      # A dev run must not fight the installed app. Three things are separated:
+      #
+      #   1. Data dir — otherwise it loads the same ~/.proxy-rs/gui-settings.json
+      #      (and its port) and writes request stats into the same stats.db.
+      #      PROXY_DATA_DIR relocates settings, stats, logs and .env
+      #      together.
+      #   2. Single-instance socket — the plugin keys off the bundle identifier,
+      #      so npm run dev passes tauri.dev.conf.json to give this build its own
+      #      identifier. Without that, launching dev connects to the installed
+      #      app's socket, exits(0), and just focuses the installed window.
+      #   3. Window title / product name — so the two are told apart in the Dock
+      #      and menu bar.
+      #
+      # The settings file is written once and then left alone: edit
+      # ~/.proxy-rs-dev/gui-settings.json to change the port, or set
+      # PROXY_DEV_PORT for the first run only.
+      - |
+        DEV_DIR="${PROXY_DATA_DIR:-${ANTHROPIC_PROXY_DATA_DIR:-$HOME/.proxy-rs-dev}}"
+        DEV_SETTINGS="$DEV_DIR/gui-settings.json"
+        mkdir -p "$DEV_DIR"
+
+        if [ ! -f "$DEV_SETTINGS" ]; then
+          PORT="${PROXY_DEV_PORT:-${ANTHROPIC_PROXY_DEV_PORT:-3477}}"
+          printf '%s\n' \
+            '{' \
+            '  "provider_id": "workbuddy-cn",' \
+            '  "custom_url": "",' \
+            '  "api_key": "",' \
+            "  \"port\": $PORT," \
+            '  "bind": "127.0.0.1",' \
+            '  "reasoning_model": "",' \
+            '  "completion_model": "",' \
+            '  "model_map": "",' \
+            '  "launch_at_login": false,' \
+            '  "sanitize_terms": ""' \
+            '}' > "$DEV_SETTINGS"
+          echo "🧪 Created $DEV_SETTINGS (port $PORT)"
+        fi
+
+        DEV_PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$DEV_SETTINGS" | head -1)
+        echo "🧪 Dev data dir : $DEV_DIR"
+        echo "🧪 Dev console  : http://127.0.0.1:${DEV_PORT:-3477}"
+        echo "🧪 Installed app keeps $HOME/.proxy-rs untouched"
+        echo
+        PROXY_DATA_DIR="$DEV_DIR" npm run dev
+
+  build:
+    desc: Build the Tauri 2 GUI desktop app (.app)
+    aliases: [gui-build]
+    deps: [setup]
+    cmds:
+      - npm run build
+
+  build-dmg:
+    desc: Build the Tauri 2 GUI desktop installer (.dmg)
+    aliases: [gui-build-dmg]
+    deps: [setup]
+    cmds:
+      - npm run build:dmg
+
+  install:
+    desc: Build the .app and replace {{.INSTALL_APP}} (restarts it if running)
+    aliases: [gui-install, local-install]
+    deps: [build]
+    cmds:
+      - |
+        TARGET_APP="{{.BUNDLE_DIR}}/{{.APP_NAME}}.app"
+
+        WAS_RUNNING=0
+        if pgrep -x "{{.APP_BIN}}" > /dev/null 2>&1 || pgrep -afil "{{.APP_NAME}}.app" > /dev/null 2>&1; then
+          WAS_RUNNING=1
+          echo "🔄 Stopping running {{.APP_NAME}}..."
+          killall "{{.APP_BIN}}" 2>/dev/null || true
+          pkill -afil "{{.APP_NAME}}.app" 2>/dev/null || true
+          sleep 1
+        fi
+
+        echo "📦 Installing to {{.INSTALL_APP}}..."
+        rm -rf "{{.INSTALL_APP}}"
+        cp -R "${TARGET_APP}" "{{.INSTALL_APP}}"
+
+        if [ $WAS_RUNNING -eq 1 ]; then
+          echo "🚀 Restarting {{.APP_NAME}}..."
+          open "{{.INSTALL_APP}}"
+        fi
+        echo "✅ Installed to {{.INSTALL_APP}}"
+
+  uninstall:
+    desc: Remove the installed desktop app
+    cmds:
+      - rm -rf "{{.INSTALL_APP}}"
+      - echo "✅ Uninstalled {{.APP_NAME}}"
+
+  # ── Quality gate ─────────────────────────────────────────────────────────
+  fmt:
+    desc: Format code
+    cmds:
+      - cargo fmt
+
+  fmt-check:
+    desc: Check code formatting
+    cmds:
+      - cargo fmt -- --check
+
+  lint:
+    desc: Run clippy linter
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+
+  lint-fix:
+    desc: Run clippy with auto-fix
+    cmds:
+      - cargo clippy --fix --allow-dirty --allow-staged
+
+  test:
+    desc: Run all tests
+    cmds:
+      - cargo test
+
+  test-verbose:
+    desc: Run tests with verbose output
+    cmds:
+      - cargo test -- --nocapture --test-threads=1
+
+  check:
+    desc: Run all checks (fmt, lint, test)
+    cmds:
+      - task: fmt-check
+      - task: lint
+      - task: test
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - cargo clean
+      - echo "✅ Cleaned build artifacts"
+
+  # ── Maintenance ──────────────────────────────────────────────────────────
+  watch:
+    desc: Watch and auto-restart the GUI on changes
+    cmds:
+      - cargo watch -x "run -p proxy-rs-gui"
+
+  audit:
+    desc: Check for security vulnerabilities
+    cmds:
+      - cargo audit
+
+  update:
+    desc: Update dependencies
+    cmds:
+      - cargo update
+
+  outdated:
+    desc: Check for outdated dependencies
+    cmds:
+      - cargo outdated
+
+  tree:
+    desc: Show dependency tree
+    cmds:
+      - cargo tree
+
+  doc:
+    desc: Generate and open documentation
+    cmds:
+      - cargo doc --open --no-deps
+
+  bench:
+    desc: Run benchmarks (if any)
+    cmds:
+      - cargo bench
+
+  size:
+    desc: Show the built binary size
+    deps: [build]
+    cmds:
+      - ls -lh {{.BUNDLE_DIR}}/{{.APP_NAME}}.app/Contents/MacOS/{{.APP_BIN}} | awk '{print "Binary size:", $5}'
+
+  release:
+    desc: Prepare a release (clean, check, build)
+    cmds:
+      - task: clean
+      - task: check
+      - task: build
+      - task: size
+      - echo "✅ Release app ready at {{.BUNDLE_DIR}}/{{.APP_NAME}}.app"
+
+  help:
+    desc: Show help information
+    cmds:
+      - echo "proxy-rs - High-performance AI protocol proxy (desktop app & core library)"
+      - echo ""
+      - echo "Common tasks:"
+      - echo "  task dev            - Start the GUI in development mode"
+      - echo "  task build          - Build the .app bundle"
+      - echo "  task build-dmg      - Build the .dmg installer"
+      - echo "  task install        - Build and install to /Applications"
+      - echo "  task test           - Run tests"
+      - echo "  task check          - Run all checks"
+      - echo "  task clean          - Clean build artifacts"
