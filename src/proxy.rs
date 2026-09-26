@@ -744,11 +744,17 @@ async fn forward_request(
                 openai_req.model
             );
 
-            let mut req_builder = client
-                .post(url)
-                .json(&openai_req)
-                .timeout(Duration::from_secs(300));
+            let mut req_builder = client.post(url).json(&openai_req);
             req_builder = apply_upstream_auth(req_builder, &config, &api_key);
+            if !streaming {
+                // Streaming requests get no per-request timeout on purpose: a
+                // total timeout hard-kills any stream that outlives it — exactly
+                // the "Codex occasionally dies mid-run" symptom when a long
+                // generation exceeds the limit. Stalls are instead caught by the
+                // shared client's idle `read_timeout` (see the GUI client
+                // builder), which only fires when the upstream stops sending.
+                req_builder = req_builder.timeout(Duration::from_secs(300));
+            }
 
             let upstream_start = Instant::now();
             let response = match req_builder.send().await {
@@ -1492,10 +1498,10 @@ async fn retry_as_stream(
         include_usage: true,
     });
 
-    let builder = client
-        .post(url)
-        .json(&streamed_req)
-        .timeout(Duration::from_secs(300));
+    let builder = client.post(url).json(&streamed_req);
+    // Always a streamed response here, so no total timeout: it would kill any
+    // stream outliving it. The shared client's idle read_timeout covers stalls
+    // — see forward_request for the rationale.
     let response = apply_upstream_auth(builder, config, api_key)
         .send()
         .await
@@ -1949,7 +1955,7 @@ fn create_flavor_sse_stream(
                                                     break;
                                                 }
                                                 ApiFlavor::Responses => {
-                                                    if let Some(state) = responses_state.as_ref() {
+                                                    if let Some(state) = responses_state.as_mut() {
                                                         for event in responses_pipeline::translate_stream_error(
                                                             state,
                                                             format!("Upstream error: {}", summary),
@@ -1994,7 +2000,7 @@ fn create_flavor_sse_stream(
                         }
                         ApiFlavor::Responses => {
                             tracing::error!("Stream error: {}", e);
-                            if let Some(state) = responses_state.as_ref() {
+                            if let Some(state) = responses_state.as_mut() {
                                 for event in responses_pipeline::translate_stream_error(
                                     state,
                                     format!("Stream error: {}", e),

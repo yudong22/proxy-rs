@@ -552,6 +552,11 @@ pub struct ResponsesStreamState {
     created_emitted: bool,
     text_item_started: bool,
     text_item_id: String,
+    /// Output index assigned when the text item was opened. Events for the
+    /// text item must echo it: a model that streams a tool call *before* text
+    /// gets a text index above 0, and a hardcoded 0 corrupts the client's
+    /// item accounting (Codex drops or mis-associates the item).
+    text_item_output_index: usize,
     accumulated_text: String,
     active_tool_calls: Vec<StreamingToolCall>,
     output_index_counter: usize,
@@ -579,6 +584,7 @@ pub fn initial_stream_state(fallback_model: String) -> ResponsesStreamState {
         created_emitted: false,
         text_item_started: false,
         text_item_id: generate_id("msg"),
+        text_item_output_index: 0,
         accumulated_text: String::new(),
         active_tool_calls: Vec::new(),
         output_index_counter: 0,
@@ -669,6 +675,7 @@ pub fn translate_stream_chunk(
         if !content.is_empty() {
             if !state.text_item_started {
                 state.text_item_started = true;
+                state.text_item_output_index = state.output_index_counter;
                 let output_index = state.output_index_counter;
                 state.output_index_counter += 1;
 
@@ -699,7 +706,7 @@ pub fn translate_stream_chunk(
             events.push(responses::ResponsesStreamEvent::OutputTextDelta {
                 response_id: state.response_id.clone(),
                 item_id: state.text_item_id.clone(),
-                output_index: 0,
+                output_index: state.text_item_output_index,
                 content_index: 0,
                 delta: content.clone(),
             });
@@ -797,14 +804,14 @@ fn close_stream_items(state: &mut ResponsesStreamState) -> Vec<responses::Respon
         events.push(responses::ResponsesStreamEvent::OutputTextDone {
             response_id: state.response_id.clone(),
             item_id: state.text_item_id.clone(),
-            output_index: 0,
+            output_index: state.text_item_output_index,
             content_index: 0,
             text: state.accumulated_text.clone(),
         });
 
         events.push(responses::ResponsesStreamEvent::OutputItemDone {
             response_id: state.response_id.clone(),
-            output_index: 0,
+            output_index: state.text_item_output_index,
             item: responses::OutputItem::Message {
                 id: state.text_item_id.clone(),
                 status: "completed".to_string(),
@@ -921,10 +928,17 @@ pub fn translate_stream_done(
 }
 
 /// Translates a stream error into `response.failed`.
+///
+/// Takes `&mut` and marks the state finalized: the failure event *is* the
+/// terminal event for the turn. Without the flag, the end-of-stream path also
+/// emits `response.completed` after `response.failed`, and a client that
+/// honours both closes the turn with an empty completed response instead of
+/// the error.
 pub fn translate_stream_error(
-    state: &ResponsesStreamState,
+    state: &mut ResponsesStreamState,
     error_message: String,
 ) -> Vec<responses::ResponsesStreamEvent> {
+    state.finalized = true;
     vec![responses::ResponsesStreamEvent::Failed {
         response_id: state.response_id.clone(),
         error: responses::StreamErrorDetail {
@@ -1741,6 +1755,64 @@ mod tests {
 
         let done_events = translate_stream_done(&mut state);
         assert!(done_events.is_empty(), "Already finalized");
+    }
+
+    #[test]
+    fn text_item_output_index_follows_the_counter() {
+        // A model that streams a tool call *before* text gives the text item an
+        // index above 0. Every text event must echo that index: a hardcoded 0
+        // corrupts the client's item accounting (Codex drops the item).
+        let mut state = initial_stream_state("gpt-4o".to_string());
+        translate_stream_chunk(&mut state, &tool_chunk(0, Some("call_1"), Some("shell")));
+        let delta_events = translate_stream_chunk(&mut state, &upstream_chunk("Done.", None));
+
+        // The text item was assigned output_index 1 (after the tool call's 0),
+        // and the delta must carry it.
+        assert!(delta_events.iter().any(|e| matches!(
+            e,
+            responses::ResponsesStreamEvent::OutputTextDelta { output_index: 1, .. }
+        )));
+
+        // The close events must echo the same index.
+        let done_events = translate_stream_done(&mut state);
+        assert!(done_events.iter().any(|e| matches!(
+            e,
+            responses::ResponsesStreamEvent::OutputTextDone { output_index: 1, .. }
+        )));
+        assert!(done_events.iter().any(|e| matches!(
+            e,
+            responses::ResponsesStreamEvent::OutputItemDone {
+                output_index: 1,
+                item: responses::OutputItem::Message { .. },
+                ..
+            }
+        )));
+        // While the tool call keeps its own index 0.
+        assert!(done_events.iter().any(|e| matches!(
+            e,
+            responses::ResponsesStreamEvent::OutputItemDone {
+                output_index: 0,
+                item: responses::OutputItem::FunctionCall { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn failed_stream_does_not_also_emit_completed() {
+        // `response.failed` is terminal. Without flagging it, the end-of-stream
+        // path appended `response.completed` with empty output after the
+        // failure, and clients honouring both closed the turn empty.
+        let mut state = initial_stream_state("gpt-4o".to_string());
+        let failed = translate_stream_error(&mut state, "boom".to_string());
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].event_type(), "response.failed");
+
+        let after = translate_stream_done(&mut state);
+        assert!(
+            after.is_empty(),
+            "nothing may follow response.failed: {after:?}"
+        );
     }
 
     #[test]

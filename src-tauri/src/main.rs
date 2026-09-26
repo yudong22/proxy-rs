@@ -831,7 +831,11 @@ fn main() {
     let wants_launch_at_login = settings.launch_at_login;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        // Idle (read) timeout rather than a total one: a total timeout hard-kills
+        // any upstream SSE stream that outlives it, cutting long Codex/Claude
+        // turns off mid-response. The read timeout only fires when the upstream
+        // stops sending data, which is the stall actually worth aborting.
+        .read_timeout(std::time::Duration::from_secs(300))
         .connect_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(10)
         .build()

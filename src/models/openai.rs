@@ -266,6 +266,10 @@ pub struct StreamChunk {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChoice {
+    /// Some upstreams omit `index` on a single-choice chunk; defaulting keeps
+    /// the frame parseable instead of discarding a whole SSE frame (and with
+    /// it the text/tool-call delta the client still needs).
+    #[serde(default)]
     pub index: usize,
     pub delta: Delta,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,6 +292,9 @@ pub struct Delta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaToolCall {
+    /// Same rationale as `StreamChoice::index`: a missing `index` on a
+    /// single-call delta must not cost the whole frame.
+    #[serde(default)]
     pub index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -351,5 +358,33 @@ mod usage_tests {
         let usage = chunk.usage.expect("usage present");
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.prompt_tokens, 0);
+    }
+
+    #[test]
+    fn stream_chunk_without_choice_index_parses() {
+        // Some upstreams emit single-choice chunks without `"index"`. A required
+        // `index` failed the whole frame, and the framer silently discarded it —
+        // the text/tool-call delta inside never reached the client.
+        let json = r#"{"id":"c1","model":"m","choices":[{"delta":{"content":"hi"}}]}"#;
+        let chunk: StreamChunk = serde_json::from_str(json).expect("missing index must default");
+        assert_eq!(chunk.choices[0].index, 0);
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn tool_call_delta_without_index_parses() {
+        // Same failure mode on the tool-call delta: a missing `index` used to
+        // cost the entire frame, truncating the streamed tool call mid-flight.
+        let json = r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+            {"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}
+        ]}}]}"#;
+        let chunk: StreamChunk = serde_json::from_str(json).expect("missing index must default");
+        let call = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.index, 0);
+        assert_eq!(call.id.as_deref(), Some("call_1"));
+        assert_eq!(
+            call.function.as_ref().unwrap().name.as_deref(),
+            Some("shell")
+        );
     }
 }
