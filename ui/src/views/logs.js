@@ -80,6 +80,7 @@ function tableHead() {
       <th class="col-duration">Duration</th>
       <th class="col-streamed">Streamed</th>
       <th class="col-status">Status</th>
+      <th class="col-status">Override</th>
       <th class="col-actions">操作</th>
     </tr>
   `;
@@ -131,7 +132,7 @@ export function renderLogsView() {
         <table class="data-table" id="request-logs-table">
           <thead>${raw(tableHead())}</thead>
           <tbody id="request-logs-tbody">
-            <tr><td colspan="9" class="table-empty">暂无请求记录</td></tr>
+            <tr><td colspan="10" class="table-empty">暂无请求记录</td></tr>
           </tbody>
         </table>
       </div>

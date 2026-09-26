@@ -18,6 +18,7 @@ use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use reqwest::Client;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -59,12 +60,14 @@ impl ApiFlavor {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
     Extension(gui_logs): Extension<Arc<crate::settings::LogBuffer>>,
     Extension(service): Extension<Arc<service::ServiceController>>,
     Extension(stats): Extension<Arc<StatsDb>>,
+    Extension(pool): Extension<crate::session_pool::SharedCredentialPool>,
     headers: HeaderMap,
     request: Request,
 ) -> ProxyResult<Response> {
@@ -141,6 +144,7 @@ pub async fn proxy_handler(
                 &session,
                 &tag,
                 in_flight,
+                &Arc::new(std::sync::Mutex::new(OverrideTrace::default())),
             )
             .await;
             return Err(err);
@@ -164,6 +168,36 @@ pub async fn proxy_handler(
         )
         .await;
 
+    // Folded by forward_request: which credential/model an exception override
+    // ended up using, for the `override_key`/`override_model` DB columns.
+    let overrides = Arc::new(std::sync::Mutex::new(OverrideTrace::default()));
+
+    // Credential-pool selection: default-first for every healthy session, the
+    // session's sticky replacement after a failover, or None when the pool is
+    // disabled (static key / passthrough path, behaviour unchanged from 1.7.1).
+    let credential = if config.credential_pool_enabled && pool.is_enabled().await {
+        pool.pick(&session.session_id).await
+    } else {
+        None
+    };
+    // Only a session that a previous failover *moved off* the default records
+    // its sticky key; the plain default pick is not an override and must leave
+    // `override_key` empty. The MutexGuard must be dropped before any `.await`
+    // (std's guard is !Send), so the default check resolves first.
+    if let Some(cred) = &credential {
+        let default_id = pool
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|c| c.is_usable(crate::util::unix_millis()))
+            .map(|c| c.id);
+        let is_default = default_id.as_deref() == Some(cred.id.as_str());
+        if !is_default {
+            if let Ok(mut t) = overrides.lock() {
+                t.set_key(cred.id.clone(), "sticky failover");
+            }
+        }
+    }
     let result = forward_request(
         config,
         client,
@@ -178,6 +212,9 @@ pub async fn proxy_handler(
         start,
         session.clone(),
         tag.clone(),
+        Arc::clone(&overrides),
+        Arc::clone(&pool),
+        credential,
     )
     .await;
 
@@ -193,18 +230,21 @@ pub async fn proxy_handler(
         &session,
         &tag,
         in_flight,
+        &overrides,
     )
     .await;
 
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn responses_proxy_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
     Extension(gui_logs): Extension<Arc<crate::settings::LogBuffer>>,
     Extension(service): Extension<Arc<service::ServiceController>>,
     Extension(stats): Extension<Arc<StatsDb>>,
+    Extension(pool): Extension<crate::session_pool::SharedCredentialPool>,
     headers: HeaderMap,
     request: Request,
 ) -> ProxyResult<Response> {
@@ -273,6 +313,7 @@ pub async fn responses_proxy_handler(
                 &session,
                 &tag,
                 in_flight,
+                &Arc::new(std::sync::Mutex::new(OverrideTrace::default())),
             )
             .await;
             return Err(err);
@@ -296,6 +337,36 @@ pub async fn responses_proxy_handler(
         )
         .await;
 
+    // Folded by forward_request: which credential/model an exception override
+    // ended up using, for the `override_key`/`override_model` DB columns.
+    let overrides = Arc::new(std::sync::Mutex::new(OverrideTrace::default()));
+
+    // Credential-pool selection: default-first for every healthy session, the
+    // session's sticky replacement after a failover, or None when the pool is
+    // disabled (static key / passthrough path, behaviour unchanged from 1.7.1).
+    let credential = if config.credential_pool_enabled && pool.is_enabled().await {
+        pool.pick(&session.session_id).await
+    } else {
+        None
+    };
+    // Only a session that a previous failover *moved off* the default records
+    // its sticky key; the plain default pick is not an override and must leave
+    // `override_key` empty. The MutexGuard must be dropped before any `.await`
+    // (std's guard is !Send), so the default check resolves first.
+    if let Some(cred) = &credential {
+        let default_id = pool
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|c| c.is_usable(crate::util::unix_millis()))
+            .map(|c| c.id);
+        let is_default = default_id.as_deref() == Some(cred.id.as_str());
+        if !is_default {
+            if let Ok(mut t) = overrides.lock() {
+                t.set_key(cred.id.clone(), "sticky failover");
+            }
+        }
+    }
     let result = forward_request(
         config,
         client,
@@ -310,6 +381,9 @@ pub async fn responses_proxy_handler(
         start,
         session.clone(),
         tag.clone(),
+        Arc::clone(&overrides),
+        Arc::clone(&pool),
+        credential,
     )
     .await;
 
@@ -325,18 +399,21 @@ pub async fn responses_proxy_handler(
         &session,
         &tag,
         in_flight,
+        &overrides,
     )
     .await;
 
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_completions_proxy_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
     Extension(gui_logs): Extension<Arc<crate::settings::LogBuffer>>,
     Extension(service): Extension<Arc<service::ServiceController>>,
     Extension(stats): Extension<Arc<StatsDb>>,
+    Extension(pool): Extension<crate::session_pool::SharedCredentialPool>,
     headers: HeaderMap,
     request: Request,
 ) -> ProxyResult<Response> {
@@ -428,6 +505,36 @@ pub async fn chat_completions_proxy_handler(
         )
         .await;
 
+    // Folded by forward_request: which credential/model an exception override
+    // ended up using, for the `override_key`/`override_model` DB columns.
+    let overrides = Arc::new(std::sync::Mutex::new(OverrideTrace::default()));
+
+    // Credential-pool selection: default-first for every healthy session, the
+    // session's sticky replacement after a failover, or None when the pool is
+    // disabled (static key / passthrough path, behaviour unchanged from 1.7.1).
+    let credential = if config.credential_pool_enabled && pool.is_enabled().await {
+        pool.pick(&session.session_id).await
+    } else {
+        None
+    };
+    // Only a session that a previous failover *moved off* the default records
+    // its sticky key; the plain default pick is not an override and must leave
+    // `override_key` empty. The MutexGuard must be dropped before any `.await`
+    // (std's guard is !Send), so the default check resolves first.
+    if let Some(cred) = &credential {
+        let default_id = pool
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|c| c.is_usable(crate::util::unix_millis()))
+            .map(|c| c.id);
+        let is_default = default_id.as_deref() == Some(cred.id.as_str());
+        if !is_default {
+            if let Ok(mut t) = overrides.lock() {
+                t.set_key(cred.id.clone(), "sticky failover");
+            }
+        }
+    }
     let result = forward_request(
         config,
         client,
@@ -442,6 +549,9 @@ pub async fn chat_completions_proxy_handler(
         start,
         session.clone(),
         tag.clone(),
+        Arc::clone(&overrides),
+        Arc::clone(&pool),
+        credential,
     )
     .await;
 
@@ -457,6 +567,7 @@ pub async fn chat_completions_proxy_handler(
         &session,
         &tag,
         in_flight,
+        &overrides,
     )
     .await;
 
@@ -551,6 +662,8 @@ async fn reject_request(
         error: Some(&message),
         session_id: &session.session_id,
         client: session.client.tag(),
+        override_key: "",
+        override_model: "",
     });
     gui_logs
         .push(
@@ -613,21 +726,28 @@ async fn finalize_request(
     session: &SessionInfo,
     tag: &str,
     in_flight: metrics::InFlightGuard,
+    overrides: &Arc<std::sync::Mutex<OverrideTrace>>,
 ) {
     in_flight.finish(start, status);
+    let overrides = overrides.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
+    // Success rows are written by the response writers themselves — the
+    // StreamLedger on the streaming path and `non_streaming_response` on the
+    // JSON path — because only they see the final token usage. Recording here
+    // as well would double-count every successful request.
     match error {
         None => {
             gui_logs
                 .push(
                     "INFO",
                     format!(
-                        "POST {} ok model={} stream={} {}ms {}",
+                        "POST {} ok model={} stream={} {}ms {}{}",
                         route,
                         client_model,
                         is_streaming,
                         start.elapsed().as_millis(),
-                        tag
+                        tag,
+                        overrides.log_suffix()
                     ),
                 )
                 .await;
@@ -645,16 +765,73 @@ async fn finalize_request(
                 error: Some(&message),
                 session_id: &session.session_id,
                 client: session.client.tag(),
+                override_key: &overrides.key,
+                override_model: &overrides.model,
             });
             gui_logs
                 .push(
                     "ERROR",
                     format!(
-                        "POST {} failed model={} stream={} {}ms {} | {}",
-                        route, client_model, is_streaming, duration_ms, tag, message
+                        "POST {} failed model={} stream={} {}ms {}{} | {}",
+                        route,
+                        client_model,
+                        is_streaming,
+                        duration_ms,
+                        tag,
+                        overrides.log_suffix(),
+                        message
                     ),
                 )
                 .await;
+        }
+    }
+}
+
+/// What an exception override (failover session switch, degraded retry, token
+/// refresh, stream upgrade) changed about one request.
+///
+/// The retry chain folds its events into these two fields: the last override
+/// wins, because the row must answer "which credential/model actually served
+/// this request". Empty fields mean the request ran exactly as configured.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OverrideTrace {
+    /// Credential short id chosen by the override (the "override_key" column).
+    pub key: String,
+    /// Upstream model chosen by the override (the "override_model" column).
+    pub model: String,
+    /// One-line reason summary for the log suffix, e.g. `429 from wb-a1`.
+    pub reason: String,
+}
+
+impl OverrideTrace {
+    /// Record a credential-level override (session switch / failover).
+    fn set_key(&mut self, key: impl Into<String>, reason: impl fmt::Display) {
+        self.key = key.into();
+        self.reason = reason.to_string();
+    }
+
+    /// Record a model-level override (degraded retry / model remap on error).
+    fn set_model(&mut self, model: impl Into<String>, reason: impl fmt::Display) {
+        self.model = model.into();
+        self.reason = reason.to_string();
+    }
+
+    /// ` override=degraded(429 from wb-a1)` for log lines; empty when clean.
+    fn log_suffix(&self) -> String {
+        if self.key.is_empty() && self.model.is_empty() {
+            return String::new();
+        }
+        let what = if !self.key.is_empty() && !self.model.is_empty() {
+            format!("{}@{}", self.key, self.model)
+        } else if self.key.is_empty() {
+            self.model.clone()
+        } else {
+            self.key.clone()
+        };
+        if self.reason.is_empty() {
+            format!(" override={}", what)
+        } else {
+            format!(" override={}({})", what, self.reason)
         }
     }
 }
@@ -680,9 +857,17 @@ async fn forward_request(
     start: Instant,
     session: SessionInfo,
     tag: String,
+    overrides: std::sync::Arc<std::sync::Mutex<OverrideTrace>>,
+    pool: crate::session_pool::SharedCredentialPool,
+    credential: Option<crate::workbuddy_auth::WorkBuddyCredential>,
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
+
+    // The credential chosen for THIS attempt. Starts as the pool's selection
+    // (default-first, or the session's sticky replacement); the 4xx handler
+    // below may fail over to a different credential and re-enter the loop.
+    let mut active_credential = credential;
 
     // Some providers (WorkBuddy) only accept streaming bodies and answer a
     // non-streaming one with `11101 Non-stream chat request is currently not
@@ -723,220 +908,316 @@ async fn forward_request(
     // from spinning on a bare 400.
     let mut degraded_attempt = false;
 
-    'url: for url in &urls {
-        let mode = if streaming {
-            "streaming"
-        } else {
-            "non-streaming"
-        };
+    // Credential attempts: the pool's pick first, then at most
+    // `min(pool-1, 2)` failovers when a limit/failure exception hits. An empty
+    // pool (or a static-key/passthrough configuration) yields exactly one
+    // iteration with `active_credential = None` — the 1.7.1 behaviour.
+    let pool_size = if pool.is_enabled().await && config.credential_pool_enabled {
+        pool.snapshot().await.iter().filter(|c| c.enabled).count()
+    } else {
+        0
+    };
+    let max_credential_attempts = if config.session_switch_enabled {
+        pool_size.clamp(1, 3)
+    } else {
+        1
+    };
 
-        // Up to three attempts against this URL: the original request, plus at
-        // most one recovery retry of either kind — a content-policy degraded
-        // retry, or an upgrade to a stream when the provider refuses plain
-        // bodies (`11101`). A connect error or retriable 5xx instead moves on
-        // to the next URL.
-        for attempt in 0..=2 {
-            tracing::debug!(
-                "Sending {} {}request to {} (model: {})",
-                mode,
-                flavor.label(),
-                url,
-                openai_req.model
-            );
+    'credential: for credential_attempt in 0..max_credential_attempts {
+        let current_credential = active_credential.clone();
 
-            let mut req_builder = client.post(url).json(&openai_req);
-            req_builder = apply_upstream_auth(req_builder, &config, &api_key);
-            if !streaming {
-                // Streaming requests get no per-request timeout on purpose: a
-                // total timeout hard-kills any stream that outlives it — exactly
-                // the "Codex occasionally dies mid-run" symptom when a long
-                // generation exceeds the limit. Stalls are instead caught by the
-                // shared client's idle `read_timeout` (see the GUI client
-                // builder), which only fires when the upstream stops sending.
-                req_builder = req_builder.timeout(Duration::from_secs(300));
-            }
-
-            let upstream_start = Instant::now();
-            let response = match req_builder.send().await {
-                Ok(resp) => {
-                    metrics::upstream_latency(
-                        upstream_start.elapsed().as_secs_f64(),
-                        "chat_completions",
-                    );
-                    resp
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to reach {}: {:?}", url, err);
-                    metrics::upstream_error("chat_completions");
-                    gui_logs
-                        .push(
-                            "ERROR",
-                            format!(
-                                "UPSTREAM ERROR [connect] url={} model={} {}ms {} | {}",
-                                url,
-                                openai_req.model,
-                                upstream_start.elapsed().as_millis(),
-                                tag,
-                                err
-                            ),
-                        )
-                        .await;
-                    last_err = Some(ProxyError::Http(err));
-                    continue 'url; // try next upstream URL
-                }
+        'url: for url in &urls {
+            let mode = if streaming {
+                "streaming"
+            } else {
+                "non-streaming"
             };
 
-            let status = response.status();
-            if !status.is_success() {
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
-                let elapsed = upstream_start.elapsed().as_millis();
-                metrics::upstream_error("chat_completions");
-                log_upstream_failure(
-                    &gui_logs,
-                    flavor.stage(),
+            // Up to three attempts against this URL: the original request, plus at
+            // most one recovery retry of either kind — a content-policy degraded
+            // retry, or an upgrade to a stream when the provider refuses plain
+            // bodies (`11101`). A connect error or retriable 5xx instead moves on
+            // to the next URL.
+            for attempt in 0..=2 {
+                tracing::debug!(
+                    "Sending {} {}request to {} (model: {})",
+                    mode,
+                    flavor.label(),
                     url,
-                    &openai_req.model,
-                    status.as_u16(),
-                    &body,
-                    elapsed,
-                    &tag,
-                )
-                .await;
+                    openai_req.model
+                );
 
-                // Shape-dependent rejections (e.g. 11148 "tool calls and tool
-                // results do not match") can only be diagnosed from the message
-                // skeleton, so attach it whenever the upstream complains about
-                // tool-call pairing.
-                if body.contains("11148") || body.contains("11152") {
-                    gui_logs
-                        .push(
-                            "ERROR",
-                            format!(
-                                "REQUEST SHAPE model={} {} | {}",
-                                openai_req.model,
-                                tag,
-                                describe_message_shape(&openai_req.messages)
-                            ),
-                        )
-                        .await;
+                let mut req_builder = client.post(url).json(&openai_req);
+                req_builder = apply_upstream_auth(req_builder, &config, &api_key);
+                if let Some(cred) = &current_credential {
+                    req_builder = apply_credential_auth(req_builder, cred);
+                }
+                if !streaming {
+                    // Streaming requests get no per-request timeout on purpose: a
+                    // total timeout hard-kills any stream that outlives it — exactly
+                    // the "Codex occasionally dies mid-run" symptom when a long
+                    // generation exceeds the limit. Stalls are instead caught by the
+                    // shared client's idle `read_timeout` (see the GUI client
+                    // builder), which only fires when the upstream stops sending.
+                    req_builder = req_builder.timeout(Duration::from_secs(300));
                 }
 
-                // Content-policy block → at most one degraded retry against the
-                // same URL, then surface a clear content_blocked error instead of
-                // a raw 400/502.
-                if is_content_blocked(status.as_u16(), &body) && !degraded_attempt && attempt == 0 {
-                    degraded_attempt = true;
-                    tracing::warn!(
-                        "Upstream content block ({}); attempting one degraded retry",
-                        status
-                    );
-                    gui_logs
-                        .push(
-                            "WARN",
-                            format!(
+                let upstream_start = Instant::now();
+                let response = match req_builder.send().await {
+                    Ok(resp) => {
+                        metrics::upstream_latency(
+                            upstream_start.elapsed().as_secs_f64(),
+                            "chat_completions",
+                        );
+                        resp
+                    }
+                    Err(err) => {
+                        tracing::warn!("Failed to reach {}: {:?}", url, err);
+                        metrics::upstream_error("chat_completions");
+                        gui_logs
+                            .push(
+                                "ERROR",
+                                format!(
+                                    "UPSTREAM ERROR [connect] url={} model={} {}ms {} | {}",
+                                    url,
+                                    openai_req.model,
+                                    upstream_start.elapsed().as_millis(),
+                                    tag,
+                                    err
+                                ),
+                            )
+                            .await;
+                        last_err = Some(ProxyError::Http(err));
+                        continue 'url; // try next upstream URL
+                    }
+                };
+
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "Unknown error".to_string());
+                    let elapsed = upstream_start.elapsed().as_millis();
+                    metrics::upstream_error("chat_completions");
+                    log_upstream_failure(
+                        &gui_logs,
+                        flavor.stage(),
+                        url,
+                        &openai_req.model,
+                        status.as_u16(),
+                        &body,
+                        elapsed,
+                        &tag,
+                    )
+                    .await;
+
+                    // Limit/failure exception on an active credential → fail over.
+                    // Only the session that hit the exception is relocated (the
+                    // plan's default-first contract), the replacement sticks for
+                    // that session so its prompt cache survives, and the current
+                    // request is retried on the replacement immediately.
+                    if let Some(cred) = current_credential.as_ref() {
+                        if is_switchable_error(status.as_u16(), &body) {
+                            let from = cred.id.clone();
+                            pool.mark_limited(&from, 60_000).await;
+                            let replacement = if config.session_switch_enabled {
+                                pool.switch(&session.session_id, &from).await
+                            } else {
+                                None
+                            };
+                            match replacement {
+                                Some(next) => {
+                                    gui_logs
+                                        .push(
+                                            "WARN",
+                                            format!(
+                                            "session 切换 from={} to={} reason={} {} session={}",
+                                            from,
+                                            next.id,
+                                            status,
+                                            tag,
+                                            session.session_id
+                                        ),
+                                        )
+                                        .await;
+                                    if let Ok(mut t) = overrides.lock() {
+                                        t.set_key(next.id.clone(), format!("{status} from {from}"));
+                                    }
+                                    active_credential = Some(next);
+                                    continue 'credential; // retry the request on the replacement
+                                }
+                                None => {
+                                    // No healthy replacement: fall through and
+                                    // return the real upstream error.
+                                    gui_logs
+                                        .push(
+                                            "WARN",
+                                            format!(
+                                                "凭据池无可用替换凭据 from={} reason={} {}",
+                                                from, status, tag
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+
+                    // Shape-dependent rejections (e.g. 11148 "tool calls and tool
+                    // results do not match") can only be diagnosed from the message
+                    // skeleton, so attach it whenever the upstream complains about
+                    // tool-call pairing.
+                    if body.contains("11148") || body.contains("11152") {
+                        gui_logs
+                            .push(
+                                "ERROR",
+                                format!(
+                                    "REQUEST SHAPE model={} {} | {}",
+                                    openai_req.model,
+                                    tag,
+                                    describe_message_shape(&openai_req.messages)
+                                ),
+                            )
+                            .await;
+                    }
+
+                    // Content-policy block → at most one degraded retry against the
+                    // same URL, then surface a clear content_blocked error instead of
+                    // a raw 400/502.
+                    if is_content_blocked(status.as_u16(), &body)
+                        && !degraded_attempt
+                        && attempt == 0
+                    {
+                        degraded_attempt = true;
+                        tracing::warn!(
+                            "Upstream content block ({}); attempting one degraded retry",
+                            status
+                        );
+                        gui_logs
+                            .push(
+                                "WARN",
+                                format!(
                                 "UPSTREAM content_blocked ({}) → 1 degraded retry (model={}) {}",
                                 status, openai_req.model, tag
                             ),
+                            )
+                            .await;
+                        apply_degraded_prompt(&mut openai_req);
+                        if let Ok(mut t) = overrides.lock() {
+                            t.set_model(&openai_req.model, format!("content_blocked {status}"));
+                        }
+                        continue; // attempt == 1: retry the SAME URL with the neutral prompt
+                    }
+
+                    // Safety net: a provider that only serves streaming bodies may
+                    // not be known up front (custom URL rather than a known
+                    // preset). If it rejects a plain body with `11101`, re-send as
+                    // a stream and aggregate it back into the single body the
+                    // client asked for; the client's own `stream` flag is
+                    // unaffected.
+                    if !upstream_streaming && is_non_stream_unsupported(&body) {
+                        tracing::warn!(
+                            "Upstream rejected non-streaming body ({}); retrying as a stream",
+                            status
+                        );
+                        gui_logs
+                            .push(
+                                "WARN",
+                                format!(
+                                    "非流式被上游拒绝(11101) → 改用流式请求重试 (model={}) {}",
+                                    openai_req.model, tag
+                                ),
+                            )
+                            .await;
+                        if let Ok(mut t) = overrides.lock() {
+                            t.set_model(&openai_req.model, "11101 stream upgrade");
+                        }
+                        return retry_as_stream(
+                            &config,
+                            &client,
+                            &openai_req,
+                            &api_key,
+                            &gui_logs,
+                            &client_model,
+                            &stats,
+                            flavor,
+                            route,
+                            start,
+                            &session,
+                            &tag,
+                            url,
+                            &overrides,
                         )
                         .await;
-                    apply_degraded_prompt(&mut openai_req);
-                    continue; // attempt == 1: retry the SAME URL with the neutral prompt
-                }
+                    }
 
-                // Safety net: a provider that only serves streaming bodies may
-                // not be known up front (custom URL rather than a known
-                // preset). If it rejects a plain body with `11101`, re-send as
-                // a stream and aggregate it back into the single body the
-                // client asked for; the client's own `stream` flag is
-                // unaffected.
-                if !upstream_streaming && is_non_stream_unsupported(&body) {
-                    tracing::warn!(
-                        "Upstream rejected non-streaming body ({}); retrying as a stream",
-                        status
-                    );
-                    gui_logs
-                        .push(
-                            "WARN",
-                            format!(
-                                "非流式被上游拒绝(11101) → 改用流式请求重试 (model={}) {}",
-                                openai_req.model, tag
-                            ),
-                        )
-                        .await;
-                    return retry_as_stream(
-                        &config,
-                        &client,
-                        &openai_req,
-                        &api_key,
-                        &gui_logs,
-                        &client_model,
-                        &stats,
-                        flavor,
-                        route,
-                        start,
-                        &session,
-                        &tag,
-                        url,
-                    )
-                    .await;
-                }
-
-                let err = ProxyError::Upstream(format!("Upstream returned {}: {}", status, body));
-                if is_retriable_status(status.as_u16()) {
-                    last_err = Some(err);
-                    continue 'url; // try next upstream URL
-                }
-                // After the degraded retry still fails, report a content_blocked
-                // error the client can understand rather than a generic upstream
-                // one.
-                if is_content_blocked(status.as_u16(), &body) {
-                    return Err(ProxyError::Upstream(
+                    let err =
+                        ProxyError::Upstream(format!("Upstream returned {}: {}", status, body));
+                    if is_retriable_status(status.as_u16()) {
+                        last_err = Some(err);
+                        continue 'url; // try next upstream URL
+                    }
+                    // After the degraded retry still fails, report a content_blocked
+                    // error the client can understand rather than a generic upstream
+                    // one.
+                    if is_content_blocked(status.as_u16(), &body) {
+                        return Err(ProxyError::Upstream(
                         "Upstream rejected the request as content policy violation (code 11128). \
                          The degraded retry also failed."
                             .to_string(),
                     ));
+                    }
+                    return Err(err);
                 }
-                return Err(err);
-            }
 
-            return if streaming {
-                streaming_response(
-                    response,
-                    flavor,
-                    client_model,
-                    route,
-                    start,
-                    gui_logs,
-                    stats,
-                    session,
-                    tag,
-                )
-            } else {
-                // The client wants one JSON body. If the request was upgraded
-                // to a stream upstream, aggregate it first; otherwise parse the
-                // response directly.
-                let resp = if upstream_streaming {
-                    collect_stream_into_response(response).await?
+                return if streaming {
+                    streaming_response(
+                        response,
+                        flavor,
+                        client_model,
+                        route,
+                        start,
+                        gui_logs,
+                        stats,
+                        session,
+                        tag,
+                        Arc::clone(&overrides),
+                    )
                 } else {
-                    response.json::<openai::OpenAIResponse>().await?
+                    // The client wants one JSON body. If the request was upgraded
+                    // to a stream upstream, aggregate it first; otherwise parse the
+                    // response directly.
+                    let resp = if upstream_streaming {
+                        collect_stream_into_response(response).await?
+                    } else {
+                        response.json::<openai::OpenAIResponse>().await?
+                    };
+                    non_streaming_response(
+                        resp,
+                        flavor,
+                        &openai_req.model,
+                        client_model,
+                        route,
+                        start,
+                        &config,
+                        stats,
+                        &session,
+                        &tag,
+                        &overrides,
+                    )
+                    .await
                 };
-                non_streaming_response(
-                    resp,
-                    flavor,
-                    &openai_req.model,
-                    client_model,
-                    route,
-                    start,
-                    &config,
-                    stats,
-                    &session,
-                    &tag,
-                )
-                .await
-            };
+            }
+        }
+
+        // The credential's attempts were exhausted without an exception that
+        // warrants a switch (e.g. a plain upstream error): stop, so a 5xx
+        // storm does not burn the whole pool.
+        if credential_attempt + 1 < max_credential_attempts {
+            // A 4xx limit exception already failed over inside the loop (see
+            // the 429/402 handling); reaching here means non-switch failures.
+            break 'credential;
         }
     }
 
@@ -1115,6 +1396,7 @@ async fn non_streaming_response(
     stats: Arc<StatsDb>,
     session: &SessionInfo,
     tag: &str,
+    overrides: &Arc<std::sync::Mutex<OverrideTrace>>,
 ) -> ProxyResult<Response> {
     let metrics_model = match flavor {
         ApiFlavor::Chat => &client_model,
@@ -1128,6 +1410,13 @@ async fn non_streaming_response(
 
     let tokens = openai_resp.usage.to_token_record();
     let duration_ms = start.elapsed().as_millis() as i64;
+    // Snapshot the override trace before the row is built: borrowing through a
+    // MutexGuard inside this struct literal self-deadlocks (a second `.lock()`
+    // in the same expression waits on the first temporary guard).
+    let (override_key, override_model) = {
+        let t = overrides.lock().unwrap_or_else(|p| p.into_inner());
+        (t.key.clone(), t.model.clone())
+    };
     // Record token breakdown and request log in the persistent stats DB.
     let _ = stats.record_request_log(RequestOutcome {
         model: &client_model,
@@ -1139,6 +1428,11 @@ async fn non_streaming_response(
         error: None,
         session_id: &session.session_id,
         client: session.client.tag(),
+        // One lock for both fields: two `.lock()` temporaries in the same
+        // expression would leave the first guard alive while the second
+        // acquires, self-deadlocking the request thread.
+        override_key: &override_key,
+        override_model: &override_model,
     });
 
     if config.verbose {
@@ -1193,6 +1487,7 @@ fn streaming_response(
     stats: Arc<StatsDb>,
     session: SessionInfo,
     tag: String,
+    overrides: Arc<std::sync::Mutex<OverrideTrace>>,
 ) -> ProxyResult<Response> {
     let upstream = response.bytes_stream();
     let sse_stream = create_flavor_sse_stream(
@@ -1205,6 +1500,7 @@ fn streaming_response(
         stats,
         session,
         tag,
+        overrides,
     );
 
     let mut headers = HeaderMap::new();
@@ -1448,6 +1744,38 @@ fn apply_upstream_auth(
     req
 }
 
+/// Attach the login-state credential fingerprint to an outbound request.
+///
+/// The bearer token replaces the static key path, and the session-bound
+/// headers (user/enterprise/machine/domain) reproduce what the genuine desktop
+/// client sends — exactly what the `11128 unapproved channel` rejection checks.
+fn apply_credential_auth(
+    mut req: reqwest::RequestBuilder,
+    credential: &crate::workbuddy_auth::WorkBuddyCredential,
+) -> reqwest::RequestBuilder {
+    req = req.header("Authorization", format!("Bearer {}", credential.bearer()));
+    for (name, value) in crate::workbuddy_auth::upstream_headers(credential) {
+        req = req.header(name, value);
+    }
+    req
+}
+
+/// Whether an upstream failure should relocate the session onto another
+/// credential: the plan's limit/failure classes — 429 rate limit, 402 out of
+/// credit, and WorkBuddy quota business codes (11105/11106 family). The 11128
+/// content-policy code is deliberately absent: switching accounts cannot fix
+/// a content-policy rejection.
+fn is_switchable_error(status: u16, body: &str) -> bool {
+    matches!(status, 401 | 402 | 429) || is_quota_business_code(body)
+}
+
+/// WorkBuddy business codes that signal quota/rate exhaustion for this account.
+fn is_quota_business_code(body: &str) -> bool {
+    // 11105: quota exhausted; 11106: rate/frequency limited. Kept alongside
+    // the status classes so a 200-wrapped business error still switches.
+    body.contains("11105") || body.contains("11106")
+}
+
 fn is_retriable_status(status: u16) -> bool {
     matches!(status, 429 | 500..=599)
 }
@@ -1491,6 +1819,7 @@ async fn retry_as_stream(
     session: &SessionInfo,
     tag: &str,
     url: &str,
+    overrides: &Arc<std::sync::Mutex<OverrideTrace>>,
 ) -> ProxyResult<Response> {
     let mut streamed_req = openai_req.clone();
     streamed_req.stream = Some(true);
@@ -1540,6 +1869,7 @@ async fn retry_as_stream(
         stats.clone(),
         session,
         tag,
+        overrides,
     )
     .await
 }
@@ -1744,6 +2074,9 @@ struct StreamLedger {
     tokens: TokenRecord,
     /// Set when the upstream stream failed; turns the row's status into a 500.
     error: Option<String>,
+    /// Exception-override fields for the row (see [`OverrideTrace`]).
+    override_key: String,
+    override_model: String,
 }
 
 impl StreamLedger {
@@ -1753,7 +2086,9 @@ impl StreamLedger {
         start: Instant,
         stats: Arc<StatsDb>,
         session: SessionInfo,
+        overrides: &Arc<std::sync::Mutex<OverrideTrace>>,
     ) -> Self {
+        let overrides = overrides.lock().unwrap_or_else(|p| p.into_inner()).clone();
         Self {
             model,
             route,
@@ -1762,6 +2097,8 @@ impl StreamLedger {
             session,
             tokens: TokenRecord::default(),
             error: None,
+            override_key: overrides.key,
+            override_model: overrides.model,
         }
     }
 }
@@ -1779,6 +2116,8 @@ impl Drop for StreamLedger {
             error: self.error.as_deref(),
             session_id: &self.session.session_id,
             client: self.session.client.tag(),
+            override_key: &self.override_key,
+            override_model: &self.override_model,
         });
     }
 }
@@ -1801,6 +2140,7 @@ fn create_flavor_sse_stream(
     stats: Arc<StatsDb>,
     session: SessionInfo,
     tag: String,
+    overrides: Arc<std::sync::Mutex<OverrideTrace>>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         // Records the request row when the stream ends — including when the
@@ -1817,8 +2157,14 @@ fn create_flavor_sse_stream(
         // Read before `session` is moved into the ledger below; drives the
         // Codex stall diagnostic at the end of the stream.
         let client_kind = session.client;
-        let mut ledger =
-            StreamLedger::new(client_model.clone(), route, start, stats.clone(), session);
+        let mut ledger = StreamLedger::new(
+            client_model.clone(),
+            route,
+            start,
+            stats.clone(),
+            session,
+            &overrides,
+        );
         let mut buffer = String::new();
         let mut usage_captured = false;
 
@@ -2070,6 +2416,7 @@ fn create_sse_stream(
         stats,
         SessionInfo::unknown(),
         "client=unknown".to_string(),
+        Default::default(),
     )
 }
 
@@ -2092,6 +2439,7 @@ fn create_responses_sse_stream(
         stats,
         SessionInfo::unknown(),
         "client=unknown".to_string(),
+        Default::default(),
     )
 }
 
@@ -2901,6 +3249,9 @@ mod tests {
             axum::Extension(logs.clone()),
             axum::Extension(service),
             axum::Extension(stats_db.clone()),
+            axum::Extension(std::sync::Arc::new(
+                crate::session_pool::CredentialPool::empty(),
+            )),
             headers,
             json_request(&req),
         )
@@ -3020,6 +3371,9 @@ mod tests {
             axum::Extension(logs),
             axum::Extension(service),
             axum::Extension(mock_stats()),
+            axum::Extension(std::sync::Arc::new(
+                crate::session_pool::CredentialPool::empty(),
+            )),
             headers,
             json_request(&req),
         )
@@ -3250,6 +3604,9 @@ mod tests {
             axum::Extension(logs),
             axum::Extension(service),
             axum::Extension(stats_db.clone()),
+            axum::Extension(std::sync::Arc::new(
+                crate::session_pool::CredentialPool::empty(),
+            )),
             HeaderMap::new(),
             json_request(&req),
         )
@@ -3385,6 +3742,9 @@ mod tests {
             axum::Extension(logs),
             axum::Extension(service),
             axum::Extension(stats_db.clone()),
+            axum::Extension(std::sync::Arc::new(
+                crate::session_pool::CredentialPool::empty(),
+            )),
             HeaderMap::new(),
             json_request(&req),
         )
@@ -3528,6 +3888,9 @@ mod tests {
             axum::Extension(std::sync::Arc::new(crate::settings::LogBuffer::new(10))),
             axum::Extension(service),
             axum::Extension(mock_stats()),
+            axum::Extension(std::sync::Arc::new(
+                crate::session_pool::CredentialPool::empty(),
+            )),
             HeaderMap::new(),
             json_request(&req),
         )
@@ -3767,6 +4130,9 @@ mod tests {
             std::time::Instant::now(),
             SessionInfo::unknown(),
             "client=unknown".to_string(),
+            Default::default(),
+            std::sync::Arc::new(crate::session_pool::CredentialPool::empty()),
+            None,
         )
         .await
         .unwrap();

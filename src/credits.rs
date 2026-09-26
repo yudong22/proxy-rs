@@ -632,6 +632,7 @@ pub async fn credits_handler(
     Extension(client): Extension<reqwest::Client>,
     Extension(gui_logs): Extension<Arc<LogBuffer>>,
     Extension(service): Extension<Arc<crate::service::ServiceController>>,
+    Extension(pool): Extension<crate::session_pool::SharedCredentialPool>,
     headers: HeaderMap,
 ) -> ProxyResult<Response> {
     // Route through the shared redactor: this line is mirrored to
@@ -649,7 +650,18 @@ pub async fn credits_handler(
         return Ok(crate::service::service_unavailable_response());
     }
 
-    let api_key = config.api_key.clone();
+    // Credential pool first: when the WorkBuddy login-state pool is active the
+    // balance is queried with the default credential's access token — the
+    // account whose quota the requests actually burn. Falls back to the static
+    // key path when the pool is off.
+    let api_key = if config.credential_pool_enabled && pool.is_enabled().await {
+        pool.pick("")
+            .await
+            .map(|c| c.access_token)
+            .or_else(|| config.api_key.clone())
+    } else {
+        config.api_key.clone()
+    };
     let result = fetch_credits(&config, &client, &api_key).await;
 
     match result {

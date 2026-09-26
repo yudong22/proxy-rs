@@ -158,9 +158,35 @@ export function renderSettings() {
     <div class="hint" id="force-stream-hint"></div>
   `);
 
+  const credentials = section('credentials', 'WorkBuddy 账号池 (登录态)', html`
+    <p class="hint">
+      粘贴 WorkBuddy / CodeBuddy 桌面端登录态 JSON（或会话文件内容），即可用账号身份请求上游，
+      摆脱 <code>11128 未授权渠道</code> 拦截。默认凭据健康时所有请求走默认凭据；
+      某会话遇到限流/超额 (429/402) 时自动切换到备用凭据并保持粘滞，便于复用上游缓存。
+    </p>
+    <div class="form-group">
+      <label for="wb-login-state">登录态 JSON</label>
+      <textarea id="wb-login-state" class="log-input" rows="4"
+        placeholder='{"auth": {"accessToken": "...", "refreshToken": "..."}, "account": {"uid": "..."}}'
+        autocomplete="off"></textarea>
+    </div>
+    <div class="form-row">
+      ${raw(input('wb-label', '备注标签 (可选)', '例如 工作号', { group: 'half' }))}
+      <div class="form-group half">
+        <div class="actions-row">
+          <button type="button" class="btn btn-small btn-primary" id="btn-wb-add">＋ 导入凭据</button>
+          <button type="button" class="btn btn-small" id="btn-wb-sticky-reset">重置会话粘滞</button>
+        </div>
+      </div>
+    </div>
+    <div id="wb-credential-list" class="wb-credential-list"></div>
+    <div class="hint" id="wb-status"></div>
+  `);
+
   root.innerHTML = html`
     <form id="settings-form" class="settings-form">
       ${raw(provider)}
+      ${raw(credentials)}
       ${raw(claude)}
       ${raw(codex)}
       ${raw(network)}
@@ -512,5 +538,118 @@ export function initSettings() {
   form?.addEventListener('input', refreshSectionBadges);
   form?.addEventListener('change', refreshSectionBadges);
 
+  initCredentialPool();
   loadCodexConfig();
+}
+
+// ── WorkBuddy credential pool management ───────────────────────────────────
+
+/** State label → badge class, so a cooled credential reads differently. */
+const WB_STATE_LABELS = {
+  ok: ['正常', 'wb-state-ok'],
+  cooldown: ['冷却中', 'wb-state-cooldown'],
+  expired: ['已过期', 'wb-state-expired'],
+  disabled: ['已禁用', 'wb-state-disabled'],
+};
+
+/** Repaint the credential list from the backend. */
+async function renderCredentialList() {
+  const listEl = $('#wb-credential-list');
+  if (!listEl) return;
+  try {
+    const res = await invoke('wb_credentials_list');
+    const items = res?.credentials || [];
+    if (!items.length) {
+      listEl.innerHTML = html`<div class="hint">还没有凭据。粘贴桌面端登录态后点击「导入凭据」。</div>`;
+      return;
+    }
+    listEl.innerHTML = items.map((c) => {
+      const [stateLabel, stateClass] = WB_STATE_LABELS[c.state] || ['未知', ''];
+      const stickyNote = c.sticky_sessions > 0
+        ? raw(`<span class="wb-sticky-note">${c.sticky_sessions} 个会话粘滞</span>`)
+        : '';
+      return html`<div class="wb-credential-row">
+        <div class="wb-credential-main">
+          <span class="wb-credential-label">${c.label || c.nickname || c.id}</span>
+          <span class="badge-pill wb-state-pill ${stateClass}">${stateLabel}</span>
+          ${stickyNote}
+          <span class="wb-credential-id mono" title="${c.masked_token}">${c.id}</span>
+        </div>
+        <div class="wb-credential-actions">
+          <button type="button" class="btn btn-small" data-wb-toggle="${c.id}" data-wb-enabled="${c.enabled ? '1' : '0'}">
+            ${c.enabled ? '禁用' : '启用'}
+          </button>
+          <button type="button" class="btn btn-small btn-danger" data-wb-delete="${c.id}">删除</button>
+        </div>
+      </div>`;
+    }).join('');
+
+    for (const btn of listEl.querySelectorAll('[data-wb-toggle]')) {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.wbToggle;
+        const enable = btn.dataset.wbEnabled !== '1';
+        try {
+          await invoke('wb_credentials_toggle', { id, enabled: enable });
+          await renderCredentialList();
+        } catch (e) {
+          showWbStatus('操作失败: ' + e, true);
+        }
+      });
+    }
+    for (const btn of listEl.querySelectorAll('[data-wb-delete]')) {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.wbDelete;
+        try {
+          await invoke('wb_credentials_delete', { id });
+          await renderCredentialList();
+          showWbStatus('凭据已删除（重启代理后完全生效）');
+        } catch (e) {
+          showWbStatus('删除失败: ' + e, true);
+        }
+      });
+    }
+  } catch (e) {
+    listEl.innerHTML = html`<div class="hint">凭据加载失败: ${String(e)}</div>`;
+  }
+}
+
+function showWbStatus(message, isError = false) {
+  const el = $('#wb-status');
+  if (!el) return;
+  el.textContent = message;
+  el.classList.toggle('error', isError);
+}
+
+/** Wire the credential-pool controls and paint the initial list. */
+function initCredentialPool() {
+  $('#btn-wb-add')?.addEventListener('click', async () => {
+    const loginState = $('#wb-login-state')?.value.trim();
+    if (!loginState) {
+      showWbStatus('请先粘贴登录态 JSON', true);
+      return;
+    }
+    try {
+      await invoke('wb_credentials_add', {
+        body: { loginState, label: $('#wb-label')?.value || '' },
+      });
+      if ($('#wb-login-state')) $('#wb-login-state').value = '';
+      if ($('#wb-label')) $('#wb-label').value = '';
+      showWbStatus('凭据已导入。重启代理后以账号身份请求上游。');
+      await renderCredentialList();
+    } catch (e) {
+      showWbStatus('导入失败: ' + e, true);
+    }
+  });
+
+  $('#btn-wb-sticky-reset')?.addEventListener('click', async () => {
+    try {
+      await invoke('wb_sticky_reset');
+      showWbStatus('已重置会话粘滞');
+      await renderCredentialList();
+    } catch (e) {
+      showWbStatus('重置失败: ' + e, true);
+    }
+  });
+
+  renderCredentialList();
 }

@@ -403,6 +403,17 @@ fn now_secs() -> Option<i64> {
     Some(secs as i64)
 }
 
+/// Current wall clock in milliseconds since the Unix epoch.
+///
+/// Used for credential expiry / cooldown comparisons, which the desktop client
+/// also expresses in epoch milliseconds. Never fails: a pre-1970 clock reads 0.
+pub fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 /// Format the current instant as a local `YYYY-MM-DD HH:MM:SS.mmm` string.
 ///
 /// This is the single timestamp source for log lines and stats rows, so both

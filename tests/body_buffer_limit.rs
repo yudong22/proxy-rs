@@ -57,6 +57,7 @@ fn router() -> (axum::Router, Arc<LogBuffer>, Arc<StatsDb>) {
         reqwest::Client::new(),
         stats.clone(),
         metrics::install(),
+        std::sync::Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
     );
     (app, logs, stats)
 }

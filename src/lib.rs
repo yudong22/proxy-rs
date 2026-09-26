@@ -11,10 +11,12 @@ pub mod proxy;
 pub mod router;
 pub mod service;
 pub mod session;
+pub mod session_pool;
 pub mod settings;
 pub mod stats;
 pub mod translate;
 pub mod util;
+pub mod workbuddy_auth;
 
 pub use config::{Config, ModelsFlavor};
 pub use error::{ProxyError, ProxyResult};

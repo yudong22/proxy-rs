@@ -22,6 +22,7 @@
 
 ### 2. 智能路由与上游容灾
 - **多上游故障转移**：`UPSTREAM_BASE_URL` 支持分号（`;`）配置多个端点。仅在遇到 `429`（限流）或 `5xx`（服务故障）时自动重试下一可用端点，业务错误快速失败。
+- **WorkBuddy 账号池（登录态）**：导入桌面端登录态即可按账号身份请求上游（完整指纹头组 + token 自动刷新），摆脱 `11128 未授权渠道` 拦截。**默认凭据优先**：默认凭据健康时所有请求都走它；仅当某个会话遇到 429/402/配额码/刷新失败时，才把**该会话**切换到备用凭据并保持粘滞（复用上游 prompt cache）；日志与请求记录可追溯每次切换（`override_key` / `override_model`）。
 - **模型重映射（Model Mapping）**：通过 `PROXY_MODEL_MAP` 自由定义请求模型到上游模型的重定向规则（例如 `claude-sonnet-4-5=deepseek-chat`）。
 - **灵活鉴权**：既支持全局静态上游密钥，也支持密钥透传模式（从请求头的 `x-api-key` 或 `authorization` 提取，适合多租户共享）。
 - **内容清洗与安全指纹消除**：内置系统提示词敏感项剔除与请求体指纹中和能力，规避第三方服务商的安全策略误拦截（如腾讯 Copilot / WorkBuddy `11128` 拦截）。
@@ -241,6 +242,9 @@ curl -X POST http://localhost:3456/v1/messages \
 | `COMPLETION_MODEL` | 否 | 客户端请求模型 | 普通请求使用的缺省上游模型 |
 | `CREDITS_API_ENDPOINT` | 否 | - | 查询额度余额的网关专有端点 |
 | `DEBUG` / `VERBOSE` | 否 | `false` | 开启调试模式 / 打印完整请求与响应体报文 |
+| `PROXY_CREDENTIAL_POOL` | 否 | 有启用凭据时自动开启 | WorkBuddy 登录态凭据池总开关（`false` 强制关闭） |
+| `PROXY_SESSION_SWITCH` | 否 | `true` | 会话遇到 429/402/配额码/刷新失败时自动切换到备用凭据；关闭后错误原样透传 |
+| `PROXY_SESSION_AFFINITY_TTL` | 否 | `86400000` (24h) | 切换后会话粘滞时长（毫秒），超时后回到默认凭据 |
 
 \* 上游需要鉴权时必填。当启用 `UPSTREAM_API_KEY_PASSTHROUGH=true` 时，不得同时指定 `UPSTREAM_API_KEY`。
 
@@ -254,6 +258,7 @@ curl -X POST http://localhost:3456/v1/messages \
 | `~/.proxy-rs/.env` | 偏好的上游地址与密钥环境文件（可选） |
 | `~/.proxy-rs/logs/proxy.log` | 全量请求日志、错误排查堆栈与系统事件 |
 | `~/.proxy-rs/stats.db` | 本地 SQLite 每日请求与 Token 统计数据库 |
+| `~/.proxy-rs/workbuddy-credentials.json` | WorkBuddy / CodeBuddy 登录态凭据池（0600，GUI「WorkBuddy 账号池」导入） |
 
 ---
 
@@ -292,6 +297,8 @@ src/                       # 代理核心库 crate: proxy_rs（纯 Rust，无 GU
   settings.rs              # Layer 3：持久化配置读写与环形日志缓冲
   stats.rs                 # Layer 3：SQLite 每日用量统计持久层
   credits.rs               # Layer 3：余额查询适配层
+  workbuddy_auth.rs        # Layer 3：WorkBuddy 登录态凭据存储、指纹头、token 刷新
+  session_pool.rs          # Layer 3：凭据池（默认优先 + 4xx 切换粘滞）
   providers.rs             # Layer 3：预置厂商模板与动态模型发现
   metrics.rs               # Prometheus 指标注册与埋点
   util.rs                  # 报文裁剪、日期计算、请求头脱敏工具类

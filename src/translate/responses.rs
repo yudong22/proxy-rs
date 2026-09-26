@@ -1770,14 +1770,20 @@ mod tests {
         // and the delta must carry it.
         assert!(delta_events.iter().any(|e| matches!(
             e,
-            responses::ResponsesStreamEvent::OutputTextDelta { output_index: 1, .. }
+            responses::ResponsesStreamEvent::OutputTextDelta {
+                output_index: 1,
+                ..
+            }
         )));
 
         // The close events must echo the same index.
         let done_events = translate_stream_done(&mut state);
         assert!(done_events.iter().any(|e| matches!(
             e,
-            responses::ResponsesStreamEvent::OutputTextDone { output_index: 1, .. }
+            responses::ResponsesStreamEvent::OutputTextDone {
+                output_index: 1,
+                ..
+            }
         )));
         assert!(done_events.iter().any(|e| matches!(
             e,

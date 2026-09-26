@@ -35,6 +35,7 @@ pub fn build_app_router(
     client: Client,
     stats: Arc<StatsDb>,
     metrics_handle: metrics::PrometheusHandle,
+    pool: crate::session_pool::SharedCredentialPool,
 ) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -82,6 +83,7 @@ pub fn build_app_router(
         .layer(Extension(config))
         .layer(Extension(client))
         .layer(Extension(stats))
+        .layer(Extension(pool))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
 }

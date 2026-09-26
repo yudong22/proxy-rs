@@ -135,6 +135,16 @@ pub struct Config {
     /// Optional gateway wallet-balance endpoint for `GET /v1/credits`.
     /// When unset, the WorkBuddy flavor auto-uses its billing resource endpoint.
     pub credits_endpoint: Option<String>,
+    /// When true, a WorkBuddy credential pool is active: the proxy presents the
+    /// imported login-state credentials instead of the static `api_key`, with
+    /// default-first routing and 4xx failover stickiness (session_pool.rs).
+    /// Turned on implicitly when `workbuddy-credentials.json` has an enabled
+    /// credential; `PROXY_SESSION_SWITCH=false` keeps the pool but disables
+    /// the failover switches.
+    pub credential_pool_enabled: bool,
+    /// Whether a 429/402/quota-code/failed-refresh exception may relocate a
+    /// session onto another credential. Default true.
+    pub session_switch_enabled: bool,
 }
 
 impl Default for Config {
@@ -156,6 +166,8 @@ impl Default for Config {
             credits_endpoint: None,
             sanitize_fingerprints: false,
             force_stream_upstream: false,
+            credential_pool_enabled: false,
+            session_switch_enabled: true,
         }
     }
 }
@@ -239,6 +251,13 @@ impl Config {
             config.system_prompt_ignore_terms = gui_terms;
         }
 
+        // The credential pool turns itself on when the store has an enabled
+        // credential, so importing a login state in the GUI is the only setup
+        // step. `PROXY_CREDENTIAL_POOL` can still force-disable it entirely.
+        config.credential_pool_enabled = crate::workbuddy_auth::load_credentials()
+            .iter()
+            .any(|c| c.enabled);
+
         config.apply_env_overrides()?;
         Ok(config)
     }
@@ -277,6 +296,14 @@ impl Config {
         self.passthrough_api_key = env_flag("UPSTREAM_API_KEY_PASSTHROUGH");
         self.debug = env_flag("DEBUG");
         self.verbose = env_flag("VERBOSE");
+        // Credential pool: on when any enabled credential exists in the store;
+        // the env var can force-disable the whole feature for testing.
+        if env_lookup("PROXY_CREDENTIAL_POOL").is_some() {
+            self.credential_pool_enabled = env_flag("PROXY_CREDENTIAL_POOL");
+        }
+        if let Some(raw) = non_empty_env("PROXY_SESSION_SWITCH") {
+            self.session_switch_enabled = raw == "1" || raw.eq_ignore_ascii_case("true");
+        }
 
         // Passthrough extracts the key per request, so a static key contradicts it.
         if self.passthrough_api_key && self.api_key.is_some() {

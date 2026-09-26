@@ -40,6 +40,13 @@ pub struct RequestOutcome<'a> {
     pub session_id: &'a str,
     /// Client dialect tag (`codex` / `claude` / `dsh` / `unknown`).
     pub client: &'a str,
+    /// Credential short id actually used after an exception override (failover
+    /// session switch, degraded retry, token refresh, …). Empty when the
+    /// request completed on its originally selected credential.
+    pub override_key: &'a str,
+    /// Upstream model name selected by an exception override (e.g. the degraded
+    /// retry's model). Empty when no override changed the model.
+    pub override_model: &'a str,
 }
 
 impl RequestOutcome<'_> {
@@ -60,6 +67,8 @@ impl RequestOutcome<'_> {
             error: self.error.map(|e| e.to_string()),
             session_id: self.session_id.to_string(),
             client: self.client.to_string(),
+            override_key: self.override_key.to_string(),
+            override_model: self.override_model.to_string(),
         }
     }
 }
@@ -81,6 +90,8 @@ struct RequestRow {
     error: Option<String>,
     session_id: String,
     client: String,
+    override_key: String,
+    override_model: String,
 }
 
 impl RequestRow {
@@ -88,8 +99,9 @@ impl RequestRow {
         "INSERT INTO request_logs (
             date, created_at, model, route,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-            duration_ms, streamed, status, error, session_id, client
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+            duration_ms, streamed, status, error, session_id, client,
+            override_key, override_model
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
     }
 
     fn bind_to(&self, stmt: &mut rusqlite::Statement<'_>) -> rusqlite::Result<()> {
@@ -108,6 +120,8 @@ impl RequestRow {
             self.error,
             self.session_id,
             self.client,
+            self.override_key,
+            self.override_model,
         ])?;
         Ok(())
     }
@@ -132,6 +146,11 @@ pub struct RequestLogItem {
     pub session_id: String,
     /// Client dialect tag, or `unknown`.
     pub client: String,
+    /// Credential short id used after an exception override, or empty when the
+    /// request ran on its originally selected credential.
+    pub override_key: String,
+    /// Upstream model chosen by an exception override, or empty.
+    pub override_model: String,
 }
 
 /// Filter criteria for querying request logs.
@@ -412,7 +431,9 @@ impl StatsDb {
                 status              INTEGER NOT NULL DEFAULT 0,
                 error               TEXT,
                 session_id          TEXT NOT NULL DEFAULT '',
-                client              TEXT NOT NULL DEFAULT ''
+                client              TEXT NOT NULL DEFAULT '',
+                override_key        TEXT NOT NULL DEFAULT '',
+                override_model      TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_request_logs_id_desc ON request_logs(id DESC);
             CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at DESC);
@@ -448,7 +469,7 @@ impl StatsDb {
         // `session_id`/`client` arrived with session-aware logging. SQLite has
         // no `ADD COLUMN IF NOT EXISTS`, so each is probed first and old rows
         // keep the empty-string default.
-        for column in ["session_id", "client"] {
+        for column in ["session_id", "client", "override_key", "override_model"] {
             let exists = conn
                 .prepare("PRAGMA table_info(request_logs)")?
                 .query_map([], |row| row.get::<_, String>(1))?
@@ -633,7 +654,8 @@ impl StatsDb {
         let query_sql = format!(
             "SELECT id, created_at, model, route,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    duration_ms, streamed, status, error, session_id, client
+                    duration_ms, streamed, status, error, session_id, client,
+                    override_key, override_model
              FROM request_logs
              {}
              ORDER BY id DESC
@@ -666,6 +688,8 @@ impl StatsDb {
                 error: row.get(11)?,
                 session_id: row.get(12)?,
                 client: row.get(13)?,
+                override_key: row.get(14)?,
+                override_model: row.get(15)?,
             })
         })?;
 
@@ -835,6 +859,8 @@ mod tests {
             error,
             session_id: "",
             client: "",
+            override_key: "",
+            override_model: "",
         }
     }
 

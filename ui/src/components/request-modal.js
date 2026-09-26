@@ -45,6 +45,12 @@ export function showRequestModal(id) {
       </tr>`
     : '';
 
+  const overrideRows = (item.override_key || item.override_model)
+    ? html`
+      <tr><td class="detail-key">Override Key</td><td class="detail-val"><span class="mono">${item.override_key || '—'}</span></td></tr>
+      <tr><td class="detail-key">Override Model</td><td class="detail-val"><span class="mono">${item.override_model || '—'}</span></td></tr>`
+    : '';
+
   openModal('请求详情', html`
     <table class="detail-table">
       <tr><td class="detail-key">请求 ID</td><td class="detail-val">#${item.id}</td></tr>
@@ -61,6 +67,7 @@ export function showRequestModal(id) {
       <tr><td class="detail-key">输出 Tokens</td><td class="detail-val">${outputTokens.toLocaleString()}</td></tr>
       <tr><td class="detail-key">总计消耗</td><td class="detail-val"><strong>${(inputTokens + outputTokens).toLocaleString()}</strong></td></tr>
       ${raw(errorRow)}
+      ${raw(overrideRows)}
     </table>
   `);
 }

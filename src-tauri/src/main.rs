@@ -32,6 +32,9 @@ struct AppContext {
     /// Whether launchd started this copy. Controls whether it may re-register
     /// its own job (it must not: `bootout` would kill the caller).
     is_launchd_child: bool,
+    /// Upstream credential pool (WorkBuddy login states / multi-key). Rebuilt
+    /// on every proxy (re)start so saved credential changes hot-apply.
+    credential_pool: Arc<proxy_rs::session_pool::CredentialPool>,
 }
 
 struct TrayState {
@@ -380,6 +383,138 @@ async fn get_providers() -> Result<Value, String> {
     Ok(json!({ "providers": providers::builtin_presets() }))
 }
 
+// ── WorkBuddy credential pool management ───────────────────────────────────
+
+/// Mask a credential for the GUI: the token never leaves the backend whole.
+fn mask_credential(
+    c: &proxy_rs::workbuddy_auth::WorkBuddyCredential,
+    sticky_sessions: usize,
+) -> Value {
+    let now = proxy_rs::util::unix_millis();
+    let state = if !c.enabled {
+        "disabled"
+    } else if c
+        .cooldown_until_ms
+        .map(|until| now < until)
+        .unwrap_or(false)
+    {
+        "cooldown"
+    } else if !c.is_usable(now) {
+        "expired"
+    } else {
+        "ok"
+    };
+    json!({
+        "id": c.id,
+        "label": c.label,
+        "masked_token": c.masked_token(),
+        "expires_at_ms": c.expires_at_ms,
+        "uid": c.account.uid,
+        "nickname": c.account.nickname,
+        "enabled": c.enabled,
+        "state": state,
+        "last_error": c.last_error,
+        "sticky_sessions": sticky_sessions,
+    })
+}
+
+#[tauri::command]
+async fn wb_credentials_list(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    let items = proxy_rs::workbuddy_auth::load_credentials();
+    let sticky = ctx.credential_pool.sticky_count().await;
+    let list: Vec<Value> = items.iter().map(|c| mask_credential(c, sticky)).collect();
+    Ok(json!({ "credentials": list }))
+}
+
+#[derive(Deserialize)]
+struct WbCredentialAddBody {
+    /// Raw login-state JSON pasted from the desktop app or a session file.
+    login_state: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[tauri::command]
+async fn wb_credentials_add(
+    ctx: State<'_, Arc<AppContext>>,
+    body: WbCredentialAddBody,
+) -> Result<Value, String> {
+    let mut credential = proxy_rs::workbuddy_auth::parse_login_state(&body.login_state)
+        .map_err(|e| e.to_string())?;
+    if !body.label.trim().is_empty() {
+        credential.label = body.label.trim().to_string();
+    }
+    proxy_rs::workbuddy_auth::upsert_credential(credential.clone()).map_err(|e| e.to_string())?;
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "WorkBuddy 凭据已保存: {} ({})",
+                credential.label, credential.id
+            ),
+        )
+        .await;
+    Ok(mask_credential(&credential, 0))
+}
+
+#[tauri::command]
+async fn wb_credentials_delete(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<Value, String> {
+    let items = proxy_rs::workbuddy_auth::load_credentials();
+    let remaining: Vec<_> = items.into_iter().filter(|c| c.id != id).collect();
+    proxy_rs::workbuddy_auth::save_credentials(&remaining).map_err(|e| e.to_string())?;
+    // The pool rebuilds on the next proxy restart; drop the sticky bindings
+    // pointing at the removed credential right away so no session stays pinned.
+    ctx.credential_pool.reset_sticky().await;
+    ctx.logs
+        .push("INFO", format!("WorkBuddy 凭据已删除: {}", id))
+        .await;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+async fn wb_credentials_toggle(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    let mut items = proxy_rs::workbuddy_auth::load_credentials();
+    let Some(c) = items.iter_mut().find(|c| c.id == id) else {
+        return Err(format!("凭据不存在: {}", id));
+    };
+    c.enabled = enabled;
+    if enabled {
+        c.cooldown_until_ms = None;
+        c.last_error.clear();
+    }
+    proxy_rs::workbuddy_auth::save_credentials(&items).map_err(|e| e.to_string())?;
+    if enabled {
+        ctx.credential_pool.mark_ok(&id).await;
+    }
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "WorkBuddy 凭据 {} 已{}",
+                id,
+                if enabled { "启用" } else { "禁用" }
+            ),
+        )
+        .await;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+async fn wb_sticky_reset(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    ctx.credential_pool.reset_sticky().await;
+    ctx.logs
+        .push("INFO", "已重置会话粘滞：全部会话回到默认凭据".to_string())
+        .await;
+    Ok(json!({ "ok": true }))
+}
+
 #[tauri::command]
 async fn fetch_models(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     let settings = ctx.settings.read().await;
@@ -717,6 +852,7 @@ fn run_proxy_server(
             ctx.client.clone(),
             ctx.stats.clone(),
             metrics_handle,
+            ctx.credential_pool.clone(),
         );
 
         let bind_addr = config_arc.bind.clone();
@@ -859,6 +995,11 @@ fn main() {
         server_shutdown: std::sync::Mutex::new(CancellationToken::new()),
         server_epoch: Arc::new(AtomicU16::new(0)),
         is_launchd_child,
+        // Credentials are re-read on every proxy (re)start, so a credential
+        // saved in the GUI hot-applies with the rest of the settings.
+        credential_pool: Arc::new(proxy_rs::session_pool::CredentialPool::new(
+            proxy_rs::workbuddy_auth::load_credentials(),
+        )),
     });
 
     let ctx_for_setup = ctx.clone();
@@ -1004,7 +1145,12 @@ fn main() {
             get_codex_config,
             apply_codex_config,
             test_upstream,
-            open_logs_dir
+            open_logs_dir,
+            wb_credentials_list,
+            wb_credentials_add,
+            wb_credentials_delete,
+            wb_credentials_toggle,
+            wb_sticky_reset
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -37,11 +37,26 @@ function sessionCell(item) {
 }
 
 /**
+ * Override cell: the credential/model an exception override ended up using, or
+ * an em dash when the request ran on its originally selected credential. The
+ * title carries the full pair so a hover reveals what a truncated cell hides.
+ */
+function overrideCell(item) {
+  const key = item.override_key || '';
+  const model = item.override_model || '';
+  if (!key && !model) {
+    return html`<span class="cell-override-none">—</span>`;
+  }
+  const label = [key, model].filter(Boolean).join(' @ ');
+  return html`<span class="badge-pill override-pill" title="${label}">${label}</span>`;
+}
+
+/**
  * One <tr>.
  *
- * `sessionCell` and `statusBadge` return *markup*, so they are interpolated
- * through `raw`: without it the `html` template would escape their tags and the
- * cell would print `<span class="…">` as text.
+ * `sessionCell`, `statusBadge` and `overrideCell` return *markup*, so they are
+ * interpolated through `raw`: without it the `html` template would escape their
+ * tags and the cell would print `<span class="…">` as text.
  */
 function row(item) {
   const isErr = item.status >= 400 || Boolean(item.error);
@@ -69,6 +84,7 @@ function row(item) {
         : raw('<span class="badge-pill stream-pill stream-false">非流式</span>')
     }</td>
     <td class="cell-center">${raw(statusBadge(item))}</td>
+    <td class="cell-center">${raw(overrideCell(item))}</td>
     <td class="cell-center"><button type="button" class="btn-inspect" data-req-id="${item.id}">详情</button></td>
   </tr>`;
 }
@@ -81,7 +97,7 @@ function render() {
   const items = appState.requestLogs || [];
   tbody.innerHTML = items.length
     ? items.map(row).join('')
-    : raw('<tr><td colspan="9" class="table-empty">未匹配到任何请求记录</td></tr>').value;
+    : raw('<tr><td colspan="10" class="table-empty">未匹配到任何请求记录</td></tr>').value;
 
   for (const btn of $$('.btn-inspect')) {
     btn.addEventListener('click', (e) => {

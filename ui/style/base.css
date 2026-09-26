@@ -229,6 +229,25 @@ input:checked + .toggle-slider::before {
   border: 1px solid var(--neutral-tint-border);
 }
 
+/* Override pill: marks a request that an exception override (failover session
+   switch, degraded retry, …) rerouted onto a different credential/model. Warm
+   amber so an overridden row stands out from the green/neutral pills next to
+   it without reading as an error. */
+.override-pill {
+  background: var(--warning-tint, rgba(214, 158, 46, 0.12));
+  color: var(--warning, #a8790a);
+  border: 1px solid var(--warning-tint-border, rgba(214, 158, 46, 0.35));
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+}
+
+.cell-override-none {
+  color: var(--muted);
+}
+
 /* One colour per client dialect, so a mixed log can be scanned by hue even
    before the dropdown is touched. These hues are brand colours and are
    deliberately not tokenised. */
