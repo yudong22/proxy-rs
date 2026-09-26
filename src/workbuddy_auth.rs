@@ -503,6 +503,409 @@ pub fn upstream_headers(credential: &WorkBuddyCredential) -> Vec<(String, String
     headers
 }
 
+// ── OAuth Device Flow & QR Code Authorization ──────────────────────────────
+
+/// Default domestic WorkBuddy endpoint authority.
+pub const DEFAULT_WORKBUDDY_ENDPOINT: &str = "https://copilot.tencent.com";
+
+/// Pending response code returned by `/v2/plugin/auth/token` while user has not yet authorized.
+pub const LOGIN_TOKEN_PENDING_CODE: i64 = 11217;
+
+/// Initial state returned by `start_oauth_flow`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthStateResponse {
+    pub state: String,
+    pub auth_url: String,
+    pub qr_svg: String,
+}
+
+/// Status of an OAuth polling check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum OAuthPollResult {
+    Pending,
+    Success {
+        credential: WorkBuddyCredential,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+/// Generate SVG vector string for any URL / text string.
+pub fn generate_qr_svg(content: &str) -> Result<String> {
+    use qrcode::render::svg;
+    use qrcode::QrCode;
+
+    let code = QrCode::new(content.as_bytes())
+        .map_err(|e| anyhow::anyhow!("生成二维码失败: {}", e))?;
+    let svg = code
+        .render::<svg::Color>()
+        .min_dimensions(220, 220)
+        .dark_color(svg::Color("#18181b"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    Ok(svg)
+}
+
+/// Start an OAuth authorization session, generating state and QR code SVG.
+pub async fn start_oauth_flow(
+    client: &reqwest::Client,
+    endpoint: Option<&str>,
+) -> Result<OAuthStateResponse> {
+    let base = endpoint.unwrap_or(DEFAULT_WORKBUDDY_ENDPOINT).trim_end_matches('/');
+    let url = format!("{}/v2/plugin/auth/state?platform=desktop", base);
+
+    let resp = client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .header("User-Agent", crate::providers::WORKBUDDY_USER_AGENT)
+        .header("X-Product-Code", "codebuddy")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("请求授权服务失败: {}", e))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("授权端点返回 {}: {}", status, crate::util::truncate(&body, 300));
+    }
+
+    let val: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("解析响应失败: {}", e))?;
+    let code = val.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = val.get("msg").and_then(|m| m.as_str()).unwrap_or("未知错误");
+        anyhow::bail!("获取授权状态失败: {}", msg);
+    }
+
+    let data = val.get("data").ok_or_else(|| anyhow::anyhow!("响应缺少 data 字段"))?;
+    let state = data.get("state").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    let auth_url = data.get("authUrl").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+
+    if state.is_empty() || auth_url.is_empty() {
+        anyhow::bail!("授权返回缺少 state 或 authUrl");
+    }
+
+    let qr_svg = generate_qr_svg(&auth_url)?;
+    Ok(OAuthStateResponse {
+        state,
+        auth_url,
+        qr_svg,
+    })
+}
+
+/// Poll the OAuth token endpoint. When authorized, creates and persists the credential.
+pub async fn poll_oauth_token(
+    client: &reqwest::Client,
+    endpoint: Option<&str>,
+    state: &str,
+) -> Result<OAuthPollResult> {
+    let base = endpoint.unwrap_or(DEFAULT_WORKBUDDY_ENDPOINT).trim_end_matches('/');
+    let url = format!("{}/v2/plugin/auth/token?state={}", base, state);
+
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .header("User-Agent", crate::providers::WORKBUDDY_USER_AGENT)
+        .header("X-Product-Code", "codebuddy")
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("轮询授权状态失败: {}", e))?;
+
+    let body = resp.text().await.unwrap_or_default();
+    let val: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => return Ok(OAuthPollResult::Failed { error: format!("无效响应: {}", e) }),
+    };
+
+    let code = val.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code == LOGIN_TOKEN_PENDING_CODE {
+        return Ok(OAuthPollResult::Pending);
+    }
+
+    if code != 0 {
+        let msg = val.get("msg").and_then(|m| m.as_str()).unwrap_or("授权失败");
+        return Ok(OAuthPollResult::Failed { error: msg.to_string() });
+    }
+
+    let data = match val.get("data") {
+        Some(d) if d.is_object() => d,
+        _ => return Ok(OAuthPollResult::Failed { error: "缺少 token 数据".to_string() }),
+    };
+
+    let access_token = data.get("accessToken").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    if access_token.is_empty() {
+        return Ok(OAuthPollResult::Failed { error: "缺少 accessToken".to_string() });
+    }
+
+    let refresh_token = data.get("refreshToken").and_then(|s| s.as_str()).map(|s| s.to_string());
+    let expires_at_ms = data.get("expiresAt").and_then(|e| e.as_i64());
+    let domain = data.get("domain").and_then(|d| d.as_str()).unwrap_or("copilot.tencent.com").to_string();
+
+    // Fetch account profile for nickname / uid / enterpriseId
+    let account = fetch_account(client, base, &access_token).await.unwrap_or_default();
+    let label = if !account.nickname.is_empty() {
+        account.nickname.clone()
+    } else {
+        "扫码账号".to_string()
+    };
+
+    let cred = WorkBuddyCredential {
+        id: credential_id(&access_token),
+        label,
+        access_token,
+        refresh_token,
+        expires_at_ms,
+        domain,
+        account,
+        machine_id: String::new(),
+        enabled: true,
+        cooldown_until_ms: None,
+        last_error: String::new(),
+    };
+
+    upsert_credential(cred.clone())?;
+    Ok(OAuthPollResult::Success { credential: cred })
+}
+
+/// Fetch user profile from `/v2/plugin/account`.
+pub async fn fetch_account(
+    client: &reqwest::Client,
+    endpoint: &str,
+    access_token: &str,
+) -> Result<WorkBuddyAccount> {
+    let url = format!("{}/v2/plugin/account", endpoint.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .header("User-Agent", crate::providers::WORKBUDDY_USER_AGENT)
+        .header("X-Product-Code", "codebuddy")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await?;
+
+    let body = resp.text().await.unwrap_or_default();
+    let val: serde_json::Value = serde_json::from_str(&body)?;
+    let data = val.get("data").cloned().unwrap_or(val);
+    let account: WorkBuddyAccount = serde_json::from_value(data).unwrap_or_default();
+    Ok(account)
+}
+
+// ── Daily Check-in & Points Claiming ───────────────────────────────────────
+
+/// Single account daily checkin result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckinResult {
+    pub id: String,
+    pub label: String,
+    pub status: CheckinStatus,
+    pub message: String,
+    pub raw: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckinStatus {
+    Success,
+    AlreadyCheckedIn,
+    Failed,
+}
+
+/// Batch check-in report across all credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchCheckinReport {
+    pub total: usize,
+    pub success: usize,
+    pub already_checked_in: usize,
+    pub failed: usize,
+    pub details: Vec<CheckinResult>,
+}
+
+/// Execute daily checkin for a single WorkBuddy credential.
+pub async fn claim_daily_checkin(
+    client: &reqwest::Client,
+    cred: &WorkBuddyCredential,
+) -> CheckinResult {
+    let id = cred.id.clone();
+    let label = if !cred.label.is_empty() {
+        cred.label.clone()
+    } else if !cred.account.nickname.is_empty() {
+        cred.account.nickname.clone()
+    } else {
+        id.clone()
+    };
+
+    if cred.access_token.is_empty() {
+        return CheckinResult {
+            id,
+            label,
+            status: CheckinStatus::Failed,
+            message: "凭据缺少 access token".to_string(),
+            raw: None,
+        };
+    }
+
+    // Try copilot.tencent.com first, then fallback to www.codebuddy.cn
+    let endpoints = [
+        "https://copilot.tencent.com/v2/billing/meter/daily-checkin",
+        "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
+        "https://www.codebuddy.cn/billing/meter/daily-checkin",
+    ];
+
+    let mut last_err = String::new();
+    for endpoint in endpoints {
+        let mut req = client
+            .post(endpoint)
+            .timeout(std::time::Duration::from_secs(15))
+            .header("Authorization", format!("Bearer {}", cred.access_token))
+            .header("X-Product-Code", "codebuddy")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+            )
+            .header("Content-Type", "application/json")
+            .header("X-Client-Platform", "web");
+
+        if endpoint.contains("codebuddy.cn") {
+            req = req
+                .header("Origin", "https://www.codebuddy.cn")
+                .header("Referer", "https://www.codebuddy.cn/profile/growth-center");
+        }
+
+        if !cred.account.uid.is_empty() {
+            req = req.header("X-User-Id", &cred.account.uid);
+        }
+        if !cred.account.enterprise_id.is_empty() {
+            req = req.header("X-Enterprise-Id", &cred.account.enterprise_id);
+        }
+
+        let resp = match req.json(&serde_json::json!({})).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("网络请求失败: {}", e);
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            last_err = format!("HTTP {}: {}", status, crate::util::truncate(&body, 200));
+            continue;
+        }
+
+        let val: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = format!("解析响应失败: {}", e);
+                continue;
+            }
+        };
+
+        let code = val.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        let msg = val.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+
+        if code == 0 {
+            let reward_msg = if let Some(data) = val.get("data") {
+                if let Some(pts) = data
+                    .get("rewardPoint")
+                    .or_else(|| data.get("points"))
+                    .or_else(|| data.get("score"))
+                {
+                    format!("打卡成功，获得 +{} 积分", pts)
+                } else {
+                    "打卡成功，积分已领取".to_string()
+                }
+            } else {
+                "打卡成功".to_string()
+            };
+            return CheckinResult {
+                id,
+                label,
+                status: CheckinStatus::Success,
+                message: reward_msg,
+                raw: Some(val),
+            };
+        } else {
+            let lower_msg = msg.to_lowercase();
+            if lower_msg.contains("已签到")
+                || lower_msg.contains("已经签到")
+                || lower_msg.contains("repeat")
+                || lower_msg.contains("already")
+                || code == 10001
+                || code == 10002
+            {
+                return CheckinResult {
+                    id,
+                    label,
+                    status: CheckinStatus::AlreadyCheckedIn,
+                    message: if msg.is_empty() {
+                        "今日已完成打卡".to_string()
+                    } else {
+                        msg.to_string()
+                    },
+                    raw: Some(val),
+                };
+            } else {
+                return CheckinResult {
+                    id,
+                    label,
+                    status: CheckinStatus::Failed,
+                    message: if msg.is_empty() {
+                        format!("打卡失败 (code {})", code)
+                    } else {
+                        msg.to_string()
+                    },
+                    raw: Some(val),
+                };
+            }
+        }
+    }
+
+    CheckinResult {
+        id,
+        label,
+        status: CheckinStatus::Failed,
+        message: if last_err.is_empty() {
+            "打卡端点无响应".to_string()
+        } else {
+            last_err
+        },
+        raw: None,
+    }
+}
+
+/// Run daily checkin across all enabled credentials in the pool.
+pub async fn batch_claim_daily_checkin(client: &reqwest::Client) -> BatchCheckinReport {
+    let credentials = load_credentials();
+    let enabled: Vec<_> = credentials.into_iter().filter(|c| c.enabled).collect();
+    let total = enabled.len();
+    let mut details = Vec::with_capacity(total);
+    let mut success = 0;
+    let mut already_checked_in = 0;
+    let mut failed = 0;
+
+    for cred in &enabled {
+        let res = claim_daily_checkin(client, cred).await;
+        match res.status {
+            CheckinStatus::Success => success += 1,
+            CheckinStatus::AlreadyCheckedIn => already_checked_in += 1,
+            CheckinStatus::Failed => failed += 1,
+        }
+        details.push(res);
+    }
+
+    BatchCheckinReport {
+        total,
+        success,
+        already_checked_in,
+        failed,
+        details,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,4 +1035,12 @@ mod tests {
         assert!(id.starts_with("wb-"));
         assert_eq!(id, credential_id("some-long-token-material"));
     }
+
+    #[test]
+    fn generates_valid_qr_svg() {
+        let svg = generate_qr_svg("https://copilot.tencent.com/login?state=test").unwrap();
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("</svg>"));
+    }
 }
+

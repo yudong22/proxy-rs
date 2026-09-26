@@ -15,6 +15,9 @@ import { $, setText, html, raw } from '../core/dom.js';
 import { invoke } from '../core/ipc.js';
 import { appState } from '../core/state.js';
 import { refreshStatus } from './overview.js';
+import { openModal, closeModal } from '../components/modal.js';
+import { toast } from '../components/toast.js';
+
 
 /**
  * A labelled input inside a `.form-group`.
@@ -160,28 +163,48 @@ export function renderSettings() {
 
   const credentials = section('credentials', 'WorkBuddy 账号池 (登录态)', html`
     <p class="hint">
-      粘贴 WorkBuddy / CodeBuddy 桌面端登录态 JSON（或会话文件内容），即可用账号身份请求上游，
-      摆脱 <code>11128 未授权渠道</code> 拦截。默认凭据健康时所有请求走默认凭据；
-      某会话遇到限流/超额 (429/402) 时自动切换到备用凭据并保持粘滞，便于复用上游缓存。
+      支持<b>微信 / QQ 扫码一键登录授权</b>并自动保存至账号池；
+      也可以一键为账号池所有账号<b>每日打卡领积分</b>。默认凭据健康时所有请求走默认凭据；
+      某会话遇到限流/超额 (429/402) 时自动切换到备用凭据并保持粘滞。
     </p>
-    <div class="form-group">
-      <label for="wb-login-state">登录态 JSON</label>
-      <textarea id="wb-login-state" class="log-input" rows="4"
-        placeholder='{"auth": {"accessToken": "...", "refreshToken": "..."}, "account": {"uid": "..."}}'
-        autocomplete="off"></textarea>
+
+    <div class="wb-pool-toolbar">
+      <button type="button" class="btn btn-small btn-primary" id="btn-wb-qrcode">
+        📱 扫码添加账号
+      </button>
+      <button type="button" class="btn btn-small" id="btn-wb-checkin-all">
+        🎁 账号池一键打卡
+      </button>
+      <button type="button" class="btn btn-small" id="btn-wb-sticky-reset">
+        重置会话粘滞
+      </button>
+      <button type="button" class="btn btn-small btn-ghost" id="btn-wb-toggle-manual">
+        ⚙️ 手动粘贴 JSON
+      </button>
     </div>
-    <div class="form-row">
-      ${raw(input('wb-label', '备注标签 (可选)', '例如 工作号', { group: 'half' }))}
-      <div class="form-group half">
-        <div class="actions-row">
-          <button type="button" class="btn btn-small btn-primary" id="btn-wb-add">＋ 导入凭据</button>
-          <button type="button" class="btn btn-small" id="btn-wb-sticky-reset">重置会话粘滞</button>
+
+    <!-- Collapsible manual JSON import -->
+    <div id="wb-manual-section" class="wb-manual-section" style="display: none;">
+      <div class="form-group">
+        <label for="wb-login-state">登录态 JSON</label>
+        <textarea id="wb-login-state" class="log-input" rows="3"
+          placeholder='{"auth": {"accessToken": "...", "refreshToken": "..."}, "account": {"uid": "..."}}'
+          autocomplete="off"></textarea>
+      </div>
+      <div class="form-row">
+        ${raw(input('wb-label', '备注标签 (可选)', '例如 工作号', { group: 'half' }))}
+        <div class="form-group half">
+          <div class="actions-row">
+            <button type="button" class="btn btn-small btn-primary" id="btn-wb-add">＋ 导入凭据</button>
+          </div>
         </div>
       </div>
     </div>
+
     <div id="wb-credential-list" class="wb-credential-list"></div>
     <div class="hint" id="wb-status"></div>
   `);
+
 
   root.innerHTML = html`
     <form id="settings-form" class="settings-form">
@@ -560,7 +583,7 @@ async function renderCredentialList() {
     const res = await invoke('wb_credentials_list');
     const items = res?.credentials || [];
     if (!items.length) {
-      listEl.innerHTML = html`<div class="hint">还没有凭据。粘贴桌面端登录态后点击「导入凭据」。</div>`;
+      listEl.innerHTML = html`<div class="hint">账号池暂无可用账号。点击上方「📱 扫码添加账号」完成微信/QQ 扫码即可添加。</div>`;
       return;
     }
     listEl.innerHTML = items.map((c) => {
@@ -576,6 +599,7 @@ async function renderCredentialList() {
           <span class="wb-credential-id mono" title="${c.masked_token}">${c.id}</span>
         </div>
         <div class="wb-credential-actions">
+          <button type="button" class="btn btn-small" data-wb-checkin="${c.id}" title="为此账号每日打卡领积分">打卡</button>
           <button type="button" class="btn btn-small" data-wb-toggle="${c.id}" data-wb-enabled="${c.enabled ? '1' : '0'}">
             ${c.enabled ? '禁用' : '启用'}
           </button>
@@ -583,6 +607,24 @@ async function renderCredentialList() {
         </div>
       </div>`;
     }).join('');
+
+    for (const btn of listEl.querySelectorAll('[data-wb-checkin]')) {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.wbCheckin;
+        btn.disabled = true;
+        btn.textContent = '...';
+        try {
+          const res = await invoke('wb_checkin_single', { id });
+          const isOk = res.status === 'success' || res.status === 'already_checked_in';
+          toast(`${res.label || id}: ${res.message}`, isOk ? 'ok' : 'error');
+        } catch (e) {
+          toast(`打卡失败: ${e}`, 'error');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '打卡';
+        }
+      });
+    }
 
     for (const btn of listEl.querySelectorAll('[data-wb-toggle]')) {
       btn.addEventListener('click', async () => {
@@ -620,8 +662,190 @@ function showWbStatus(message, isError = false) {
   el.classList.toggle('error', isError);
 }
 
+/** Active OAuth polling timer reference. */
+let oauthPollTimer = null;
+
+function clearOAuthPolling() {
+  if (oauthPollTimer) {
+    clearInterval(oauthPollTimer);
+    oauthPollTimer = null;
+  }
+}
+
+/** Start QR code OAuth login flow. */
+async function startQrCodeLogin() {
+  clearOAuthPolling();
+  openModal(
+    '📱 扫码添加 WorkBuddy 账号',
+    html`
+      <div class="wb-qr-modal">
+        <p class="wb-qr-tip">请使用微信或腾讯客户端扫描下方二维码完成授权：</p>
+        <div id="wb-qr-target" class="wb-qr-box">
+          <div class="wb-qr-loading">正在请求授权二维码...</div>
+        </div>
+        <div class="wb-qr-poll-status" id="wb-qr-poll-status">
+          <span class="wb-pulse-dot"></span> 等待扫码确认...
+        </div>
+        <div class="wb-qr-link-row">
+          <a id="wb-qr-browser-link" href="#" target="_blank" class="wb-external-link">在浏览器中打开授权页面 ↗</a>
+        </div>
+      </div>
+    `
+  );
+
+  try {
+    const res = await invoke('wb_oauth_start');
+    const { state, auth_url, qr_svg } = res;
+
+    const qrTarget = $('#wb-qr-target');
+    if (qrTarget && qr_svg) {
+      qrTarget.innerHTML = qr_svg;
+    }
+
+    const browserLink = $('#wb-qr-browser-link');
+    if (browserLink && auth_url) {
+      browserLink.href = auth_url;
+    }
+
+    // Start polling every 2 seconds
+    oauthPollTimer = setInterval(async () => {
+      // Check if modal is still open
+      const overlay = $('#request-modal-overlay');
+      if (!overlay || !overlay.classList.contains('active')) {
+        clearOAuthPolling();
+        return;
+      }
+
+      try {
+        const poll = await invoke('wb_oauth_poll', { state });
+        const statusEl = $('#wb-qr-poll-status');
+
+        if (poll.status === 'success') {
+          clearOAuthPolling();
+          if (statusEl) {
+            statusEl.innerHTML = html`<span style="color:var(--success, #2e8b45);font-weight:600;">✅ 扫码成功！账号已自动加入账号池</span>`;
+          }
+          toast(`WorkBuddy 账号「${poll.credential?.label || '新账号'}」已加入账号池！`, 'ok');
+          await renderCredentialList();
+          setTimeout(() => closeModal(), 1500);
+        } else if (poll.status === 'failed') {
+          clearOAuthPolling();
+          if (statusEl) {
+            statusEl.innerHTML = html`<span style="color:var(--error, #e53e3e);">❌ 授权失败: ${poll.error}</span>`;
+          }
+        }
+      } catch (err) {
+        clearOAuthPolling();
+        const statusEl = $('#wb-qr-poll-status');
+        if (statusEl) {
+          statusEl.innerHTML = html`<span style="color:var(--error, #e53e3e);">轮询异常: ${err}</span>`;
+        }
+      }
+    }, 2000);
+  } catch (err) {
+    const qrTarget = $('#wb-qr-target');
+    if (qrTarget) {
+      qrTarget.innerHTML = html`<div style="color:var(--error, #e53e3e);padding:20px;">生成授权二维码失败: ${err}</div>`;
+    }
+  }
+}
+
+/** Trigger batch checkin across all pool accounts and show report modal. */
+async function triggerBatchCheckin() {
+  const btn = $('#btn-wb-checkin-all');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '⏳ 正在打卡...';
+  }
+
+  try {
+    const report = await invoke('wb_checkin_all');
+    if (report.total === 0) {
+      toast('账号池中没有已启用的账号', 'error');
+      return;
+    }
+
+    const rows = (report.details || []).map((d) => {
+      let badge = '';
+      if (d.status === 'success') {
+        badge = '<span class="badge-pill wb-state-pill wb-state-ok">打卡成功</span>';
+      } else if (d.status === 'already_checked_in') {
+        badge = '<span class="badge-pill wb-state-pill" style="background:rgba(59,130,246,0.15);color:#3b82f6;">今日已打卡</span>';
+      } else {
+        badge = '<span class="badge-pill wb-state-pill wb-state-expired">失败</span>';
+      }
+
+      return html`
+        <tr>
+          <td style="font-weight:600;">${d.label} <span class="mono" style="color:var(--muted);font-size:11px;">(${d.id})</span></td>
+          <td>${raw(badge)}</td>
+          <td style="font-size:12px;">${d.message}</td>
+        </tr>
+      `;
+    }).join('');
+
+    openModal(
+      '🎁 账号池每日打卡结果',
+      html`
+        <div class="wb-checkin-report-modal">
+          <div class="wb-checkin-summary-cards">
+            <div class="wb-stat-card">
+              <span class="wb-stat-val">${report.total}</span>
+              <span class="wb-stat-label">总账号数</span>
+            </div>
+            <div class="wb-stat-card">
+              <span class="wb-stat-val" style="color:var(--success, #2e8b45);">${report.success}</span>
+              <span class="wb-stat-label">本次领取</span>
+            </div>
+            <div class="wb-stat-card">
+              <span class="wb-stat-val" style="color:#3b82f6;">${report.already_checked_in}</span>
+              <span class="wb-stat-label">今日已打卡</span>
+            </div>
+            <div class="wb-stat-card">
+              <span class="wb-stat-val" style="color:var(--error, #e53e3e);">${report.failed}</span>
+              <span class="wb-stat-label">失败</span>
+            </div>
+          </div>
+
+          <table class="wb-checkin-table">
+            <thead>
+              <tr>
+                <th>账号</th>
+                <th>状态</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${raw(rows)}
+            </tbody>
+          </table>
+        </div>
+      `
+    );
+
+    toast(`打卡完成：${report.success} 个成功，${report.already_checked_in} 个已打卡`, 'ok');
+  } catch (err) {
+    toast(`每日打卡失败: ${err}`, 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '🎁 账号池一键打卡';
+    }
+  }
+}
+
 /** Wire the credential-pool controls and paint the initial list. */
 function initCredentialPool() {
+  $('#btn-wb-qrcode')?.addEventListener('click', startQrCodeLogin);
+  $('#btn-wb-checkin-all')?.addEventListener('click', triggerBatchCheckin);
+
+  $('#btn-wb-toggle-manual')?.addEventListener('click', () => {
+    const sec = $('#wb-manual-section');
+    if (!sec) return;
+    const isHidden = sec.style.display === 'none';
+    sec.style.display = isHidden ? 'block' : 'none';
+  });
+
   $('#btn-wb-add')?.addEventListener('click', async () => {
     const loginState = $('#wb-login-state')?.value.trim();
     if (!loginState) {
@@ -653,3 +877,4 @@ function initCredentialPool() {
 
   renderCredentialList();
 }
+

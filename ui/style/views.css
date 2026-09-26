@@ -315,3 +315,160 @@ details.form-section[open] > summary {
 #wb-status.error {
   color: var(--error);
 }
+
+.wb-pool-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0 12px 0;
+}
+
+.wb-manual-section {
+  padding: 12px;
+  background: var(--neutral-tint, rgba(255, 255, 255, 0.03));
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+/* ── WorkBuddy QR Code Modal ─────────────────────────────────────── */
+
+.wb-qr-modal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 10px 0;
+}
+
+.wb-qr-tip {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 16px;
+}
+
+.wb-qr-box {
+  background: #ffffff;
+  padding: 16px;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 240px;
+  min-height: 240px;
+}
+
+.wb-qr-box svg {
+  display: block;
+  width: 220px;
+  height: 220px;
+}
+
+.wb-qr-loading {
+  color: #333333;
+  font-size: 13px;
+}
+
+.wb-qr-poll-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 18px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.wb-pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3b82f6;
+  box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7);
+  animation: wb-pulse 1.8s infinite;
+}
+
+@keyframes wb-pulse {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 6px rgba(59, 130, 246, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+  }
+}
+
+.wb-qr-link-row {
+  margin-top: 14px;
+}
+
+.wb-external-link {
+  font-size: 12px;
+  color: var(--accent, #3b82f6);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ── WorkBuddy Checkin Report Modal ──────────────────────────────── */
+
+.wb-checkin-report-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.wb-checkin-summary-cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+
+.wb-stat-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 10px;
+  background: var(--surface, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.wb-stat-val {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.wb-stat-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.wb-checkin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-top: 8px;
+}
+
+.wb-checkin-table th,
+.wb-checkin-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.wb-checkin-table th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+}

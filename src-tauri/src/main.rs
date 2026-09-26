@@ -516,6 +516,92 @@ async fn wb_sticky_reset(ctx: State<'_, Arc<AppContext>>) -> Result<Value, Strin
 }
 
 #[tauri::command]
+async fn wb_oauth_start(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let res = proxy_rs::workbuddy_auth::start_oauth_flow(&client, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.logs
+        .push("INFO", format!("已生成 WorkBuddy 扫码授权: {}", res.state))
+        .await;
+    Ok(json!({
+        "state": res.state,
+        "auth_url": res.auth_url,
+        "qr_svg": res.qr_svg,
+    }))
+}
+
+#[tauri::command]
+async fn wb_oauth_poll(
+    ctx: State<'_, Arc<AppContext>>,
+    state: String,
+) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let res = proxy_rs::workbuddy_auth::poll_oauth_token(&client, None, &state)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match res {
+        proxy_rs::workbuddy_auth::OAuthPollResult::Pending => Ok(json!({ "status": "pending" })),
+        proxy_rs::workbuddy_auth::OAuthPollResult::Failed { error } => {
+            Ok(json!({ "status": "failed", "error": error }))
+        }
+        proxy_rs::workbuddy_auth::OAuthPollResult::Success { credential } => {
+            ctx.logs
+                .push(
+                    "INFO",
+                    format!(
+                        "WorkBuddy 扫码授权成功并保存: {} ({})",
+                        credential.label, credential.id
+                    ),
+                )
+                .await;
+            Ok(json!({
+                "status": "success",
+                "credential": mask_credential(&credential, 0),
+            }))
+        }
+    }
+}
+
+#[tauri::command]
+async fn wb_checkin_all(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let report = proxy_rs::workbuddy_auth::batch_claim_daily_checkin(&client).await;
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "WorkBuddy 账号池打卡完成: 共 {} 个，成功 {} 个，已打卡 {} 个，失败 {} 个",
+                report.total, report.success, report.already_checked_in, report.failed
+            ),
+        )
+        .await;
+    Ok(json!(report))
+}
+
+#[tauri::command]
+async fn wb_checkin_single(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<Value, String> {
+    let items = proxy_rs::workbuddy_auth::load_credentials();
+    let Some(c) = items.into_iter().find(|item| item.id == id) else {
+        return Err(format!("凭据不存在: {}", id));
+    };
+    let client = reqwest::Client::new();
+    let res = proxy_rs::workbuddy_auth::claim_daily_checkin(&client, &c).await;
+    ctx.logs
+        .push(
+            "INFO",
+            format!("WorkBuddy 账号 {} 打卡结果: {}", id, res.message),
+        )
+        .await;
+    Ok(json!(res))
+}
+
+
+#[tauri::command]
 async fn fetch_models(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     let settings = ctx.settings.read().await;
     let preset = settings.models_preset();
@@ -1150,8 +1236,13 @@ fn main() {
             wb_credentials_add,
             wb_credentials_delete,
             wb_credentials_toggle,
-            wb_sticky_reset
+            wb_sticky_reset,
+            wb_oauth_start,
+            wb_oauth_poll,
+            wb_checkin_all,
+            wb_checkin_single
         ])
+
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {

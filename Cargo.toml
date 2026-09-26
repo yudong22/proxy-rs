@@ -1,6 +1,6 @@
 [package]
 name = "proxy-rs"
-version = "1.8.0"
+version = "1.8.1"
 edition = "2021"
 authors = [
     "yudong22 (孙东) <3cking@163.com>",
@@ -63,6 +63,7 @@ bytes = "1.9"
 # SQLite persistence for daily statistics
 rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2.189"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 
 [profile.release]
 opt-level = "z"        # Optimize for size
