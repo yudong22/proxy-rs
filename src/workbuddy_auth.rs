@@ -635,6 +635,42 @@ pub fn active_api_key() -> Option<String> {
         .map(|k| k.key.trim().to_string())
 }
 
+/// The active API key entry (including its id, label, and key string).
+pub fn active_api_key_entry() -> Option<ApiKeyEntry> {
+    let items = load_api_keys();
+    if items.is_empty() {
+        return None;
+    }
+    let prefs = load_preferences();
+    let enabled = |k: &ApiKeyEntry| k.enabled && !k.key.trim().is_empty();
+    if prefs.default_identity_id.starts_with("k-") {
+        if let Some(k) = items
+            .iter()
+            .find(|k| k.id == prefs.default_identity_id && enabled(k))
+        {
+            return Some(k.clone());
+        }
+    }
+    if !prefs.default_key_id.is_empty() {
+        if let Some(k) = items
+            .iter()
+            .find(|k| k.id == prefs.default_key_id && enabled(k))
+        {
+            return Some(k.clone());
+        }
+    }
+    items.iter().find(|k| enabled(k)).cloned()
+}
+
+/// All currently enabled API keys in the key pool with non-empty keys.
+pub fn enabled_api_keys() -> Vec<ApiKeyEntry> {
+    let items = load_api_keys();
+    items
+        .into_iter()
+        .filter(|k| k.enabled && !k.key.trim().is_empty())
+        .collect()
+}
+
 /// Set the default credential id, validating it exists.
 pub fn set_default_credential(id: &str) -> Result<PoolPreferences> {
     let mut prefs = load_preferences();

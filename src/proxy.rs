@@ -934,6 +934,25 @@ async fn forward_request(
     // (default-first, or the session's sticky replacement); the 4xx handler
     // below may fail over to a different credential and re-enter the loop.
     let mut active_credential = credential;
+    let mut current_api_key = api_key;
+    let mut current_key_id = if active_credential.is_none() {
+        if let Some(entry) = crate::workbuddy_auth::active_api_key_entry() {
+            Some(entry.id)
+        } else if let Some(ref k) = current_api_key {
+            crate::workbuddy_auth::enabled_api_keys()
+                .into_iter()
+                .find(|e| e.key.trim() == k.trim())
+                .map(|e| e.id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut tried_key_ids = std::collections::HashSet::new();
+    if let Some(ref kid) = current_key_id {
+        tried_key_ids.insert(kid.clone());
+    }
 
     // Some providers (WorkBuddy) only accept streaming bodies and answer a
     // non-streaming one with `11101 Non-stream chat request is currently not
@@ -983,8 +1002,10 @@ async fn forward_request(
     } else {
         0
     };
+    let enabled_keys_count = crate::workbuddy_auth::enabled_api_keys().len();
+    let total_identities = pool_size + enabled_keys_count;
     let max_credential_attempts = if config.session_switch_enabled {
-        pool_size.clamp(1, 3)
+        total_identities.clamp(1, 5)
     } else {
         1
     };
@@ -1041,7 +1062,7 @@ async fn forward_request(
                 req_builder = apply_upstream_auth(
                     req_builder,
                     &config,
-                    &api_key,
+                    &current_api_key,
                     current_credential.as_ref(),
                 );
                 if !streaming {
@@ -1109,40 +1130,40 @@ async fn forward_request(
                     // plan's default-first contract), the replacement sticks for
                     // that session so its prompt cache survives, and the current
                     // request is retried on the replacement immediately.
-                    if let Some(cred) = current_credential.as_ref() {
-                        // ── 401 special-case: distinguish token expiry from routing failure ──
-                        //
-                        // Tencent / WorkBuddy upstreams return HTTP 401 for two very
-                        // different root causes that call for opposite treatments:
-                        //
-                        //  a) {"message":"not_found"} — the gateway could not route to
-                        //     the session / pod. The access token is fine; refreshing it
-                        //     wastes ~200 ms and won't fix a routing hiccup.  A brief
-                        //     wait lets the load-balancer resolve the bad path; if the
-                        //     retry still fails we fall through to the account switch.
-                        //
-                        //  b) Any other 401 — the access token is stale or revoked.
-                        //     Renew it and retry the *same* credential once before
-                        //     switching; with a single account, failing over has nowhere
-                        //     to go and would surface the 401 to the client directly.
-                        if status.as_u16() == 401 && body.contains("not_found") && !token_refresh_attempted {
-                            if attempt == 0 {
-                                // First attempt: brief pause, then retry without refresh.
-                                gui_logs
-                                    .push(
-                                        "WARN",
-                                        format!(
-                                            "UPSTREAM 401 not_found (疑似瞬时路由故障), 1.5s 后重试同一凭据 model={} {}",
-                                            openai_req.model, tag
-                                        ),
-                                    )
-                                    .await;
-                                tokio::time::sleep(Duration::from_millis(1500)).await;
-                                continue; // attempt 0 → 1, no token refresh
-                            }
-                            // attempt ≥ 1: two tries already failed; fall through to
-                            // is_switchable_error → account switch (or 5 s cooldown).
-                        } else if status.as_u16() == 401 && !token_refresh_attempted {
+                    // ── 401 special-case: distinguish token expiry from routing failure ──
+                    //
+                    // Tencent / WorkBuddy upstreams return HTTP 401 for two very
+                    // different root causes that call for opposite treatments:
+                    //
+                    //  a) {"message":"not_found"} — the gateway could not route to
+                    //     the session / pod. The access token is fine; refreshing it
+                    //     wastes ~200 ms and won't fix a routing hiccup. A 3s
+                    //     wait lets the load-balancer resolve the bad path; if the
+                    //     retry still fails we fall through to the account / key switch.
+                    //
+                    //  b) Any other 401 — the access token is stale or revoked.
+                    //     Renew it and retry the *same* credential once before
+                    //     switching; with a single account, failing over has nowhere
+                    //     to go and would surface the 401 to the client directly.
+                    if status.as_u16() == 401 && body.contains("not_found") {
+                        if attempt == 0 {
+                            // First attempt: brief 3s pause, then retry without refresh.
+                            gui_logs
+                                .push(
+                                    "WARN",
+                                    format!(
+                                        "UPSTREAM 401 not_found (疑似瞬时路由故障), 3s 后重试同一凭据 model={} {}",
+                                        openai_req.model, tag
+                                    ),
+                                )
+                                .await;
+                            tokio::time::sleep(Duration::from_millis(3000)).await;
+                            continue; // attempt 0 → 1, no token refresh
+                        }
+                        // attempt ≥ 1: two tries already failed; fall through to
+                        // is_switchable_error → account / key failover.
+                    } else if status.as_u16() == 401 && !token_refresh_attempted {
+                        if let Some(cred) = current_credential.as_ref() {
                             // Normal 401: the access token is stale/revoked. Renew it
                             // and retry the *same* credential once before failing
                             // over: with a single account, failing over has nowhere
@@ -1170,9 +1191,10 @@ async fn forward_request(
                                 continue; // retry this URL with the renewed token
                             }
                         }
+                    }
 
-
-                        if is_switchable_error(status.as_u16(), &body) {
+                    if is_switchable_error(status.as_u16(), &body) {
+                        if let Some(cred) = current_credential.as_ref() {
                             let from = cred.id.clone();
                             // Attempt the switch BEFORE marking the failing
                             // credential as limited, so we can use the
@@ -1201,13 +1223,13 @@ async fn forward_request(
                                         .push(
                                             "WARN",
                                             format!(
-                                            "session 切换 from={} to={} reason={} {} session={}",
-                                            from,
-                                            next.id,
-                                            status,
-                                            tag,
-                                            session.session_id
-                                        ),
+                                                "session 切换 from={} to={} reason={} {} session={}",
+                                                from,
+                                                next.id,
+                                                status,
+                                                tag,
+                                                session.session_id
+                                            ),
                                         )
                                         .await;
                                     if let Ok(mut t) = overrides.lock() {
@@ -1218,24 +1240,99 @@ async fn forward_request(
                                     continue 'credential; // retry the request on the replacement
                                 }
                                 None => {
-                                    // No healthy replacement available. Apply only
-                                    // a short cooldown so the pool stays online
-                                    // for the next client retry (transient errors
-                                    // resolve; a 60 s full park would silence the
-                                    // pool and make every following request fail
-                                    // immediately without trying the upstream).
+                                    // No healthy replacement account available in the pool.
+                                    // Apply short 5s cooldown so the pool recovers quickly.
                                     pool.mark_limited(&from, 5_000).await;
+
+                                    // Fallback: check if API key pool has available keys for failover
+                                    if config.session_switch_enabled {
+                                        let available_keys = crate::workbuddy_auth::enabled_api_keys();
+                                        if let Some(key) = available_keys.into_iter().find(|k| !tried_key_ids.contains(&k.id)) {
+                                            tried_key_ids.insert(key.id.clone());
+                                            gui_logs
+                                                .push(
+                                                    "WARN",
+                                                    format!(
+                                                        "账号池无可用替换账号 from={} reason={}，自动降级至密钥池: key_id={} label={} {} session={}",
+                                                        from, status, key.id, key.label, tag, session.session_id
+                                                    ),
+                                                )
+                                                .await;
+                                            if let Ok(mut t) = overrides.lock() {
+                                                t.set_key(key.id.clone(), format!("{status} from {from} (降级密钥池)"));
+                                                t.set_model(openai_req.model.clone(), format!("failover {status} from {from}"));
+                                            }
+                                            active_credential = None;
+                                            current_api_key = Some(key.key.clone());
+                                            current_key_id = Some(key.id.clone());
+                                            continue 'credential; // retry the request on the fallback API key
+                                        }
+                                    }
+
                                     gui_logs
                                         .push(
                                             "WARN",
                                             format!(
-                                                "凭据池无可用替换凭据 from={} reason={} {} (短暂冷却5s后恢复)",
+                                                "凭据池与密钥池均无可用替换身份 from={} reason={} {} (短暂冷却5s后恢复)",
                                                 from, status, tag
                                             ),
                                         )
                                         .await;
                                 }
                             }
+                        } else if config.session_switch_enabled {
+                            // Currently using API key (current_credential is None)
+                            let from = current_key_id.clone().unwrap_or_else(|| "api-key".to_string());
+                            tried_key_ids.insert(from.clone());
+                            let available_keys = crate::workbuddy_auth::enabled_api_keys();
+                            if let Some(key) = available_keys.into_iter().find(|k| !tried_key_ids.contains(&k.id)) {
+                                tried_key_ids.insert(key.id.clone());
+                                gui_logs
+                                    .push(
+                                        "WARN",
+                                        format!(
+                                            "密钥失败 from={} reason={}，自动轮询切换至下一密钥: key_id={} label={} {} session={}",
+                                            from, status, key.id, key.label, tag, session.session_id
+                                        ),
+                                    )
+                                    .await;
+                                if let Ok(mut t) = overrides.lock() {
+                                    t.set_key(key.id.clone(), format!("{status} from {from}"));
+                                    t.set_model(openai_req.model.clone(), format!("failover {status} from {from}"));
+                                }
+                                active_credential = None;
+                                current_api_key = Some(key.key.clone());
+                                current_key_id = Some(key.id.clone());
+                                continue 'credential;
+                            } else if config.credential_pool_enabled && pool.is_enabled().await {
+                                if let Some(next) = pool.pick(&session.session_id).await {
+                                    gui_logs
+                                        .push(
+                                            "WARN",
+                                            format!(
+                                                "密钥池已耗尽 from={} reason={}，自动切换至账号池: cred_id={} {} session={}",
+                                                from, status, next.id, tag, session.session_id
+                                            ),
+                                        )
+                                        .await;
+                                    if let Ok(mut t) = overrides.lock() {
+                                        t.set_key(next.id.clone(), format!("{status} from {from} (切换账号池)"));
+                                        t.set_model(openai_req.model.clone(), format!("failover {status} from {from}"));
+                                    }
+                                    active_credential = Some(next);
+                                    continue 'credential;
+                                }
+                            }
+
+                            gui_logs
+                                .push(
+                                    "WARN",
+                                    format!(
+                                        "密钥池无可用替换密钥 from={} reason={} {}",
+                                        from, status, tag
+                                    ),
+                                )
+                                .await;
                         }
                     }
 
@@ -1312,7 +1409,7 @@ async fn forward_request(
                             &config,
                             &client,
                             &openai_req,
-                            &api_key,
+                            &current_api_key,
                             current_credential.as_ref(),
                             &gui_logs,
                             &client_model,
@@ -3163,6 +3260,17 @@ mod tests {
         );
         let key = super::resolve_responses_api_key(&config, &headers);
         assert_eq!(key, Some("sk-bearer-test".to_string()));
+    }
+
+    #[test]
+    fn switchable_error_covers_401_402_403_429_and_quota_codes() {
+        assert!(super::is_switchable_error(401, "unauthorized"));
+        assert!(super::is_switchable_error(402, "payment required"));
+        assert!(super::is_switchable_error(403, "forbidden"));
+        assert!(super::is_switchable_error(429, "too many requests"));
+        assert!(super::is_switchable_error(200, r#"{"code":11105,"message":"quota exhausted"}"#));
+        assert!(!super::is_switchable_error(500, "internal server error"));
+        assert!(!super::is_switchable_error(400, "bad request"));
     }
 
     #[tokio::test]
