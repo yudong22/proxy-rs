@@ -103,6 +103,7 @@ pub fn translate_request(
         model,
         messages: openai_messages,
         max_tokens: Some(req.max_tokens),
+        max_completion_tokens: None,
         temperature: req.temperature,
         top_p: req.top_p,
         stop: req.stop_sequences,
@@ -710,6 +711,7 @@ mod tests {
                 },
             ],
             max_tokens: Some(1),
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             stop: None,
@@ -1210,8 +1212,11 @@ mod tests {
                 message: openai::ChoiceMessage {
                     role: "assistant".to_string(),
                     content: Some("hello".to_string()),
+                    reasoning_content: None,
+                    refusal: None,
                     tool_calls: None,
                 },
+                logprobs: None,
                 finish_reason: Some("stop".to_string()),
             }],
             usage: openai::Usage {
@@ -1243,8 +1248,11 @@ mod tests {
                 message: openai::ChoiceMessage {
                     role: "assistant".to_string(),
                     content: Some("pong".to_string()),
+                    reasoning_content: None,
+                    refusal: None,
                     tool_calls: None,
                 },
+                logprobs: None,
                 finish_reason: Some("stop".to_string()),
             }],
             usage: openai::Usage {
@@ -1276,6 +1284,8 @@ mod tests {
                 message: openai::ChoiceMessage {
                     role: "assistant".to_string(),
                     content: None,
+                    reasoning_content: None,
+                    refusal: None,
                     tool_calls: Some(vec![openai::ToolCall {
                         id: "call_abc".to_string(),
                         call_type: "function".to_string(),
@@ -1285,6 +1295,7 @@ mod tests {
                         },
                     }]),
                 },
+                logprobs: None,
                 finish_reason: Some("tool_calls".to_string()),
             }],
             usage: openai::Usage {

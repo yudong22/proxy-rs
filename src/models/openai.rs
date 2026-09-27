@@ -2,12 +2,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// OpenAI API request structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpenAIRequest {
     pub model: String,
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,6 +34,11 @@ pub struct StreamOptions {
 }
 
 impl OpenAIRequest {
+    /// Returns the configured token limit, checking `max_tokens` first then `max_completion_tokens`.
+    pub fn effective_max_tokens(&self) -> Option<u32> {
+        self.max_tokens.or(self.max_completion_tokens)
+    }
+
     /// Rough estimation of input tokens from request messages and tools when
     /// the upstream fails and returns no usage object.
     ///
@@ -177,20 +184,26 @@ pub struct OpenAIResponse {
     pub system_fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Choice {
     pub index: usize,
     pub message: ChoiceMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChoiceMessage {
     pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
@@ -315,7 +328,7 @@ pub struct StreamChunk {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamChoice {
     /// Some upstreams omit `index` on a single-choice chunk; defaulting keeps
     /// the frame parseable instead of discarding a whole SSE frame (and with
@@ -323,16 +336,20 @@ pub struct StreamChoice {
     #[serde(default)]
     pub index: usize,
     pub delta: Delta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<DeltaToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]

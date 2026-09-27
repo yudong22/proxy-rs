@@ -108,6 +108,11 @@ pub fn translate_responses_request(
                                 openai::MessageContent::Parts(conv_parts)
                             }
                         };
+                        let role = if role == "developer" {
+                            "system".to_string()
+                        } else {
+                            role
+                        };
                         messages.push(openai::Message {
                             role,
                             content: Some(msg_content),
@@ -203,17 +208,30 @@ pub fn translate_responses_request(
                     }
                     responses::ResponseInputItem::Raw(val) => {
                         if let Some(role) = val.get("role").and_then(|r| r.as_str()) {
+                            let role = if role == "developer" { "system" } else { role };
                             let content_text = val
                                 .get("content")
                                 .and_then(|c| c.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            let tool_calls: Option<Vec<openai::ToolCall>> = val
+                                .get("tool_calls")
+                                .and_then(|tc| serde_json::from_value(tc.clone()).ok());
+                            let tool_call_id = val
+                                .get("tool_call_id")
+                                .and_then(|tci| tci.as_str())
+                                .map(|s| s.to_string());
+                            let content = if content_text.is_empty() && tool_calls.is_some() {
+                                None
+                            } else {
+                                Some(openai::MessageContent::Text(content_text))
+                            };
                             messages.push(openai::Message {
                                 role: role.to_string(),
-                                content: Some(openai::MessageContent::Text(content_text)),
+                                content,
                                 reasoning_content: None,
-                                tool_calls: None,
-                                tool_call_id: None,
+                                tool_calls,
+                                tool_call_id,
                                 name: None,
                             });
                         }
@@ -262,11 +280,24 @@ pub fn translate_responses_request(
     if let Some(parallel) = req.parallel_tool_calls {
         extra.insert("parallel_tool_calls".to_string(), Value::Bool(parallel));
     }
+    if let Some(ref r) = req.reasoning {
+        let effort = if let Some(s) = r.as_str() {
+            Some(s.to_string())
+        } else if let Some(eff) = r.get("effort").and_then(|v| v.as_str()) {
+            Some(eff.to_string())
+        } else {
+            None
+        };
+        if let Some(effort) = effort {
+            extra.insert("reasoning_effort".to_string(), Value::String(effort));
+        }
+    }
 
     Ok(openai::OpenAIRequest {
         model,
         messages,
         max_tokens,
+        max_completion_tokens: req.max_output_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
         stop: None,
@@ -443,7 +474,7 @@ fn normalize_tool_choice(
             });
 
             match (kind, name) {
-                ("function", Some(raw_name)) => {
+                ("function" | "custom", Some(raw_name)) => {
                     let sanitized = sanitize_tool_name(raw_name);
                     if tool_exists(tools, &sanitized) {
                         Some(json!({"type": "function", "function": {"name": sanitized}}))
@@ -514,6 +545,25 @@ pub fn translate_responses_response(
         }
     }
 
+    if output.is_empty() {
+        let text = choice
+            .message
+            .content
+            .clone()
+            .or_else(|| choice.message.reasoning_content.clone())
+            .unwrap_or_default();
+        output.push(responses::OutputItem::Message {
+            id: generate_id("msg"),
+            status: "completed".to_string(),
+            role: choice.message.role.clone(),
+            content: vec![responses::OutputContentPart::OutputText { text: text.clone() }],
+        });
+        response_content_items.push(responses::ResponseContentItem {
+            content_type: "output_text".to_string(),
+            text: Some(text),
+        });
+    }
+
     let response_output = if !response_content_items.is_empty() {
         Some(responses::ResponseOutput {
             role: Some(choice.message.role.clone()),
@@ -560,6 +610,7 @@ pub struct ResponsesStreamState {
     accumulated_text: String,
     active_tool_calls: Vec<StreamingToolCall>,
     output_index_counter: usize,
+    items_closed: bool,
     finalized: bool,
     pending_usage: Option<openai::Usage>,
 }
@@ -588,6 +639,7 @@ pub fn initial_stream_state(fallback_model: String) -> ResponsesStreamState {
         accumulated_text: String::new(),
         active_tool_calls: Vec::new(),
         output_index_counter: 0,
+        items_closed: false,
         finalized: false,
         pending_usage: None,
     }
@@ -667,6 +719,11 @@ pub fn translate_stream_chunk(
     }
 
     let Some(choice) = chunk.choices.first() else {
+        // If choices is empty (e.g. trailing usage chunk in OpenAI stream)
+        // and stream items have already been closed, emit Completed event now.
+        if state.items_closed && !state.finalized && state.pending_usage.is_some() {
+            events.extend(emit_completed(state));
+        }
         return events;
     };
 
@@ -742,8 +799,11 @@ pub fn translate_stream_chunk(
                 }
             }
 
+            // Only start the tool call item when we have both call_id and a non-empty name,
+            // avoiding empty tool name events on initial ID-only chunks.
             if !tool_entry.started
-                && (!tool_entry.name.is_empty() || !tool_entry.call_id.is_empty())
+                && !tool_entry.name.is_empty()
+                && !tool_entry.call_id.is_empty()
             {
                 tool_entry.started = true;
                 events.push(responses::ResponsesStreamEvent::OutputItemAdded {
@@ -786,18 +846,24 @@ pub fn translate_stream_chunk(
     // then renders nothing. Mirrors `stream::translate_chunk`.
     if let Some(finish_reason) = &choice.finish_reason {
         if !finish_reason.is_empty() {
-            events.extend(close_stream_items(state));
+            if !state.items_closed {
+                events.extend(close_active_items(state));
+            }
+            if state.pending_usage.is_some() && !state.finalized {
+                events.extend(emit_completed(state));
+            }
         }
     }
 
     events
 }
 
-fn close_stream_items(state: &mut ResponsesStreamState) -> Vec<responses::ResponsesStreamEvent> {
+fn close_active_items(state: &mut ResponsesStreamState) -> Vec<responses::ResponsesStreamEvent> {
     let mut events = Vec::new();
-    if state.finalized {
+    if state.items_closed {
         return events;
     }
+    state.items_closed = true;
 
     // Close text item if active
     if state.text_item_started {
@@ -848,6 +914,16 @@ fn close_stream_items(state: &mut ResponsesStreamState) -> Vec<responses::Respon
             });
         }
     }
+
+    events
+}
+
+fn emit_completed(state: &mut ResponsesStreamState) -> Vec<responses::ResponsesStreamEvent> {
+    let mut events = Vec::new();
+    if state.finalized {
+        return events;
+    }
+    state.finalized = true;
 
     // Assemble completed output items
     let mut output = Vec::new();
@@ -912,7 +988,6 @@ fn close_stream_items(state: &mut ResponsesStreamState) -> Vec<responses::Respon
         },
     });
 
-    state.finalized = true;
     events
 }
 
@@ -920,11 +995,14 @@ fn close_stream_items(state: &mut ResponsesStreamState) -> Vec<responses::Respon
 pub fn translate_stream_done(
     state: &mut ResponsesStreamState,
 ) -> Vec<responses::ResponsesStreamEvent> {
-    if !state.finalized {
-        close_stream_items(state)
-    } else {
-        Vec::new()
+    let mut events = Vec::new();
+    if !state.items_closed {
+        events.extend(close_active_items(state));
     }
+    if !state.finalized {
+        events.extend(emit_completed(state));
+    }
+    events
 }
 
 /// Translates a stream error into `response.failed`.
@@ -1509,8 +1587,11 @@ mod tests {
                 message: openai::ChoiceMessage {
                     role: "assistant".to_string(),
                     content: Some("Hello! How can I assist you?".to_string()),
+                    reasoning_content: None,
+                    refusal: None,
                     tool_calls: None,
                 },
+                logprobs: None,
                 finish_reason: Some("stop".to_string()),
             }],
             usage: openai::Usage {
@@ -1622,10 +1703,12 @@ mod tests {
                 delta: openai::Delta {
                     role: Some("assistant".to_string()),
                     content: Some(content.to_string()),
+                    refusal: None,
                     tool_calls: None,
                     reasoning: None,
                     reasoning_content: None,
                 },
+                logprobs: None,
                 finish_reason: finish_reason.map(|s| s.to_string()),
             }],
             usage: None,
@@ -1660,7 +1743,7 @@ mod tests {
             "no new item should be started: {types:?}"
         );
 
-        // Only the real reason closes it, and the text is carried through.
+        // Only the real reason closes items, and stream completion emits Completed.
         let last = translate_stream_chunk(&mut state, &upstream_chunk("", Some("stop")));
         let types: Vec<&str> = last.iter().map(|e| e.event_type()).collect();
         assert_eq!(
@@ -1668,7 +1751,6 @@ mod tests {
             vec![
                 "response.output_text.done",
                 "response.output_item.done",
-                "response.completed"
             ]
         );
 
@@ -1679,7 +1761,10 @@ mod tests {
             other => panic!("expected OutputTextDone, got {other:?}"),
         }
 
-        match &last[2] {
+        let done = translate_stream_done(&mut state);
+        let done_types: Vec<&str> = done.iter().map(|e| e.event_type()).collect();
+        assert_eq!(done_types, vec!["response.completed"]);
+        match &done[0] {
             responses::ResponsesStreamEvent::Completed { response } => {
                 assert_eq!(response.output.len(), 1, "completed must carry the text");
             }
@@ -1701,10 +1786,12 @@ mod tests {
                 delta: openai::Delta {
                     role: Some("assistant".to_string()),
                     content: Some("Hello".to_string()),
+                    refusal: None,
                     tool_calls: None,
                     reasoning: None,
                     reasoning_content: None,
                 },
+                logprobs: None,
                 finish_reason: None,
             }],
             usage: None,
@@ -1728,10 +1815,12 @@ mod tests {
                 delta: openai::Delta {
                     role: None,
                     content: Some(" world!".to_string()),
+                    refusal: None,
                     tool_calls: None,
                     reasoning: None,
                     reasoning_content: None,
                 },
+                logprobs: None,
                 finish_reason: Some("stop".to_string()),
             }],
             usage: Some(openai::Usage {
@@ -1967,5 +2056,159 @@ mod tests {
         );
         let assistants = msgs.iter().filter(|m| m.role == "assistant").count();
         assert_eq!(assistants, 2, "separate turns stay separate: {msgs:#?}");
+    }
+
+    #[test]
+    fn trailing_usage_chunk_is_captured_into_completed() {
+        let mut state = initial_stream_state("gpt-4o".to_string());
+
+        // Chunk 1: text delta
+        let chunk1 = openai::StreamChunk {
+            id: Some("c1".into()),
+            object: Some("chat.completion.chunk".into()),
+            created: Some(100),
+            model: Some("gpt-4o".into()),
+            choices: vec![openai::StreamChoice {
+                index: 0,
+                delta: openai::Delta {
+                    role: Some("assistant".into()),
+                    content: Some("answer".into()),
+                    refusal: None,
+                    tool_calls: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        translate_stream_chunk(&mut state, &chunk1);
+
+        // Chunk 2: finish_reason without usage (standard OpenAI behavior)
+        let chunk2 = openai::StreamChunk {
+            id: Some("c2".into()),
+            object: Some("chat.completion.chunk".into()),
+            created: Some(101),
+            model: Some("gpt-4o".into()),
+            choices: vec![openai::StreamChoice {
+                index: 0,
+                delta: openai::Delta::default(),
+                logprobs: None,
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+        let events2 = translate_stream_chunk(&mut state, &chunk2);
+        let types2: Vec<&str> = events2.iter().map(|e| e.event_type()).collect();
+        assert_eq!(types2, vec!["response.output_text.done", "response.output_item.done"]);
+
+        // Chunk 3: trailing usage chunk with empty choices
+        let chunk3 = openai::StreamChunk {
+            id: Some("c3".into()),
+            object: Some("chat.completion.chunk".into()),
+            created: Some(102),
+            model: Some("gpt-4o".into()),
+            choices: vec![],
+            usage: Some(openai::Usage {
+                prompt_tokens: 15,
+                completion_tokens: 7,
+                total_tokens: 22,
+                ..Default::default()
+            }),
+        };
+        let events3 = translate_stream_chunk(&mut state, &chunk3);
+        let types3: Vec<&str> = events3.iter().map(|e| e.event_type()).collect();
+        assert_eq!(types3, vec!["response.completed"]);
+
+        match &events3[0] {
+            responses::ResponsesStreamEvent::Completed { response } => {
+                let u = response.usage.as_ref().expect("usage must be present");
+                assert_eq!(u.input_tokens, 15);
+                assert_eq!(u.output_tokens, 7);
+                assert_eq!(u.total_tokens, 22);
+            }
+            other => panic!("expected Completed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_stream_delays_output_item_added_until_name_is_known() {
+        let mut state = initial_stream_state("gpt-4o".to_string());
+
+        // Chunk 1: ID only, function name empty
+        let chunk1 = openai::StreamChunk {
+            id: Some("c1".into()),
+            object: Some("chat.completion.chunk".into()),
+            created: Some(100),
+            model: Some("gpt-4o".into()),
+            choices: vec![openai::StreamChoice {
+                index: 0,
+                delta: openai::Delta {
+                    role: Some("assistant".into()),
+                    content: None,
+                    refusal: None,
+                    tool_calls: Some(vec![openai::DeltaToolCall {
+                        index: 0,
+                        id: Some("call_abc123".into()),
+                        call_type: Some("function".into()),
+                        function: None,
+                    }]),
+                    reasoning: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let events1 = translate_stream_chunk(&mut state, &chunk1);
+        let types1: Vec<&str> = events1.iter().map(|e| e.event_type()).collect();
+        assert!(!types1.contains(&"response.output_item.added"), "must not emit output_item.added when name is empty");
+
+        // Chunk 2: Name arrives
+        let chunk2 = openai::StreamChunk {
+            id: Some("c2".into()),
+            object: Some("chat.completion.chunk".into()),
+            created: Some(101),
+            model: Some("gpt-4o".into()),
+            choices: vec![openai::StreamChoice {
+                index: 0,
+                delta: openai::Delta {
+                    role: None,
+                    content: None,
+                    refusal: None,
+                    tool_calls: Some(vec![openai::DeltaToolCall {
+                        index: 0,
+                        id: None,
+                        call_type: None,
+                        function: Some(openai::DeltaFunctionCall {
+                            name: Some("apply_patch".into()),
+                            arguments: None,
+                        }),
+                    }]),
+                    reasoning: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let events2 = translate_stream_chunk(&mut state, &chunk2);
+        let types2: Vec<&str> = events2.iter().map(|e| e.event_type()).collect();
+        assert!(types2.contains(&"response.output_item.added"), "must emit output_item.added now that name is known");
+        match &events2[0] {
+            responses::ResponsesStreamEvent::OutputItemAdded { item, .. } => {
+                match item {
+                    responses::OutputItem::FunctionCall { id, name, .. } => {
+                        assert_eq!(id, "call_abc123");
+                        assert_eq!(name, "apply_patch");
+                    }
+                    other => panic!("expected FunctionCall, got {other:?}"),
+                }
+            }
+            other => panic!("expected OutputItemAdded, got {other:?}"),
+        }
     }
 }

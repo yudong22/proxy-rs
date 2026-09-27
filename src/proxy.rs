@@ -458,6 +458,18 @@ pub async fn chat_completions_proxy_handler(
     req.model =
         pipeline::resolve_upstream_model(&req.model, policy.completion_model.as_ref(), &policy);
 
+    // Normalize role: "developer" to "system" (for compatibility with upstreams expecting standard roles)
+    for msg in &mut req.messages {
+        if msg.role == "developer" {
+            msg.role = "system".to_string();
+        }
+    }
+
+    // Fall back max_tokens to max_completion_tokens if not explicitly set
+    if req.max_tokens.is_none() && req.max_completion_tokens.is_some() {
+        req.max_tokens = req.max_completion_tokens;
+    }
+
     // 2. Sanitize system prompt if ignore terms are configured
     if !policy.ignore_terms.is_empty() {
         for msg in &mut req.messages {
@@ -1635,6 +1647,12 @@ impl Aggregate {
             Some(self.content)
         };
 
+        let reasoning_content = if self.reasoning.is_empty() {
+            None
+        } else {
+            Some(self.reasoning)
+        };
+
         openai::OpenAIResponse {
             id: self.id,
             object: Some("chat.completion".to_string()),
@@ -1645,8 +1663,11 @@ impl Aggregate {
                 message: openai::ChoiceMessage {
                     role: "assistant".to_string(),
                     content,
+                    reasoning_content,
+                    refusal: None,
                     tool_calls,
                 },
+                logprobs: None,
                 finish_reason: self.finish_reason.or(Some("stop".to_string())),
             }],
             usage: self.usage.unwrap_or_default(),
@@ -1743,6 +1764,15 @@ async fn non_streaming_response(
             // Report the model the client asked for, not the upstream's name.
             if openai_resp.model.is_some() {
                 openai_resp.model = Some(client_model);
+            }
+            if openai_resp.object.is_none() {
+                openai_resp.object = Some("chat.completion".to_string());
+            }
+            if openai_resp.id.is_none() {
+                openai_resp.id = Some(crate::translate::responses::generate_id("chatcmpl"));
+            }
+            if openai_resp.created.is_none() {
+                openai_resp.created = Some(crate::translate::responses::current_timestamp() as u64);
             }
             Ok(Json(openai_resp).into_response())
         }
@@ -2615,6 +2645,9 @@ fn create_flavor_sse_stream(
                                             if chunk_obj.model.is_some() {
                                                 chunk_obj.model = Some(client_model.clone());
                                             }
+                                            if chunk_obj.object.is_none() {
+                                                chunk_obj.object = Some("chat.completion.chunk".to_string());
+                                            }
                                             let serialized = serde_json::to_string(&chunk_obj)
                                                 .unwrap_or_else(|_| data.to_string());
                                             yield Ok(Bytes::from(format!("data: {}\n\n", serialized)));
@@ -2994,6 +3027,7 @@ mod tests {
                 },
             ],
             max_tokens: Some(1),
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             stop: None,
@@ -3029,6 +3063,7 @@ mod tests {
                 name: None,
             }],
             max_tokens: Some(1),
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             stop: None,
@@ -3661,8 +3696,11 @@ mod tests {
                         message: openai::ChoiceMessage {
                             role: "assistant".to_string(),
                             content: Some("Response from mock".to_string()),
+                            reasoning_content: None,
+                            refusal: None,
                             tool_calls: None,
                         },
+                        logprobs: None,
                         finish_reason: Some("stop".to_string()),
                     }],
                     usage: openai::Usage {
@@ -4016,8 +4054,11 @@ mod tests {
                         message: openai::ChoiceMessage {
                             role: "assistant".to_string(),
                             content: Some("Hello from OpenAI mock!".to_string()),
+                            reasoning_content: None,
+                            refusal: None,
                             tool_calls: None,
                         },
+                        logprobs: None,
                         finish_reason: Some("stop".to_string()),
                     }],
                     usage: openai::Usage {
@@ -4070,6 +4111,7 @@ mod tests {
                 name: None,
             }],
             max_tokens: Some(100),
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             stop: None,
@@ -4208,6 +4250,7 @@ mod tests {
                 name: None,
             }],
             max_tokens: None,
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             stop: None,
@@ -4353,6 +4396,7 @@ mod tests {
                 name: None,
             }],
             max_tokens: None,
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             stop: None,
@@ -4558,8 +4602,11 @@ mod tests {
                             message: openai::ChoiceMessage {
                                 role: "assistant".into(),
                                 content: Some("direct".into()),
+                                reasoning_content: None,
+                                refusal: None,
                                 tool_calls: None,
                             },
+                            logprobs: None,
                             finish_reason: Some("stop".into()),
                         }],
                         usage: openai::Usage::default(),
@@ -4588,6 +4635,7 @@ mod tests {
                 name: None,
             }],
             max_tokens: None,
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             stop: None,
