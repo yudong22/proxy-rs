@@ -119,6 +119,7 @@ details.form-section[open] > summary {
   outline: none;
   font-family: inherit;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .form-group input:focus, .form-group select:focus {
@@ -182,6 +183,7 @@ details.form-section[open] > summary {
   font-family: var(--mono);
   cursor: pointer;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .model-chip:hover {
@@ -330,6 +332,84 @@ details.form-section[open] > summary {
   border: 1px dashed var(--border);
   border-radius: 8px;
   margin-bottom: 12px;
+}
+
+/* ── WorkBuddy schedule row ─────────────────────────────────────── */
+
+.wb-schedule-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.wb-checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.wb-time-input {
+  width: 110px;
+}
+
+.wb-schedule-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ── WorkBuddy API key pool ─────────────────────────────────────── */
+
+.wb-key-add-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.wb-key-input {
+  width: 240px;
+}
+
+.wb-label-input {
+  width: 140px;
+}
+
+/* Default-account / default-key marker. Accent-tinted so it reads as a
+   selection state rather than as another status pill. */
+.wb-default-pill {
+  background: var(--accent-tint, rgba(59, 130, 246, 0.15));
+  color: var(--accent, #3b82f6);
+  border: 1px solid var(--accent-tint-border, rgba(59, 130, 246, 0.35));
+  font-size: 10px;
+  padding: 1px 6px;
+}
+
+.wb-credential-row--default {
+  border-color: var(--accent, #3b82f6);
+}
+
+.wb-points {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.wb-checkin-note {
+  font-size: 11px;
+  color: #3b82f6;
+}
+
+/* The "设为默认" button reads as selected while it is the default. */
+.btn-active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-tint, rgba(59, 130, 246, 0.12));
 }
 
 /* ── WorkBuddy QR Code Modal ─────────────────────────────────────── */

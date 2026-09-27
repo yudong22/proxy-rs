@@ -56,6 +56,152 @@ pub struct WorkBuddyCredential {
     /// Last failure description, shown in the GUI credential list.
     #[serde(default)]
     pub last_error: String,
+    /// Remaining points (积分) as last queried. `None` until a refresh reads
+    /// them, so the UI can distinguish "unknown" from a real zero balance.
+    #[serde(default)]
+    pub points: Option<f64>,
+    /// When `points` was last fetched, milliseconds since the epoch.
+    #[serde(default)]
+    pub points_fetched_at_ms: Option<i64>,
+    /// Local calendar day (`YYYY-MM-DD`) this credential last claimed its daily
+    /// check-in. Drives both the "already checked in" display and the scheduler's
+    /// once-a-day guard.
+    #[serde(default)]
+    pub last_checkin_date: Option<String>,
+}
+
+/// Persisted pool-wide preferences: which credential is the default and the
+/// daily check-in schedule.
+///
+/// Kept in its own file rather than on each credential so "the default" is a
+/// single value that cannot disagree with itself, and so the scheduler settings
+/// survive a credential being deleted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PoolPreferences {
+    /// Id of the credential every healthy session uses. Empty means "first
+    /// usable in store order", the pre-1.8.2 behaviour.
+    #[serde(default)]
+    pub default_credential_id: String,
+    /// Local wall-clock time to run the daily check-in, `HH:MM` (24h).
+    #[serde(default = "default_checkin_time")]
+    pub daily_checkin_time: String,
+    /// Whether the backend scheduler runs the check-in at all.
+    #[serde(default)]
+    pub daily_checkin_enabled: bool,
+    /// Local calendar day the scheduler last ran, so a restart inside the same
+    /// day does not claim twice.
+    #[serde(default)]
+    pub last_checkin_run_date: Option<String>,
+    /// Id of the default upstream API key in the key pool. Empty means the
+    /// single `GuiSettings::api_key` field is used.
+    #[serde(default)]
+    pub default_key_id: String,
+}
+
+fn default_checkin_time() -> String {
+    "09:00".to_string()
+}
+
+/// Pool preferences file path: `~/.proxy-rs/workbuddy-pool.json`.
+pub fn preferences_path() -> PathBuf {
+    crate::settings::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("workbuddy-pool.json")
+}
+
+/// Load the pool preferences. A missing or unreadable file is the default, not
+/// an error — every field has a sane fallback.
+pub fn load_preferences() -> PoolPreferences {
+    let Ok(text) = std::fs::read_to_string(preferences_path()) else {
+        return PoolPreferences::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// Persist the pool preferences.
+pub fn save_preferences(prefs: &PoolPreferences) -> Result<()> {
+    let path = preferences_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(prefs)?)?;
+    Ok(())
+}
+
+/// Rewrite just the scheduling fields, leaving the selection fields alone.
+///
+/// The GUI saves the schedule from one place and the default selection from
+/// another; going through the whole struct each time would let a stale copy of
+/// the other half clobber it.
+pub fn save_schedule(enabled: bool, time: &str) -> Result<PoolPreferences> {
+    let mut prefs = load_preferences();
+    prefs.daily_checkin_enabled = enabled;
+    prefs.daily_checkin_time = normalize_checkin_time(time);
+    save_preferences(&prefs)?;
+    Ok(prefs)
+}
+
+/// Clamp a user-entered `HH:MM` to a valid wall-clock time.
+///
+/// Anything unparseable falls back to the 09:00 default rather than being
+/// stored: an invalid time would either disable the scheduler silently or panic
+/// the timer's duration arithmetic.
+pub fn normalize_checkin_time(raw: &str) -> String {
+    let raw = raw.trim();
+    let Some((h, m)) = raw.split_once(':') else {
+        return default_checkin_time();
+    };
+    let Ok(h) = h.trim().parse::<u32>() else {
+        return default_checkin_time();
+    };
+    // Trailing seconds ("09:00:00") are accepted and ignored.
+    let m = m.split(':').next().unwrap_or("").trim();
+    let Ok(m) = m.parse::<u32>() else {
+        return default_checkin_time();
+    };
+    if h > 23 || m > 59 {
+        return default_checkin_time();
+    }
+    format!("{:02}:{:02}", h, m)
+}
+
+/// Local calendar day string (`YYYY-MM-DD`) for `now_ms`.
+///
+/// The check-in is a *daily* allowance in the user's own timezone, so the day
+/// boundary must be local — a UTC day would let an evening claim count as the
+/// next morning's.
+pub fn local_day(now_ms: i64) -> String {
+    let secs = now_ms / 1000;
+    let offset = crate::util::local_utc_offset_secs();
+    let local = secs + offset;
+    let days = local.div_euclid(86_400);
+    let (y, mo, d) = crate::util::civil_from_days(days);
+    format!("{:04}-{:02}-{:02}", y, mo, d)
+}
+
+/// Milliseconds from now until the next local wall-clock `HH:MM`.
+///
+/// Always strictly positive: a time that has just passed schedules for
+/// tomorrow, so a check-in set to the current minute fires once rather than
+/// spinning.
+pub fn millis_until_daily_time(now_ms: i64, time: &str) -> i64 {
+    let time = normalize_checkin_time(time);
+    let (h, m) = time.split_once(':').unwrap_or(("9", "0"));
+    let h: i64 = h.parse().unwrap_or(9);
+    let m: i64 = m.parse().unwrap_or(0);
+    let target_of_day = h * 3_600_000 + m * 60_000;
+
+    let offset = crate::util::local_utc_offset_secs() * 1000;
+    let local_ms = now_ms + offset;
+    let day_start = local_ms.div_euclid(86_400_000) * 86_400_000;
+    let mut target_local = day_start + target_of_day;
+    if target_local <= local_ms {
+        target_local += 86_400_000;
+    }
+    // Back to epoch milliseconds; the result is a duration, so the offset
+    // cancels out.
+    let delta = target_local - local_ms;
+    delta.max(1_000)
 }
 
 fn default_true() -> bool {
@@ -328,7 +474,221 @@ pub fn parse_login_state(raw: &str) -> Result<WorkBuddyCredential> {
         enabled: true,
         cooldown_until_ms: None,
         last_error: String::new(),
+        points: None,
+        points_fetched_at_ms: None,
+        last_checkin_date: None,
     })
+}
+
+/// One upstream API key in the key pool.
+///
+/// Mirrors [`WorkBuddyCredential`] in shape (id / label / enabled / points) so
+/// the GUI renders both pools with the same code, but it carries a raw key
+/// instead of a login state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApiKeyEntry {
+    /// Stable short id (`k-<6 hex>`), derived from the key material so the same
+    /// key imported twice collapses to one entry.
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    pub key: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub points: Option<f64>,
+    #[serde(default)]
+    pub points_fetched_at_ms: Option<i64>,
+}
+
+impl ApiKeyEntry {
+    /// Masked display form: the key never goes back to the UI whole.
+    pub fn masked(&self) -> String {
+        let k = &self.key;
+        if k.len() <= 8 {
+            "••••".to_string()
+        } else {
+            format!("{}••••{}", &k[..4], &k[k.len() - 4..])
+        }
+    }
+}
+
+/// Stable short id for an API key, derived like [`credential_id`].
+pub fn api_key_id(key: &str) -> String {
+    use std::fmt::Write;
+    let digest = md5_hex(key.as_bytes());
+    let mut out = String::from("k-");
+    for byte in &digest[..3] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// API key pool file path: `~/.proxy-rs/api-keys.json`.
+///
+/// Live keys, so it is written 0600 like the credential store.
+pub fn api_keys_path() -> PathBuf {
+    crate::settings::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("api-keys.json")
+}
+
+/// Load the API key pool.
+pub fn load_api_keys() -> Vec<ApiKeyEntry> {
+    let Ok(text) = std::fs::read_to_string(api_keys_path()) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// Persist the API key pool (mode 0600).
+pub fn save_api_keys(items: &[ApiKeyEntry]) -> Result<()> {
+    let path = api_keys_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(items)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Upsert one API key (matched by [`api_key_id`]).
+pub fn upsert_api_key(item: ApiKeyEntry) -> Result<ApiKeyEntry> {
+    let mut items = load_api_keys();
+    let id = item.id.clone();
+    if let Some(slot) = items.iter_mut().find(|k| k.id == id) {
+        *slot = item.clone();
+    } else {
+        items.push(item.clone());
+    }
+    save_api_keys(&items)?;
+    Ok(item)
+}
+
+/// The upstream key the proxy should use right now.
+///
+/// Resolution: the pool's default enabled key if one is set, else the first
+/// enabled key, else `None` — which leaves [`crate::config::Config::api_key`]
+/// (the single GUI field / env var) in charge, so a 1.7.x setup is untouched.
+pub fn active_api_key() -> Option<String> {
+    let items = load_api_keys();
+    if items.is_empty() {
+        return None;
+    }
+    let prefs = load_preferences();
+    let enabled = |k: &ApiKeyEntry| k.enabled && !k.key.trim().is_empty();
+    if !prefs.default_key_id.is_empty() {
+        if let Some(k) = items
+            .iter()
+            .find(|k| k.id == prefs.default_key_id && enabled(k))
+        {
+            return Some(k.key.trim().to_string());
+        }
+    }
+    // Falls through to the first enabled key when the remembered default was
+    // deleted or disabled: a stale pointer must not disable the proxy.
+    items
+        .iter()
+        .find(|k| enabled(k))
+        .map(|k| k.key.trim().to_string())
+}
+
+/// Set the default credential id, validating it exists.
+pub fn set_default_credential(id: &str) -> Result<PoolPreferences> {
+    let mut prefs = load_preferences();
+    prefs.default_credential_id = if id.is_empty() {
+        String::new()
+    } else {
+        let items = load_credentials();
+        items
+            .iter()
+            .find(|c| c.id == id)
+            .map(|_| id.to_string())
+            .ok_or_else(|| anyhow::anyhow!("账号不存在: {}", id))?
+    };
+    save_preferences(&prefs)?;
+    Ok(prefs)
+}
+
+/// Set the default API key id, validating it exists.
+pub fn set_default_api_key(id: &str) -> Result<PoolPreferences> {
+    let mut prefs = load_preferences();
+    prefs.default_key_id = if id.is_empty() {
+        String::new()
+    } else {
+        let items = load_api_keys();
+        items
+            .iter()
+            .find(|k| k.id == id)
+            .map(|_| id.to_string())
+            .ok_or_else(|| anyhow::anyhow!("密钥不存在: {}", id))?
+    };
+    save_preferences(&prefs)?;
+    Ok(prefs)
+}
+
+/// Credentials in the order the pool should try them: the chosen default first,
+/// then the rest in store order.
+///
+/// Ordering *is* the default mechanism ([`crate::session_pool::CredentialPool`]
+/// picks the first usable entry), so selecting a default is a reorder at load
+/// time rather than a new field the request path must check.
+pub fn ordered_credentials() -> Vec<WorkBuddyCredential> {
+    let mut items = load_credentials();
+    let prefs = load_preferences();
+    if prefs.default_credential_id.is_empty() {
+        return items;
+    }
+    let Some(pos) = items
+        .iter()
+        .position(|c| c.id == prefs.default_credential_id)
+    else {
+        return items;
+    };
+    let chosen = items.remove(pos);
+    items.insert(0, chosen);
+    items
+}
+
+/// Record a successful check-in for one credential on today's local day.
+pub fn mark_checkin_done(id: &str) -> Result<()> {
+    let mut items = load_credentials();
+    let Some(c) = items.iter_mut().find(|c| c.id == id) else {
+        return Ok(());
+    };
+    c.last_checkin_date = Some(local_day(crate::util::unix_millis()));
+    save_credentials(&items)
+}
+
+/// Whether this credential already claimed today's check-in.
+pub fn checked_in_today(c: &WorkBuddyCredential, today: &str) -> bool {
+    c.last_checkin_date.as_deref() == Some(today)
+}
+
+/// Store the queried points for one credential.
+pub fn set_points(id: &str, points: Option<f64>) -> Result<()> {
+    let mut items = load_credentials();
+    let Some(c) = items.iter_mut().find(|c| c.id == id) else {
+        return Ok(());
+    };
+    c.points = points;
+    c.points_fetched_at_ms = Some(crate::util::unix_millis());
+    save_credentials(&items)
+}
+
+/// Store the queried points for one API key.
+pub fn set_api_key_points(id: &str, points: Option<f64>) -> Result<()> {
+    let mut items = load_api_keys();
+    let Some(k) = items.iter_mut().find(|k| k.id == id) else {
+        return Ok(());
+    };
+    k.points = points;
+    k.points_fetched_at_ms = Some(crate::util::unix_millis());
+    save_api_keys(&items)
 }
 
 /// Credentials file path: `~/.proxy-rs/workbuddy-credentials.json` (relocated by
@@ -524,8 +884,10 @@ pub struct OAuthStateResponse {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum OAuthPollResult {
     Pending,
+    // Boxed: `WorkBuddyCredential` dwarfs the other variants, and this enum is
+    // carried across an await per poll, so the size difference is real churn.
     Success {
-        credential: WorkBuddyCredential,
+        credential: Box<WorkBuddyCredential>,
     },
     Failed {
         error: String,
@@ -537,8 +899,8 @@ pub fn generate_qr_svg(content: &str) -> Result<String> {
     use qrcode::render::svg;
     use qrcode::QrCode;
 
-    let code = QrCode::new(content.as_bytes())
-        .map_err(|e| anyhow::anyhow!("生成二维码失败: {}", e))?;
+    let code =
+        QrCode::new(content.as_bytes()).map_err(|e| anyhow::anyhow!("生成二维码失败: {}", e))?;
     let svg = code
         .render::<svg::Color>()
         .min_dimensions(220, 220)
@@ -553,7 +915,9 @@ pub async fn start_oauth_flow(
     client: &reqwest::Client,
     endpoint: Option<&str>,
 ) -> Result<OAuthStateResponse> {
-    let base = endpoint.unwrap_or(DEFAULT_WORKBUDDY_ENDPOINT).trim_end_matches('/');
+    let base = endpoint
+        .unwrap_or(DEFAULT_WORKBUDDY_ENDPOINT)
+        .trim_end_matches('/');
     let url = format!("{}/v2/plugin/auth/state?platform=desktop", base);
 
     let resp = client
@@ -569,20 +933,37 @@ pub async fn start_oauth_flow(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("授权端点返回 {}: {}", status, crate::util::truncate(&body, 300));
+        anyhow::bail!(
+            "授权端点返回 {}: {}",
+            status,
+            crate::util::truncate(&body, 300)
+        );
     }
 
-    let val: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("解析响应失败: {}", e))?;
+    let val: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("解析响应失败: {}", e))?;
     let code = val.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
-        let msg = val.get("msg").and_then(|m| m.as_str()).unwrap_or("未知错误");
+        let msg = val
+            .get("msg")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
         anyhow::bail!("获取授权状态失败: {}", msg);
     }
 
-    let data = val.get("data").ok_or_else(|| anyhow::anyhow!("响应缺少 data 字段"))?;
-    let state = data.get("state").and_then(|s| s.as_str()).unwrap_or_default().to_string();
-    let auth_url = data.get("authUrl").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    let data = val
+        .get("data")
+        .ok_or_else(|| anyhow::anyhow!("响应缺少 data 字段"))?;
+    let state = data
+        .get("state")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let auth_url = data
+        .get("authUrl")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
 
     if state.is_empty() || auth_url.is_empty() {
         anyhow::bail!("授权返回缺少 state 或 authUrl");
@@ -602,7 +983,9 @@ pub async fn poll_oauth_token(
     endpoint: Option<&str>,
     state: &str,
 ) -> Result<OAuthPollResult> {
-    let base = endpoint.unwrap_or(DEFAULT_WORKBUDDY_ENDPOINT).trim_end_matches('/');
+    let base = endpoint
+        .unwrap_or(DEFAULT_WORKBUDDY_ENDPOINT)
+        .trim_end_matches('/');
     let url = format!("{}/v2/plugin/auth/token?state={}", base, state);
 
     let resp = client
@@ -617,7 +1000,11 @@ pub async fn poll_oauth_token(
     let body = resp.text().await.unwrap_or_default();
     let val: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(e) => return Ok(OAuthPollResult::Failed { error: format!("无效响应: {}", e) }),
+        Err(e) => {
+            return Ok(OAuthPollResult::Failed {
+                error: format!("无效响应: {}", e),
+            })
+        }
     };
 
     let code = val.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -626,26 +1013,50 @@ pub async fn poll_oauth_token(
     }
 
     if code != 0 {
-        let msg = val.get("msg").and_then(|m| m.as_str()).unwrap_or("授权失败");
-        return Ok(OAuthPollResult::Failed { error: msg.to_string() });
+        let msg = val
+            .get("msg")
+            .and_then(|m| m.as_str())
+            .unwrap_or("授权失败");
+        return Ok(OAuthPollResult::Failed {
+            error: msg.to_string(),
+        });
     }
 
     let data = match val.get("data") {
         Some(d) if d.is_object() => d,
-        _ => return Ok(OAuthPollResult::Failed { error: "缺少 token 数据".to_string() }),
+        _ => {
+            return Ok(OAuthPollResult::Failed {
+                error: "缺少 token 数据".to_string(),
+            })
+        }
     };
 
-    let access_token = data.get("accessToken").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    let access_token = data
+        .get("accessToken")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
     if access_token.is_empty() {
-        return Ok(OAuthPollResult::Failed { error: "缺少 accessToken".to_string() });
+        return Ok(OAuthPollResult::Failed {
+            error: "缺少 accessToken".to_string(),
+        });
     }
 
-    let refresh_token = data.get("refreshToken").and_then(|s| s.as_str()).map(|s| s.to_string());
+    let refresh_token = data
+        .get("refreshToken")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
     let expires_at_ms = data.get("expiresAt").and_then(|e| e.as_i64());
-    let domain = data.get("domain").and_then(|d| d.as_str()).unwrap_or("copilot.tencent.com").to_string();
+    let domain = data
+        .get("domain")
+        .and_then(|d| d.as_str())
+        .unwrap_or("copilot.tencent.com")
+        .to_string();
 
     // Fetch account profile for nickname / uid / enterpriseId
-    let account = fetch_account(client, base, &access_token).await.unwrap_or_default();
+    let account = fetch_account(client, base, &access_token)
+        .await
+        .unwrap_or_default();
     let label = if !account.nickname.is_empty() {
         account.nickname.clone()
     } else {
@@ -664,10 +1075,15 @@ pub async fn poll_oauth_token(
         enabled: true,
         cooldown_until_ms: None,
         last_error: String::new(),
+        points: None,
+        points_fetched_at_ms: None,
+        last_checkin_date: None,
     };
 
     upsert_credential(cred.clone())?;
-    Ok(OAuthPollResult::Success { credential: cred })
+    Ok(OAuthPollResult::Success {
+        credential: Box::new(cred),
+    })
 }
 
 /// Fetch user profile from `/v2/plugin/account`.
@@ -693,6 +1109,110 @@ pub async fn fetch_account(
     Ok(account)
 }
 
+/// Query the remaining points (积分) for one WorkBuddy credential.
+///
+/// Hits the same billing resource endpoint `credits.rs` uses, but authorised
+/// with the credential's own access token, so each account reports its own
+/// balance. Returns `None` when the upstream cannot answer — the UI shows "—"
+/// rather than a misleading zero.
+pub async fn fetch_points(client: &reqwest::Client, cred: &WorkBuddyCredential) -> Option<f64> {
+    if cred.access_token.is_empty() {
+        return None;
+    }
+    let url = format!(
+        "{}{}",
+        WORKBUDDY_BILLING_HOST,
+        crate::credits::WORKBUDDY_RESOURCE_PATH
+    );
+    let resp = client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .header("Authorization", format!("Bearer {}", cred.access_token))
+        .header("X-API-Key", &cred.access_token)
+        .header("Content-Type", "application/json")
+        .header("X-Client-Platform", "web")
+        .header("Origin", WORKBUDDY_BILLING_HOST)
+        .header("Referer", format!("{}/profile/plans-usage", WORKBUDDY_BILLING_HOST))
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        )
+        .json(&serde_json::json!({
+            "PageNumber": 1,
+            "PageSize": 100,
+            "ProductCode": crate::credits::WORKBUDDY_RESOURCE_PRODUCT_CODE,
+            "Status": [0, 3],
+        }))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+
+    // A business error is not a balance; reporting 0 would read as exhausted.
+    if let Some(code) = value.get("code").and_then(|c| c.as_i64()) {
+        if code != 0 {
+            return None;
+        }
+    }
+    Some(crate::credits::remaining_from_response(&value))
+}
+
+/// The WorkBuddy billing host, shared with `credits.rs`.
+const WORKBUDDY_BILLING_HOST: &str = "https://www.codebuddy.cn";
+
+/// Refresh stored points for every enabled credential and return a report.
+///
+/// Each account is queried once and persisted, so the GUI can show a balance
+/// immediately on load and so a failover decision can prefer the account with
+/// the most remaining points without a network call on the request path.
+pub async fn refresh_all_points(client: &reqwest::Client) -> PointsReport {
+    let items = load_credentials();
+    let mut results = Vec::new();
+    for cred in items.iter().filter(|c| c.enabled) {
+        let points = fetch_points(client, cred).await;
+        // Persist even on failure: a failed refresh clears a stale figure
+        // rather than leaving a number the account no longer has.
+        let _ = set_points(&cred.id, points);
+        results.push(PointsResult {
+            id: cred.id.clone(),
+            label: display_label(cred),
+            points,
+        });
+    }
+    PointsReport { results }
+}
+
+/// One account's refreshed point balance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointsResult {
+    pub id: String,
+    pub label: String,
+    /// `None` when the upstream could not be read.
+    pub points: Option<f64>,
+}
+
+/// Result of a pool-wide points refresh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointsReport {
+    pub results: Vec<PointsResult>,
+}
+
+/// The name to show for a credential: explicit label, then nickname, then id.
+pub fn display_label(cred: &WorkBuddyCredential) -> String {
+    if !cred.label.is_empty() {
+        cred.label.clone()
+    } else if !cred.account.nickname.is_empty() {
+        cred.account.nickname.clone()
+    } else {
+        cred.id.clone()
+    }
+}
+
 // ── Daily Check-in & Points Claiming ───────────────────────────────────────
 
 /// Single account daily checkin result.
@@ -713,6 +1233,76 @@ pub enum CheckinStatus {
     Failed,
 }
 
+/// Business codes the check-in endpoint returns for "already claimed today".
+///
+/// The upstream does not agree on one code across deployments, and `code == 0`
+/// is *not* proof of a fresh claim: it also comes back for a repeat call that
+/// granted nothing. So these are checked independently of `code`.
+const ALREADY_CHECKIN_CODES: &[i64] = &[10001, 10002, 11217, 11101];
+
+/// Substrings that mark "already checked in" in a message, ASCII-lowercased
+/// before comparison so mixed-case English and Chinese both match (Chinese is
+/// unaffected by the lowering).
+const ALREADY_CHECKIN_WORDS: &[&str] = &[
+    "already",
+    "repeat",
+    "duplicate",
+    "已签到",
+    "已经签到",
+    "已打卡",
+    "已经打卡",
+    "今日已打卡",
+    "今日已完成",
+    "重复打卡",
+    "重复签到",
+    "已领取",
+    "已经领取",
+    "今日已领",
+    "重复领取",
+];
+
+/// Whether `msg`/`code` mean this account already claimed today's check-in.
+///
+/// Exposed as a pure predicate so the classification is unit-testable without
+/// a network call — the counting bug this fixes was precisely a misread of the
+/// response, and a heuristic this wide needs tests more than the I/O does.
+pub fn is_already_checked_in(code: Option<i64>, msg: &str) -> bool {
+    if let Some(code) = code {
+        if ALREADY_CHECKIN_CODES.contains(&code) {
+            return true;
+        }
+    }
+    // Compare case-insensitively; the Chinese entries pass through unchanged.
+    let lower = msg.to_lowercase();
+    ALREADY_CHECKIN_WORDS.iter().any(|w| lower.contains(w))
+}
+
+/// Whether a `code == 0` response actually granted points.
+///
+/// A repeat check-in returns success with no reward payload, so "success" is
+/// only claimed when a reward figure is present — otherwise the run is counted
+/// as already-checked-in rather than inflating the success counter.
+pub fn has_reward(val: &serde_json::Value) -> bool {
+    reward_points(val).is_some()
+}
+
+/// The reward point figure in a check-in response, if any.
+fn reward_points(val: &serde_json::Value) -> Option<f64> {
+    let data = val.get("data")?;
+    for key in ["rewardPoint", "rewardPoints", "points", "score", "point"] {
+        if let Some(n) = data.get(key).and_then(serde_json::Value::as_f64) {
+            return Some(n);
+        }
+        // Some deployments spell the reward as a string ("100").
+        if let Some(s) = data.get(key).and_then(serde_json::Value::as_str) {
+            if let Ok(n) = s.trim().parse::<f64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 /// Batch check-in report across all credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchCheckinReport {
@@ -724,18 +1314,31 @@ pub struct BatchCheckinReport {
 }
 
 /// Execute daily checkin for a single WorkBuddy credential.
+///
+/// `force` skips the "already claimed today" short-circuit: the GUI's manual
+/// button uses it so a user can re-run a claim the local record thinks is done
+/// (e.g. after the upstream reset at midnight in another timezone).
 pub async fn claim_daily_checkin(
     client: &reqwest::Client,
     cred: &WorkBuddyCredential,
 ) -> CheckinResult {
+    claim_daily_checkin_inner(client, cred, false).await
+}
+
+pub async fn claim_daily_checkin_forced(
+    client: &reqwest::Client,
+    cred: &WorkBuddyCredential,
+) -> CheckinResult {
+    claim_daily_checkin_inner(client, cred, true).await
+}
+
+async fn claim_daily_checkin_inner(
+    client: &reqwest::Client,
+    cred: &WorkBuddyCredential,
+    force: bool,
+) -> CheckinResult {
     let id = cred.id.clone();
-    let label = if !cred.label.is_empty() {
-        cred.label.clone()
-    } else if !cred.account.nickname.is_empty() {
-        cred.account.nickname.clone()
-    } else {
-        id.clone()
-    };
+    let label = display_label(cred);
 
     if cred.access_token.is_empty() {
         return CheckinResult {
@@ -743,6 +1346,19 @@ pub async fn claim_daily_checkin(
             label,
             status: CheckinStatus::Failed,
             message: "凭据缺少 access token".to_string(),
+            raw: None,
+        };
+    }
+
+    // Local-day guard: the scheduler runs unattended, so it must not re-claim
+    // an account that already got today's allowance.
+    let today = local_day(crate::util::unix_millis());
+    if !force && checked_in_today(cred, &today) {
+        return CheckinResult {
+            id,
+            label,
+            status: CheckinStatus::AlreadyCheckedIn,
+            message: "今日已打卡".to_string(),
             raw: None,
         };
     }
@@ -805,63 +1421,72 @@ pub async fn claim_daily_checkin(
         };
 
         let code = val.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-        let msg = val.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        // Some deployments spell the message field `message`, and some nest it
+        // under `data`. Both feed the already-checked-in classification, so all
+        // spellings are read before a fresh success is claimed.
+        let msg = val
+            .get("msg")
+            .or_else(|| val.get("message"))
+            .or_else(|| {
+                val.get("data")
+                    .and_then(|d| d.get("msg").or_else(|| d.get("message")))
+            })
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
 
         if code == 0 {
-            let reward_msg = if let Some(data) = val.get("data") {
-                if let Some(pts) = data
-                    .get("rewardPoint")
-                    .or_else(|| data.get("points"))
-                    .or_else(|| data.get("score"))
-                {
-                    format!("打卡成功，获得 +{} 积分", pts)
-                } else {
-                    "打卡成功，积分已领取".to_string()
-                }
-            } else {
-                "打卡成功".to_string()
-            };
-            return CheckinResult {
-                id,
-                label,
-                status: CheckinStatus::Success,
-                message: reward_msg,
-                raw: Some(val),
-            };
-        } else {
-            let lower_msg = msg.to_lowercase();
-            if lower_msg.contains("已签到")
-                || lower_msg.contains("已经签到")
-                || lower_msg.contains("repeat")
-                || lower_msg.contains("already")
-                || code == 10001
-                || code == 10002
-            {
+            // A repeat claim also answers `code == 0`, just without a reward
+            // payload — and sometimes with an "already" message. Counting those
+            // as fresh successes is what made 今日已打卡 read 0, so the reward
+            // is what decides success.
+            if is_already_checked_in(Some(code), msg) || !has_reward(&val) {
+                let _ = mark_checkin_done(&id);
                 return CheckinResult {
                     id,
                     label,
                     status: CheckinStatus::AlreadyCheckedIn,
-                    message: if msg.is_empty() {
-                        "今日已完成打卡".to_string()
-                    } else {
-                        msg.to_string()
-                    },
-                    raw: Some(val),
-                };
-            } else {
-                return CheckinResult {
-                    id,
-                    label,
-                    status: CheckinStatus::Failed,
-                    message: if msg.is_empty() {
-                        format!("打卡失败 (code {})", code)
-                    } else {
-                        msg.to_string()
-                    },
+                    message: "今日已打卡".to_string(),
                     raw: Some(val),
                 };
             }
+            let pts = reward_points(&val).unwrap_or_default();
+            // Remember the local day so the scheduler does not claim twice.
+            let _ = mark_checkin_done(&id);
+            return CheckinResult {
+                id,
+                label,
+                status: CheckinStatus::Success,
+                message: format!("打卡成功，获得 +{} 积分", pts),
+                raw: Some(val),
+            };
         }
+
+        if is_already_checked_in(Some(code), msg) {
+            let _ = mark_checkin_done(&id);
+            return CheckinResult {
+                id,
+                label,
+                status: CheckinStatus::AlreadyCheckedIn,
+                message: if msg.is_empty() {
+                    "今日已完成打卡".to_string()
+                } else {
+                    msg.to_string()
+                },
+                raw: Some(val),
+            };
+        }
+
+        return CheckinResult {
+            id,
+            label,
+            status: CheckinStatus::Failed,
+            message: if msg.is_empty() {
+                format!("打卡失败 (code {})", code)
+            } else {
+                msg.to_string()
+            },
+            raw: Some(val),
+        };
     }
 
     CheckinResult {
@@ -878,7 +1503,21 @@ pub async fn claim_daily_checkin(
 }
 
 /// Run daily checkin across all enabled credentials in the pool.
+///
+/// `force` is the manual button: it ignores the local "already claimed today"
+/// record, so a user who knows the upstream reset can re-claim deliberately.
 pub async fn batch_claim_daily_checkin(client: &reqwest::Client) -> BatchCheckinReport {
+    batch_claim_daily_checkin_inner(client, false).await
+}
+
+pub async fn batch_claim_daily_checkin_forced(client: &reqwest::Client) -> BatchCheckinReport {
+    batch_claim_daily_checkin_inner(client, true).await
+}
+
+async fn batch_claim_daily_checkin_inner(
+    client: &reqwest::Client,
+    force: bool,
+) -> BatchCheckinReport {
     let credentials = load_credentials();
     let enabled: Vec<_> = credentials.into_iter().filter(|c| c.enabled).collect();
     let total = enabled.len();
@@ -888,7 +1527,7 @@ pub async fn batch_claim_daily_checkin(client: &reqwest::Client) -> BatchCheckin
     let mut failed = 0;
 
     for cred in &enabled {
-        let res = claim_daily_checkin(client, cred).await;
+        let res = claim_daily_checkin_inner(client, cred, force).await;
         match res.status {
             CheckinStatus::Success => success += 1,
             CheckinStatus::AlreadyCheckedIn => already_checked_in += 1,
@@ -1037,10 +1676,116 @@ mod tests {
     }
 
     #[test]
+    fn local_day_uses_the_local_offset() {
+        // Two instants 12h apart around a UTC midnight must collapse to the
+        // same local day when the offset is large enough — this is what stops
+        // an evening claim from counting as the next morning's.
+        let offset = crate::util::local_utc_offset_secs();
+        let day = local_day(crate::util::unix_millis());
+        // Sanity: the day is a well-formed YYYY-MM-DD.
+        assert_eq!(day.len(), 10, "{day} (offset {offset})");
+        assert!(day.chars().filter(|c| *c == '-').count() == 2, "{day}");
+        // Same instant expressed through the function twice is stable.
+        let now = crate::util::unix_millis();
+        assert_eq!(local_day(now), local_day(now));
+    }
+
+    #[test]
+    fn checkin_day_record_round_trips() {
+        let mut c = parse_login_state(r#"{"accessToken":"day-test-token"}"#).unwrap();
+        let today = local_day(crate::util::unix_millis());
+        assert!(!checked_in_today(&c, &today));
+        c.last_checkin_date = Some(today.clone());
+        assert!(checked_in_today(&c, &today));
+        assert!(!checked_in_today(&c, "1999-01-01"));
+    }
+
+    #[test]
+    fn already_checked_in_reads_every_message_spelling() {
+        // The endpoint disagrees on the field name and on nesting; all of these
+        // must be recognised, or a repeat claim is miscounted as a success.
+        let cases = [
+            r#"{"code":500,"msg":"已签到"}"#,
+            r#"{"code":500,"message":"already claimed"}"#,
+            r#"{"code":500,"data":{"msg":"已打卡"}}"#,
+            r#"{"code":500,"data":{"message":"repeat"}}"#,
+        ];
+        for raw in cases {
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let msg = v
+                .get("msg")
+                .or_else(|| v.get("message"))
+                .or_else(|| {
+                    v.get("data")
+                        .and_then(|d| d.get("msg").or_else(|| d.get("message")))
+                })
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            assert!(
+                is_already_checked_in(v.get("code").and_then(|c| c.as_i64()), msg),
+                "{raw} -> msg {msg:?} not recognised"
+            );
+        }
+    }
+
+    #[test]
     fn generates_valid_qr_svg() {
         let svg = generate_qr_svg("https://copilot.tencent.com/login?state=test").unwrap();
         assert!(svg.contains("<svg"));
         assert!(svg.contains("</svg>"));
     }
-}
 
+    // ── Check-in classification ────────────────────────────────────────────
+    // These cover the counting bug: a repeat claim that answers `code == 0`
+    // used to be tallied as a fresh success, so 今日已打卡 always read 0.
+
+    #[test]
+    fn repeat_claim_with_code_zero_is_already_checked_in() {
+        // A repeat call answers `code == 0` with no reward payload. Neither the
+        // code nor the message alone says "already", so the missing reward is
+        // what classifies it — this is the case that used to be counted as a
+        // fresh success and made 今日已打卡 read 0.
+        let repeat: serde_json::Value = serde_json::from_str(r#"{"code":0,"data":{}}"#).unwrap();
+        assert!(!is_already_checked_in(Some(0), ""));
+        assert!(!has_reward(&repeat));
+        assert!(is_already_checked_in(Some(0), "") || !has_reward(&repeat));
+
+        // A repeat that *does* say so in the message is caught by the words.
+        assert!(is_already_checked_in(Some(0), "今日已打卡"));
+    }
+
+    #[test]
+    fn already_checked_in_matches_phrases_and_codes() {
+        for msg in [
+            "已签到",
+            "已经打卡",
+            "Already checked in",
+            "REPEAT",
+            "已领取",
+        ] {
+            assert!(is_already_checked_in(Some(4321), msg), "{msg}");
+        }
+        for code in [10001, 10002] {
+            assert!(is_already_checked_in(Some(code), ""), "code {code}");
+        }
+        // An unrelated failure must not be silently downgraded to "already".
+        assert!(!is_already_checked_in(Some(500), "internal error"));
+        assert!(!is_already_checked_in(None, ""));
+    }
+
+    #[test]
+    fn reward_payload_decides_a_fresh_success() {
+        let granted: serde_json::Value =
+            serde_json::from_str(r#"{"code":0,"data":{"rewardPoint":100}}"#).unwrap();
+        assert!(has_reward(&granted));
+        assert_eq!(reward_points(&granted), Some(100.0));
+
+        let repeat: serde_json::Value = serde_json::from_str(r#"{"code":0,"data":{}}"#).unwrap();
+        assert!(!has_reward(&repeat));
+
+        // A numeric string is a real deployment spelling of the same figure.
+        let as_string: serde_json::Value =
+            serde_json::from_str(r#"{"code":0,"data":{"points":"50"}}"#).unwrap();
+        assert_eq!(reward_points(&as_string), Some(50.0));
+    }
+}

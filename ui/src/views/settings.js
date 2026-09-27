@@ -163,9 +163,8 @@ export function renderSettings() {
 
   const credentials = section('credentials', 'WorkBuddy 账号池 (登录态)', html`
     <p class="hint">
-      支持<b>微信 / QQ 扫码一键登录授权</b>并自动保存至账号池；
-      也可以一键为账号池所有账号<b>每日打卡领积分</b>。默认凭据健康时所有请求走默认凭据；
-      某会话遇到限流/超额 (429/402) 时自动切换到备用凭据并保持粘滞。
+      支持<b>微信 / QQ 扫码一键登录授权</b>并自动保存至账号池；支持<b>每日定时打卡</b>领积分并显示剩余积分。
+      默认凭据健康时所有请求走默认凭据；某会话遇到限流/超额 (429/402) 时自动切换到备用凭据并保持粘滞。
     </p>
 
     <div class="wb-pool-toolbar">
@@ -175,34 +174,43 @@ export function renderSettings() {
       <button type="button" class="btn btn-small" id="btn-wb-checkin-all">
         🎁 账号池一键打卡
       </button>
+      <button type="button" class="btn btn-small" id="btn-wb-refresh-points">
+        💎 刷新积分
+      </button>
       <button type="button" class="btn btn-small" id="btn-wb-sticky-reset">
         重置会话粘滞
       </button>
-      <button type="button" class="btn btn-small btn-ghost" id="btn-wb-toggle-manual">
-        ⚙️ 手动粘贴 JSON
-      </button>
     </div>
 
-    <!-- Collapsible manual JSON import -->
-    <div id="wb-manual-section" class="wb-manual-section" style="display: none;">
-      <div class="form-group">
-        <label for="wb-login-state">登录态 JSON</label>
-        <textarea id="wb-login-state" class="log-input" rows="3"
-          placeholder='{"auth": {"accessToken": "...", "refreshToken": "..."}, "account": {"uid": "..."}}'
-          autocomplete="off"></textarea>
-      </div>
-      <div class="form-row">
-        ${raw(input('wb-label', '备注标签 (可选)', '例如 工作号', { group: 'half' }))}
-        <div class="form-group half">
-          <div class="actions-row">
-            <button type="button" class="btn btn-small btn-primary" id="btn-wb-add">＋ 导入凭据</button>
-          </div>
-        </div>
-      </div>
+    <div class="wb-schedule-row">
+      <label class="wb-checkbox-inline">
+        <input type="checkbox" id="wb-checkin-enabled">
+        <span>每日定时打卡</span>
+      </label>
+      <input type="time" id="wb-checkin-time" class="log-input wb-time-input" value="09:00">
+      <button type="button" class="btn btn-small" id="btn-wb-schedule-save">保存定时</button>
+      <span class="wb-schedule-hint" id="wb-schedule-hint"></span>
     </div>
 
     <div id="wb-credential-list" class="wb-credential-list"></div>
     <div class="hint" id="wb-status"></div>
+  `);
+
+  const apiKeys = section('api-keys', '上游 API Key 池', html`
+    <p class="hint">
+      可添加多个上游密钥并指定<b>默认使用</b>的密钥（用于 WorkBuddy <code>api key</code> 方式）。
+      账号池为空时，代理默认使用下方密钥池的默认密钥；密钥池也为空时回退到「模型提供商」里的单个 API Key。
+    </p>
+    <div class="wb-key-add-row">
+      <input type="password" id="wb-new-key" class="log-input wb-key-input"
+        placeholder="粘贴上游 API Key" autocomplete="off">
+      <input type="text" id="wb-new-key-label" class="log-input wb-label-input"
+        placeholder="备注 (可选)" autocomplete="off">
+      <button type="button" class="btn btn-small btn-primary" id="btn-wb-key-add">＋ 添加密钥</button>
+      <button type="button" class="btn btn-small btn-show-hide" id="btn-wb-key-visibility">显示</button>
+    </div>
+    <div id="wb-key-list" class="wb-credential-list"></div>
+    <div class="hint" id="wb-key-status"></div>
   `);
 
 
@@ -210,6 +218,7 @@ export function renderSettings() {
     <form id="settings-form" class="settings-form">
       ${raw(provider)}
       ${raw(credentials)}
+      ${raw(apiKeys)}
       ${raw(claude)}
       ${raw(codex)}
       ${raw(network)}
@@ -575,6 +584,15 @@ const WB_STATE_LABELS = {
   disabled: ['已禁用', 'wb-state-disabled'],
 };
 
+/** Format a point balance for display; `null` means "not queried yet". */
+function formatPoints(points) {
+  if (points === null || points === undefined) return '—';
+  const n = Number(points);
+  if (!Number.isFinite(n)) return '—';
+  // Integral balances read better without a decimal tail.
+  return Number.isInteger(n) ? String(n) : n.toFixed(2);
+}
+
 /** Repaint the credential list from the backend. */
 async function renderCredentialList() {
   const listEl = $('#wb-credential-list');
@@ -591,14 +609,33 @@ async function renderCredentialList() {
       const stickyNote = c.sticky_sessions > 0
         ? raw(`<span class="wb-sticky-note">${c.sticky_sessions} 个会话粘滞</span>`)
         : '';
-      return html`<div class="wb-credential-row">
+      // The default account is a radio-like choice, so it reads as selected
+      // rather than as another action button.
+      const defaultBadge = c.is_default
+        ? raw('<span class="badge-pill wb-default-pill">默认</span>')
+        : '';
+      const pointsChip = raw(
+        `<span class="wb-points" title="剩余积分">💎 ${formatPoints(c.points)}</span>`,
+      );
+      const checkinNote = c.checked_in_today
+        ? raw('<span class="wb-checkin-note">今日已打卡</span>')
+        : '';
+      return html`<div class="wb-credential-row${raw(c.is_default ? ' wb-credential-row--default' : '')}">
         <div class="wb-credential-main">
           <span class="wb-credential-label">${c.label || c.nickname || c.id}</span>
+          ${defaultBadge}
           <span class="badge-pill wb-state-pill ${stateClass}">${stateLabel}</span>
+          ${pointsChip}
+          ${checkinNote}
           ${stickyNote}
           <span class="wb-credential-id mono" title="${c.masked_token}">${c.id}</span>
         </div>
         <div class="wb-credential-actions">
+          <button type="button" class="btn btn-small${raw(c.is_default ? ' btn-active' : '')}"
+            data-wb-default="${c.id}" data-wb-is-default="${c.is_default ? '1' : '0'}"
+            title="设为默认使用的账号">${c.is_default ? '默认账号' : '设为默认'}</button>
+          <button type="button" class="btn btn-small" data-wb-points="${c.id}"
+            title="刷新此账号的剩余积分">刷新积分</button>
           <button type="button" class="btn btn-small" data-wb-checkin="${c.id}" title="为此账号每日打卡领积分">打卡</button>
           <button type="button" class="btn btn-small" data-wb-toggle="${c.id}" data-wb-enabled="${c.enabled ? '1' : '0'}">
             ${c.enabled ? '禁用' : '启用'}
@@ -607,6 +644,39 @@ async function renderCredentialList() {
         </div>
       </div>`;
     }).join('');
+
+    for (const btn of listEl.querySelectorAll('[data-wb-default]')) {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.wbDefault;
+        if (btn.dataset.wbIsDefault === '1') return;
+        btn.disabled = true;
+        try {
+          await invoke('wb_set_default', { id });
+          showWbStatus('已设置默认账号，立即生效（无需重启）');
+          await renderCredentialList();
+        } catch (e) {
+          showWbStatus('设置默认账号失败: ' + e, true);
+          btn.disabled = false;
+        }
+      });
+    }
+
+    for (const btn of listEl.querySelectorAll('[data-wb-points]')) {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.wbPoints;
+        btn.disabled = true;
+        btn.textContent = '...';
+        try {
+          await invoke('wb_refresh_points');
+          await renderCredentialList();
+          showWbStatus('已刷新账号池积分');
+        } catch (e) {
+          showWbStatus('刷新积分失败: ' + e, true);
+          btn.disabled = false;
+          btn.textContent = '刷新积分';
+        }
+      });
+    }
 
     for (const btn of listEl.querySelectorAll('[data-wb-checkin]')) {
       btn.addEventListener('click', async () => {
@@ -617,6 +687,7 @@ async function renderCredentialList() {
           const res = await invoke('wb_checkin_single', { id });
           const isOk = res.status === 'success' || res.status === 'already_checked_in';
           toast(`${res.label || id}: ${res.message}`, isOk ? 'ok' : 'error');
+          await renderCredentialList();
         } catch (e) {
           toast(`打卡失败: ${e}`, 'error');
         } finally {
@@ -644,14 +715,14 @@ async function renderCredentialList() {
         try {
           await invoke('wb_credentials_delete', { id });
           await renderCredentialList();
-          showWbStatus('凭据已删除（重启代理后完全生效）');
+          showWbStatus('账号已删除，立即生效');
         } catch (e) {
           showWbStatus('删除失败: ' + e, true);
         }
       });
     }
   } catch (e) {
-    listEl.innerHTML = html`<div class="hint">凭据加载失败: ${String(e)}</div>`;
+    listEl.innerHTML = html`<div class="hint">账号加载失败: ${String(e)}</div>`;
   }
 }
 
@@ -759,7 +830,9 @@ async function triggerBatchCheckin() {
   }
 
   try {
-    const report = await invoke('wb_checkin_all');
+    // The manual button forces: the local "already claimed today" record must
+    // not stop a run the user explicitly asked for.
+    const report = await invoke('wb_checkin_all', { force: true });
     if (report.total === 0) {
       toast('账号池中没有已启用的账号', 'error');
       return;
@@ -834,34 +907,195 @@ async function triggerBatchCheckin() {
   }
 }
 
+// ── Upstream API key pool ──────────────────────────────────────────────────
+
+function showKeyStatus(message, isError = false) {
+  const el = $('#wb-key-status');
+  if (!el) return;
+  el.textContent = message;
+  el.classList.toggle('error', isError);
+}
+
+/** Repaint the API key list from the backend. */
+async function renderApiKeyList() {
+  const listEl = $('#wb-key-list');
+  if (!listEl) return;
+  try {
+    const res = await invoke('api_keys_list');
+    const items = res?.keys || [];
+    if (!items.length) {
+      listEl.innerHTML = html`<div class="hint">密钥池为空。添加密钥后可指定默认使用的密钥；留空则使用「模型提供商」中的 API Key。</div>`;
+      return;
+    }
+    listEl.innerHTML = items.map((k) => {
+      const defaultBadge = k.is_default
+        ? raw('<span class="badge-pill wb-default-pill">默认</span>')
+        : '';
+      const statePill = k.enabled
+        ? raw('<span class="badge-pill wb-state-pill wb-state-ok">已启用</span>')
+        : raw('<span class="badge-pill wb-state-pill wb-state-disabled">已禁用</span>');
+      const pointsChip = raw(
+        `<span class="wb-points" title="剩余积分">💎 ${formatPoints(k.points)}</span>`,
+      );
+      return html`<div class="wb-credential-row${raw(k.is_default ? ' wb-credential-row--default' : '')}">
+        <div class="wb-credential-main">
+          <span class="wb-credential-label">${k.label || k.id}</span>
+          ${defaultBadge}
+          ${statePill}
+          ${pointsChip}
+          <span class="wb-credential-id mono" title="${k.masked}">${k.id}</span>
+        </div>
+        <div class="wb-credential-actions">
+          <button type="button" class="btn btn-small${raw(k.is_default ? ' btn-active' : '')}"
+            data-key-default="${k.id}" data-key-is-default="${k.is_default ? '1' : '0'}"
+            title="设为默认使用的密钥">${k.is_default ? '默认密钥' : '设为默认'}</button>
+          <button type="button" class="btn btn-small" data-key-toggle="${k.id}"
+            data-key-enabled="${k.enabled ? '1' : '0'}">${k.enabled ? '禁用' : '启用'}</button>
+          <button type="button" class="btn btn-small btn-danger" data-key-delete="${k.id}">删除</button>
+        </div>
+      </div>`;
+    }).join('');
+
+    for (const btn of listEl.querySelectorAll('[data-key-default]')) {
+      btn.addEventListener('click', async () => {
+        if (btn.dataset.keyIsDefault === '1') return;
+        btn.disabled = true;
+        try {
+          await invoke('api_keys_set_default', { id: btn.dataset.keyDefault });
+          showKeyStatus('已设置默认密钥（重启代理后生效）');
+          await renderApiKeyList();
+        } catch (e) {
+          showKeyStatus('设置默认密钥失败: ' + e, true);
+          btn.disabled = false;
+        }
+      });
+    }
+    for (const btn of listEl.querySelectorAll('[data-key-toggle]')) {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.keyToggle;
+        const enable = btn.dataset.keyEnabled !== '1';
+        try {
+          await invoke('api_keys_toggle', { id, enabled: enable });
+          await renderApiKeyList();
+        } catch (e) {
+          showKeyStatus('操作失败: ' + e, true);
+        }
+      });
+    }
+    for (const btn of listEl.querySelectorAll('[data-key-delete]')) {
+      btn.addEventListener('click', async () => {
+        try {
+          await invoke('api_keys_delete', { id: btn.dataset.keyDelete });
+          await renderApiKeyList();
+          showKeyStatus('密钥已删除');
+        } catch (e) {
+          showKeyStatus('删除失败: ' + e, true);
+        }
+      });
+    }
+  } catch (e) {
+    listEl.innerHTML = html`<div class="hint">密钥加载失败: ${String(e)}</div>`;
+  }
+}
+
+/** Load the persisted daily-check-in schedule into its controls. */
+async function loadSchedule() {
+  try {
+    const prefs = await invoke('wb_preferences');
+    if (!prefs) return;
+    const enabled = $('#wb-checkin-enabled');
+    const time = $('#wb-checkin-time');
+    if (enabled) enabled.checked = Boolean(prefs.daily_checkin_enabled);
+    if (time) time.value = prefs.daily_checkin_time || '09:00';
+    const hint = $('#wb-schedule-hint');
+    if (hint) {
+      hint.textContent = prefs.last_checkin_run_date
+        ? `上次定时打卡：${prefs.last_checkin_run_date}`
+        : '';
+    }
+  } catch (e) {
+    console.warn('loadSchedule error:', e);
+  }
+}
+
 /** Wire the credential-pool controls and paint the initial list. */
 function initCredentialPool() {
   $('#btn-wb-qrcode')?.addEventListener('click', startQrCodeLogin);
   $('#btn-wb-checkin-all')?.addEventListener('click', triggerBatchCheckin);
 
-  $('#btn-wb-toggle-manual')?.addEventListener('click', () => {
-    const sec = $('#wb-manual-section');
-    if (!sec) return;
-    const isHidden = sec.style.display === 'none';
-    sec.style.display = isHidden ? 'block' : 'none';
+  $('#btn-wb-refresh-points')?.addEventListener('click', async () => {
+    const btn = $('#btn-wb-refresh-points');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ 刷新中...';
+    }
+    try {
+      await invoke('wb_refresh_points');
+      await renderCredentialList();
+      showWbStatus('已刷新账号池剩余积分');
+    } catch (e) {
+      showWbStatus('刷新积分失败: ' + e, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '💎 刷新积分';
+      }
+    }
   });
 
-  $('#btn-wb-add')?.addEventListener('click', async () => {
-    const loginState = $('#wb-login-state')?.value.trim();
-    if (!loginState) {
-      showWbStatus('请先粘贴登录态 JSON', true);
+  $('#btn-wb-schedule-save')?.addEventListener('click', async () => {
+    const enabled = Boolean($('#wb-checkin-enabled')?.checked);
+    const time = $('#wb-checkin-time')?.value || '09:00';
+    const btn = $('#btn-wb-schedule-save');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '保存中...';
+    }
+    try {
+      const res = await invoke('wb_set_schedule', { enabled, time });
+      const hint = $('#wb-schedule-hint');
+      if (hint) {
+        hint.textContent = res.daily_checkin_enabled
+          ? `已开启：每天 ${res.daily_checkin_time} 自动打卡（应用启动时若当天未打卡会立即补打卡）`
+          : '已关闭定时打卡';
+      }
+      toast(
+        res.daily_checkin_enabled ? `已开启每日 ${res.daily_checkin_time} 定时打卡` : '已关闭定时打卡',
+        'ok',
+      );
+    } catch (e) {
+      showWbStatus('保存定时打卡失败: ' + e, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '保存定时';
+      }
+    }
+  });
+
+  // Key pool: visibility toggle mirrors the provider API-key field.
+  $('#btn-wb-key-visibility')?.addEventListener('click', () => {
+    const input = $('#wb-new-key');
+    const btn = $('#btn-wb-key-visibility');
+    const show = input?.type === 'password';
+    if (input) input.type = show ? 'text' : 'password';
+    if (btn) btn.textContent = show ? '隐藏' : '显示';
+  });
+
+  $('#btn-wb-key-add')?.addEventListener('click', async () => {
+    const key = $('#wb-new-key')?.value.trim();
+    if (!key) {
+      showKeyStatus('请先粘贴上游 API Key', true);
       return;
     }
     try {
-      await invoke('wb_credentials_add', {
-        body: { loginState, label: $('#wb-label')?.value || '' },
-      });
-      if ($('#wb-login-state')) $('#wb-login-state').value = '';
-      if ($('#wb-label')) $('#wb-label').value = '';
-      showWbStatus('凭据已导入。重启代理后以账号身份请求上游。');
-      await renderCredentialList();
+      await invoke('api_keys_add', { key, label: $('#wb-new-key-label')?.value || '' });
+      if ($('#wb-new-key')) $('#wb-new-key').value = '';
+      if ($('#wb-new-key-label')) $('#wb-new-key-label').value = '';
+      showKeyStatus('密钥已加入密钥池');
+      await renderApiKeyList();
     } catch (e) {
-      showWbStatus('导入失败: ' + e, true);
+      showKeyStatus('添加失败: ' + e, true);
     }
   });
 
@@ -876,5 +1110,7 @@ function initCredentialPool() {
   });
 
   renderCredentialList();
+  renderApiKeyList();
+  loadSchedule();
 }
 

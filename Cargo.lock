@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-rs"
-version = "1.8.1"
+version = "1.8.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3025,6 +3025,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -3032,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-rs-gui"
-version = "1.8.1"
+version = "1.8.2"
 dependencies = [
  "anyhow",
  "axum",

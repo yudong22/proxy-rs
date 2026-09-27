@@ -24,7 +24,31 @@ body {
   /* The window is a fixed-size app shell: the individual panes scroll, not the
      document, so the header and tabs never move. */
   user-select: none;
+  /* The unprefixed property alone does not take effect in the macOS WKWebView
+     this app ships in, so window chrome stayed highlightable there. Stated
+     explicitly for the engines that need it. */
+  -webkit-user-select: none;
   overflow: hidden;
+}
+
+/* Window chrome must never be selectable: the header is also the drag region,
+   so a drag that starts on a label would otherwise paint a text selection
+   instead of moving the window. Restated with the prefix because the webview
+   ignores the unprefixed declaration, and with `*` so a future child does not
+   opt back in by accident. */
+.header,
+.header *,
+.tabs,
+.tabs * {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+/* Dragging the window by the title bar is the point of the header, so it keeps
+   the drag cursor away from the buttons, which opt into `pointer` themselves. */
+.header[data-tauri-drag-region] {
+  -webkit-app-region: drag;
 }
 
 code, pre, .mono {
@@ -467,6 +491,7 @@ input:checked + .toggle-slider::before {
   outline: none;
   font-family: inherit;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .palette-list {

@@ -389,6 +389,7 @@ async fn get_providers() -> Result<Value, String> {
 fn mask_credential(
     c: &proxy_rs::workbuddy_auth::WorkBuddyCredential,
     sticky_sessions: usize,
+    is_default: bool,
 ) -> Value {
     let now = proxy_rs::util::unix_millis();
     let state = if !c.enabled {
@@ -415,6 +416,14 @@ fn mask_credential(
         "state": state,
         "last_error": c.last_error,
         "sticky_sessions": sticky_sessions,
+        "is_default": is_default,
+        // `null` means "not queried yet" — distinct from a real 0 balance.
+        "points": c.points,
+        "points_fetched_at_ms": c.points_fetched_at_ms,
+        "checked_in_today": proxy_rs::workbuddy_auth::checked_in_today(
+            c,
+            &proxy_rs::workbuddy_auth::local_day(now),
+        ),
     })
 }
 
@@ -422,8 +431,27 @@ fn mask_credential(
 async fn wb_credentials_list(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     let items = proxy_rs::workbuddy_auth::load_credentials();
     let sticky = ctx.credential_pool.sticky_count().await;
-    let list: Vec<Value> = items.iter().map(|c| mask_credential(c, sticky)).collect();
-    Ok(json!({ "credentials": list }))
+    let prefs = proxy_rs::workbuddy_auth::load_preferences();
+    // With no explicit default the first usable credential is the one in force,
+    // so the badge follows the same rule the pool's `pick` uses.
+    let effective_default = items
+        .iter()
+        .find(|c| c.is_usable(proxy_rs::util::unix_millis()))
+        .map(|c| c.id.clone())
+        .unwrap_or_default();
+    let default_id = if prefs.default_credential_id.is_empty() {
+        effective_default
+    } else {
+        prefs.default_credential_id.clone()
+    };
+    let list: Vec<Value> = items
+        .iter()
+        .map(|c| mask_credential(c, sticky, c.id == default_id))
+        .collect();
+    Ok(json!({
+        "credentials": list,
+        "default_credential_id": prefs.default_credential_id,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -445,6 +473,7 @@ async fn wb_credentials_add(
         credential.label = body.label.trim().to_string();
     }
     proxy_rs::workbuddy_auth::upsert_credential(credential.clone()).map_err(|e| e.to_string())?;
+    reload_pool(&ctx).await;
     ctx.logs
         .push(
             "INFO",
@@ -454,7 +483,7 @@ async fn wb_credentials_add(
             ),
         )
         .await;
-    Ok(mask_credential(&credential, 0))
+    Ok(mask_credential(&credential, 0, false))
 }
 
 #[tauri::command]
@@ -465,9 +494,9 @@ async fn wb_credentials_delete(
     let items = proxy_rs::workbuddy_auth::load_credentials();
     let remaining: Vec<_> = items.into_iter().filter(|c| c.id != id).collect();
     proxy_rs::workbuddy_auth::save_credentials(&remaining).map_err(|e| e.to_string())?;
-    // The pool rebuilds on the next proxy restart; drop the sticky bindings
-    // pointing at the removed credential right away so no session stays pinned.
-    ctx.credential_pool.reset_sticky().await;
+    // Hot-apply: reload drops only the bindings pointing at the removed
+    // credential, rather than resetting every session's stickiness.
+    reload_pool(&ctx).await;
     ctx.logs
         .push("INFO", format!("WorkBuddy 凭据已删除: {}", id))
         .await;
@@ -490,6 +519,7 @@ async fn wb_credentials_toggle(
         c.last_error.clear();
     }
     proxy_rs::workbuddy_auth::save_credentials(&items).map_err(|e| e.to_string())?;
+    reload_pool(&ctx).await;
     if enabled {
         ctx.credential_pool.mark_ok(&id).await;
     }
@@ -504,6 +534,240 @@ async fn wb_credentials_toggle(
         )
         .await;
     Ok(json!({ "ok": true }))
+}
+
+/// Reload the in-memory pool after a default/credential change.
+///
+/// The proxy picks credentials from the pool on every request, so this is what
+/// makes a newly selected default take effect without a service restart.
+async fn reload_pool(ctx: &Arc<AppContext>) {
+    ctx.credential_pool.reload_from_store().await;
+}
+
+#[tauri::command]
+async fn wb_set_default(ctx: State<'_, Arc<AppContext>>, id: String) -> Result<Value, String> {
+    let prefs = proxy_rs::workbuddy_auth::set_default_credential(&id).map_err(|e| e.to_string())?;
+    reload_pool(&ctx).await;
+    ctx.logs
+        .push("INFO", format!("已设置默认 WorkBuddy 账号: {}", id))
+        .await;
+    Ok(json!({ "ok": true, "default_credential_id": prefs.default_credential_id }))
+}
+
+#[tauri::command]
+async fn wb_preferences() -> Result<Value, String> {
+    let prefs = proxy_rs::workbuddy_auth::load_preferences();
+    Ok(json!({
+        "default_credential_id": prefs.default_credential_id,
+        "default_key_id": prefs.default_key_id,
+        "daily_checkin_enabled": prefs.daily_checkin_enabled,
+        "daily_checkin_time": prefs.daily_checkin_time,
+        "last_checkin_run_date": prefs.last_checkin_run_date,
+    }))
+}
+
+#[tauri::command]
+async fn wb_set_schedule(
+    ctx: State<'_, Arc<AppContext>>,
+    enabled: bool,
+    time: String,
+) -> Result<Value, String> {
+    let prefs =
+        proxy_rs::workbuddy_auth::save_schedule(enabled, &time).map_err(|e| e.to_string())?;
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "每日定时打卡已{}（{}）",
+                if enabled { "开启" } else { "关闭" },
+                prefs.daily_checkin_time
+            ),
+        )
+        .await;
+    Ok(json!({
+        "ok": true,
+        "daily_checkin_enabled": prefs.daily_checkin_enabled,
+        "daily_checkin_time": prefs.daily_checkin_time,
+    }))
+}
+
+#[tauri::command]
+async fn wb_refresh_points(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    let report = proxy_rs::workbuddy_auth::refresh_all_points(&ctx.client).await;
+    let known = report.results.iter().filter(|r| r.points.is_some()).count();
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "已刷新账号池积分: {} 个账号，{} 个读取成功",
+                report.results.len(),
+                known
+            ),
+        )
+        .await;
+    Ok(json!({ "results": report.results }))
+}
+
+#[tauri::command]
+async fn wb_checkin_all(
+    ctx: State<'_, Arc<AppContext>>,
+    force: Option<bool>,
+) -> Result<Value, String> {
+    let forced = force.unwrap_or(false);
+    let report = if forced {
+        proxy_rs::workbuddy_auth::batch_claim_daily_checkin_forced(&ctx.client).await
+    } else {
+        proxy_rs::workbuddy_auth::batch_claim_daily_checkin(&ctx.client).await
+    };
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "WorkBuddy 账号池打卡完成: 共 {} 个，成功 {} 个，已打卡 {} 个，失败 {} 个",
+                report.total, report.success, report.already_checked_in, report.failed
+            ),
+        )
+        .await;
+    Ok(json!(report))
+}
+
+#[tauri::command]
+async fn wb_checkin_single(ctx: State<'_, Arc<AppContext>>, id: String) -> Result<Value, String> {
+    let items = proxy_rs::workbuddy_auth::load_credentials();
+    let Some(c) = items.into_iter().find(|item| item.id == id) else {
+        return Err(format!("凭据不存在: {}", id));
+    };
+    // The manual button ignores the local "already claimed" record: the user is
+    // asking for this one explicitly.
+    let res = proxy_rs::workbuddy_auth::claim_daily_checkin_forced(&ctx.client, &c).await;
+    ctx.logs
+        .push(
+            "INFO",
+            format!("WorkBuddy 账号 {} 打卡结果: {}", id, res.message),
+        )
+        .await;
+    Ok(json!(res))
+}
+
+// ── Upstream API key pool ──────────────────────────────────────────────────
+
+/// Mask one key entry for the GUI; the raw key never leaves the backend.
+fn mask_api_key(k: &proxy_rs::workbuddy_auth::ApiKeyEntry, is_default: bool) -> Value {
+    json!({
+        "id": k.id,
+        "label": k.label,
+        "masked": k.masked(),
+        "enabled": k.enabled,
+        "points": k.points,
+        "is_default": is_default,
+    })
+}
+
+#[tauri::command]
+async fn api_keys_list() -> Result<Value, String> {
+    let items = proxy_rs::workbuddy_auth::load_api_keys();
+    let prefs = proxy_rs::workbuddy_auth::load_preferences();
+    // With no explicit default the first enabled key is the one in force, so
+    // the badge follows the same rule `active_api_key` uses.
+    let effective = proxy_rs::workbuddy_auth::active_api_key();
+    let list: Vec<Value> = items
+        .iter()
+        .map(|k| {
+            let is_default = if !prefs.default_key_id.is_empty() {
+                k.id == prefs.default_key_id
+            } else {
+                effective.as_deref() == Some(k.key.as_str())
+            };
+            mask_api_key(k, is_default)
+        })
+        .collect();
+    Ok(json!({ "keys": list, "default_key_id": prefs.default_key_id }))
+}
+
+#[derive(Deserialize)]
+struct ApiKeyAddBody {
+    key: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[tauri::command]
+async fn api_keys_add(
+    ctx: State<'_, Arc<AppContext>>,
+    body: ApiKeyAddBody,
+) -> Result<Value, String> {
+    let key = body.key.trim().to_string();
+    if key.is_empty() {
+        return Err("密钥不能为空".to_string());
+    }
+    let entry = proxy_rs::workbuddy_auth::ApiKeyEntry {
+        id: proxy_rs::workbuddy_auth::api_key_id(&key),
+        label: body.label.trim().to_string(),
+        key,
+        enabled: true,
+        points: None,
+        points_fetched_at_ms: None,
+    };
+    proxy_rs::workbuddy_auth::upsert_api_key(entry.clone()).map_err(|e| e.to_string())?;
+    ctx.logs
+        .push("INFO", format!("上游密钥已加入密钥池: {}", entry.id))
+        .await;
+    Ok(mask_api_key(&entry, false))
+}
+
+#[tauri::command]
+async fn api_keys_delete(ctx: State<'_, Arc<AppContext>>, id: String) -> Result<Value, String> {
+    let items = proxy_rs::workbuddy_auth::load_api_keys();
+    let remaining: Vec<_> = items.into_iter().filter(|k| k.id != id).collect();
+    proxy_rs::workbuddy_auth::save_api_keys(&remaining).map_err(|e| e.to_string())?;
+    // A dangling default pointer would silently fall through to the first key
+    // anyway, but clearing it keeps the GUI badge honest.
+    let mut prefs = proxy_rs::workbuddy_auth::load_preferences();
+    if prefs.default_key_id == id {
+        prefs.default_key_id.clear();
+        let _ = proxy_rs::workbuddy_auth::save_preferences(&prefs);
+    }
+    ctx.logs
+        .push("INFO", format!("上游密钥已删除: {}", id))
+        .await;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+async fn api_keys_toggle(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    let mut items = proxy_rs::workbuddy_auth::load_api_keys();
+    let Some(k) = items.iter_mut().find(|k| k.id == id) else {
+        return Err(format!("密钥不存在: {}", id));
+    };
+    k.enabled = enabled;
+    proxy_rs::workbuddy_auth::save_api_keys(&items).map_err(|e| e.to_string())?;
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "上游密钥 {} 已{}",
+                id,
+                if enabled { "启用" } else { "禁用" }
+            ),
+        )
+        .await;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+async fn api_keys_set_default(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<Value, String> {
+    let prefs = proxy_rs::workbuddy_auth::set_default_api_key(&id).map_err(|e| e.to_string())?;
+    ctx.logs
+        .push("INFO", format!("已设置默认上游密钥: {}", id))
+        .await;
+    Ok(json!({ "ok": true, "default_key_id": prefs.default_key_id }))
 }
 
 #[tauri::command]
@@ -532,10 +796,7 @@ async fn wb_oauth_start(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String
 }
 
 #[tauri::command]
-async fn wb_oauth_poll(
-    ctx: State<'_, Arc<AppContext>>,
-    state: String,
-) -> Result<Value, String> {
+async fn wb_oauth_poll(ctx: State<'_, Arc<AppContext>>, state: String) -> Result<Value, String> {
     let client = reqwest::Client::new();
     let res = proxy_rs::workbuddy_auth::poll_oauth_token(&client, None, &state)
         .await
@@ -558,48 +819,11 @@ async fn wb_oauth_poll(
                 .await;
             Ok(json!({
                 "status": "success",
-                "credential": mask_credential(&credential, 0),
+                "credential": mask_credential(&credential, 0, false),
             }))
         }
     }
 }
-
-#[tauri::command]
-async fn wb_checkin_all(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
-    let client = reqwest::Client::new();
-    let report = proxy_rs::workbuddy_auth::batch_claim_daily_checkin(&client).await;
-    ctx.logs
-        .push(
-            "INFO",
-            format!(
-                "WorkBuddy 账号池打卡完成: 共 {} 个，成功 {} 个，已打卡 {} 个，失败 {} 个",
-                report.total, report.success, report.already_checked_in, report.failed
-            ),
-        )
-        .await;
-    Ok(json!(report))
-}
-
-#[tauri::command]
-async fn wb_checkin_single(
-    ctx: State<'_, Arc<AppContext>>,
-    id: String,
-) -> Result<Value, String> {
-    let items = proxy_rs::workbuddy_auth::load_credentials();
-    let Some(c) = items.into_iter().find(|item| item.id == id) else {
-        return Err(format!("凭据不存在: {}", id));
-    };
-    let client = reqwest::Client::new();
-    let res = proxy_rs::workbuddy_auth::claim_daily_checkin(&client, &c).await;
-    ctx.logs
-        .push(
-            "INFO",
-            format!("WorkBuddy 账号 {} 打卡结果: {}", id, res.message),
-        )
-        .await;
-    Ok(json!(res))
-}
-
 
 #[tauri::command]
 async fn fetch_models(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
@@ -1082,14 +1306,17 @@ fn main() {
         server_epoch: Arc::new(AtomicU16::new(0)),
         is_launchd_child,
         // Credentials are re-read on every proxy (re)start, so a credential
-        // saved in the GUI hot-applies with the rest of the settings.
+        // saved in the GUI hot-applies with the rest of the settings. Ordered:
+        // the GUI-selected default goes first, which is what makes it the
+        // default (the pool picks the first usable entry).
         credential_pool: Arc::new(proxy_rs::session_pool::CredentialPool::new(
-            proxy_rs::workbuddy_auth::load_credentials(),
+            proxy_rs::workbuddy_auth::ordered_credentials(),
         )),
     });
 
     let ctx_for_setup = ctx.clone();
     let ctx_for_tray = ctx.clone();
+    let ctx_for_scheduler = ctx.clone();
 
     let mut builder = tauri::Builder::default();
 
@@ -1142,6 +1369,16 @@ fn main() {
 
             let app_handle = app.handle().clone();
             start_proxy_server(app_handle.clone(), ctx_for_setup);
+
+            // Daily check-in scheduler. Independent of the proxy listener: it
+            // must run whether or not the local gateway is up, and it lives for
+            // the whole process, so it gets its own cancellation token that is
+            // never cancelled in practice (dropping it on exit stops the task).
+            proxy_rs::scheduler::spawn_daily_checkin(
+                ctx_for_scheduler.client.clone(),
+                ctx_for_scheduler.logs.clone(),
+                tokio_util::sync::CancellationToken::new(),
+            );
 
             // Build Tray Menu
             let status_i =
@@ -1240,9 +1477,17 @@ fn main() {
             wb_oauth_start,
             wb_oauth_poll,
             wb_checkin_all,
-            wb_checkin_single
+            wb_checkin_single,
+            wb_set_default,
+            wb_preferences,
+            wb_set_schedule,
+            wb_refresh_points,
+            api_keys_list,
+            api_keys_add,
+            api_keys_delete,
+            api_keys_toggle,
+            api_keys_set_default
         ])
-
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {

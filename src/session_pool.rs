@@ -126,10 +126,20 @@ impl CredentialPool {
     pub async fn switch(&self, session_id: &str, from: &str) -> Option<WorkBuddyCredential> {
         let now = crate::util::unix_millis();
         let entries = self.entries.read().await;
-        let candidates: Vec<&WorkBuddyCredential> = entries
+        let mut candidates: Vec<&WorkBuddyCredential> = entries
             .iter()
             .filter(|c| c.id != from && c.is_usable(now))
             .collect();
+        // Most remaining points first, when a refresh has recorded them: a
+        // failover should land on the account that can actually keep serving.
+        // Credentials with no figure sort last (treated as unknown, not zero),
+        // and ties keep store order.
+        candidates.sort_by(|a, b| {
+            b.points
+                .unwrap_or(-1.0)
+                .partial_cmp(&a.points.unwrap_or(-1.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let chosen = (*candidates.first()?).clone();
 
         let mut switched = self.switched.write().await;
@@ -177,6 +187,30 @@ impl CredentialPool {
             c.cooldown_until_ms = None;
             c.last_error.clear();
         }
+    }
+
+    /// Replace the credential list, preserving the sticky bindings.
+    ///
+    /// Called when the GUI changes the default account or imports/deletes one.
+    /// Only the bindings pointing at a credential that no longer exists are
+    /// dropped; the rest keep their session on the account they were relocated
+    /// to, so re-selecting a default does not invalidate everyone's cache.
+    pub async fn reload(&self, credentials: Vec<WorkBuddyCredential>) {
+        let present: std::collections::HashSet<String> =
+            credentials.iter().map(|c| c.id.clone()).collect();
+        *self.entries.write().await = credentials;
+        self.switched
+            .write()
+            .await
+            .retain(|_, s| present.contains(&s.credential_id));
+    }
+
+    /// Reload from the credential store, honouring the selected default's
+    /// ordering. The GUI calls this after a selection change so the running
+    /// proxy picks up the new default without a restart.
+    pub async fn reload_from_store(&self) {
+        self.reload(crate::workbuddy_auth::ordered_credentials())
+            .await;
     }
 
     /// Drop every sticky binding: all sessions return to the default
@@ -341,5 +375,46 @@ mod tests {
         let p = CredentialPool::empty();
         assert!(!p.is_enabled().await);
         assert!(p.pick("claude:s1").await.is_none());
+    }
+
+    /// Failover prefers the credential with the most remaining points.
+    ///
+    /// This is why the GUI refreshes and stores points: the switch is the one
+    /// moment the "most remaining quota" rule is consulted.
+    #[tokio::test]
+    async fn failover_prefers_the_most_remaining_points() {
+        let mut items = vec![cred("wb-a"), cred("wb-b"), cred("wb-c")];
+        items[1].points = Some(500.0);
+        items[2].points = Some(50.0);
+        // wb-a has no figure: unknown, so it sorts last behind both.
+        let p = CredentialPool::new(items);
+
+        let chosen = p.switch("claude:s1", "wb-a").await.unwrap();
+        assert_eq!(chosen.id, "wb-b", "most points wins");
+    }
+
+    /// Reloading keeps sticky bindings whose credential still exists and drops
+    /// the ones pointing at a removed credential.
+    #[tokio::test]
+    async fn reload_preserves_live_bindings_and_drops_dead_ones() {
+        let p = pool(&["wb-a", "wb-b"]);
+        p.switch("claude:s1", "wb-a").await.unwrap();
+        assert_eq!(p.sticky_count().await, 1);
+
+        // wb-b — where s1 landed — is removed.
+        p.reload(vec![cred("wb-a")]).await;
+        assert_eq!(
+            p.sticky_count().await,
+            0,
+            "bindings to a deleted credential must go"
+        );
+
+        // A reload that keeps the credential preserves the binding, so
+        // re-selecting a default does not invalidate everyone's cache.
+        let p2 = pool(&["wb-a", "wb-b"]);
+        p2.switch("claude:s1", "wb-a").await.unwrap();
+        p2.reload(vec![cred("wb-b"), cred("wb-a")]).await;
+        assert_eq!(p2.sticky_count().await, 1);
+        assert_eq!(p2.pick("claude:s1").await.unwrap().id, "wb-b");
     }
 }

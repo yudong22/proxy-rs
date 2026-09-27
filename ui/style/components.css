@@ -96,6 +96,7 @@
   align-items: center;
   gap: 8px;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 /* ── Log Pane Chrome (shared by the table and console views) ──── */
@@ -409,6 +410,7 @@
   min-height: 0;
   font: 12px/1.6 var(--mono);
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .log-line {

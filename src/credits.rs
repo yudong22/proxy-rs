@@ -32,10 +32,10 @@ use crate::config::ModelsFlavor;
 
 /// WorkBuddy/CodeBuddy billing host. The CLI chat endpoint (`copilot.tencent.com`)
 /// serves inference; billing lives on the product site.
-const WORKBUDDY_BILLING_HOST: &str = "https://www.codebuddy.cn";
-const WORKBUDDY_RESOURCE_PATH: &str = "/v2/billing/meter/get-user-resource";
+pub const WORKBUDDY_BILLING_HOST: &str = "https://www.codebuddy.cn";
+pub const WORKBUDDY_RESOURCE_PATH: &str = "/v2/billing/meter/get-user-resource";
 /// Product code used by the official balance console for CodeBuddy packages.
-const WORKBUDDY_RESOURCE_PRODUCT_CODE: &str = "p_tcaca";
+pub const WORKBUDDY_RESOURCE_PRODUCT_CODE: &str = "p_tcaca";
 
 /// Fields that may carry the *remaining* credit amount of a package.
 const REMAINING_FIELDS: &[&str] = &[
@@ -202,6 +202,29 @@ fn chrono_like(epoch: i64, _fmt: &str) -> String {
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     crate::util::civil_from_days(z)
+}
+
+/// Sum the remaining balance of a WorkBuddy resource response.
+///
+/// Exposed for per-account point queries (`workbuddy_auth`), which need the
+/// same "summary fields at account level, else sum the segments" aggregation
+/// `fetch_credits` applies to the wallet total — duplicating it would let the
+/// pool's per-account numbers drift from the overview's total.
+pub fn remaining_from_response(value: &Value) -> f64 {
+    let accounts = collect_accounts(value);
+    let mut sum = 0.0_f64;
+    for account in &accounts {
+        if let Some(r) = first_number(account, SUMMARY_REMAINING_FIELDS) {
+            sum += r;
+        }
+    }
+    if sum > 0.0 {
+        return sum;
+    }
+    merge_segments(parse_workbuddy(value))
+        .iter()
+        .map(|s| s.remaining)
+        .sum()
 }
 
 fn now_epoch() -> f64 {

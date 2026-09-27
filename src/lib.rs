@@ -9,6 +9,7 @@ pub mod models;
 pub mod providers;
 pub mod proxy;
 pub mod router;
+pub mod scheduler;
 pub mod service;
 pub mod session;
 pub mod session_pool;

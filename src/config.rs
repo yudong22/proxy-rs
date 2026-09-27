@@ -229,7 +229,11 @@ impl Config {
                     }
                 }),
             upstream_urls,
-            api_key: Some(settings.api_key.trim().to_string()).filter(|k| !k.is_empty()),
+            // The key pool's default wins when one is configured; otherwise the
+            // single `api_key` field keeps working exactly as before, so a
+            // 1.7.x setup is untouched.
+            api_key: crate::workbuddy_auth::active_api_key()
+                .or_else(|| Some(settings.api_key.trim().to_string()).filter(|k| !k.is_empty())),
             reasoning_model: Some(settings.reasoning_model.trim().to_string())
                 .filter(|m| !m.is_empty()),
             completion_model: Some(settings.completion_model.trim().to_string())

@@ -1,6 +1,6 @@
 [package]
 name = "proxy-rs"
-version = "1.8.1"
+version = "1.8.2"
 edition = "2021"
 authors = [
     "yudong22 (孙东) <3cking@163.com>",
@@ -20,8 +20,9 @@ members = [
 ]
 
 [dependencies]
-# Async runtime
-tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "sync", "net"] }
+# Async runtime. `time` enables the interval the daily check-in scheduler ticks on.
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
+tokio-util = "0.7"
 
 # Web framework
 axum = { version = "0.7", features = ["http2"] }
