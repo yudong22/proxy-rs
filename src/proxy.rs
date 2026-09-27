@@ -10,7 +10,7 @@ use crate::util::{self, format_headers, truncate};
 use axum::{
     body::Body,
     extract::{FromRequest, Request},
-    http::{HeaderMap, HeaderValue},
+    http::{HeaderMap, HeaderName, HeaderValue},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -948,10 +948,14 @@ async fn forward_request(
                 );
 
                 let mut req_builder = client.post(url).json(&openai_req);
-                req_builder = apply_upstream_auth(req_builder, &config, &api_key);
-                if let Some(cred) = &current_credential {
-                    req_builder = apply_credential_auth(req_builder, cred);
-                }
+                // Credential auth is authoritative when present: the token must
+                // not be accompanied by a static-key Authorization/x-api-key.
+                req_builder = apply_upstream_auth(
+                    req_builder,
+                    &config,
+                    &api_key,
+                    current_credential.as_ref(),
+                );
                 if !streaming {
                     // Streaming requests get no per-request timeout on purpose: a
                     // total timeout hard-kills any stream that outlives it — exactly
@@ -1138,6 +1142,7 @@ async fn forward_request(
                             &client,
                             &openai_req,
                             &api_key,
+                            current_credential.as_ref(),
                             &gui_logs,
                             &client_model,
                             &stats,
@@ -1722,52 +1727,102 @@ fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
 /// `X-Requested-With`). These are cheap and were validated as passing in the
 /// troubleshooting doc's "full headers" test, so we send them proactively.
 /// Other providers keep the plain `Authorization` flow.
+///
+/// `credential` — when the request is served by a login-state credential — is
+/// authoritative: its bearer token replaces *both* the `Authorization` and
+/// `x-api-key` values, and no static-key value survives. This must be a single
+/// header map because reqwest's `.header()` *appends* rather than replaces, so
+/// issuing a static-key `Authorization` and then a credential `Authorization`
+/// would put two conflicting values on the wire and the Tencent `stgw` gateway
+/// answers that with a bare HTML `400 Bad Request`.
 fn apply_upstream_auth(
     mut req: reqwest::RequestBuilder,
     config: &Config,
     api_key: &Option<String>,
+    credential: Option<&crate::workbuddy_auth::WorkBuddyCredential>,
 ) -> reqwest::RequestBuilder {
-    if config.models_flavor == ModelsFlavor::WorkBuddyConfig {
-        req = req
-            .header("user-agent", crate::providers::WORKBUDDY_USER_AGENT)
-            .header("x-codebuddy-request", "1")
-            .header("accept", "application/json, text/event-stream")
-            .header("x-requested-with", "XMLHttpRequest");
-        if let Some(ref key) = api_key {
-            req = req
-                .header("x-api-key", key)
-                .header("Authorization", format!("Bearer {}", key));
-        }
-    } else if let Some(ref key) = api_key {
-        req = req.header("Authorization", format!("Bearer {}", key));
+    let headers = upstream_auth_headers(config, api_key, credential);
+    if !headers.is_empty() {
+        req = req.headers(headers);
     }
     req
 }
 
-/// Attach the login-state credential fingerprint to an outbound request.
+/// Build the outbound auth/fingerprint header map (pure; unit-tested).
 ///
-/// The bearer token replaces the static key path, and the session-bound
-/// headers (user/enterprise/machine/domain) reproduce what the genuine desktop
-/// client sends — exactly what the `11128 unapproved channel` rejection checks.
-///
-/// Critically, when a credential is in use the request must present a *single*,
-/// consistent identity. `apply_upstream_auth` (for the WorkBuddy flavor) may
-/// have already injected an `x-api-key` from the key-pool default; leaving a
-/// mismatched `x-api-key` (a different key than the bearer token) alongside the
-/// login-state bearer is exactly what makes the gateway reject the request with
-/// an opaque 502. So we overwrite `x-api-key` with the token here, mirroring the
-/// proven `fetch_points` call which authenticates with the token in both
-/// `Authorization` and `X-API-Key`. A credential session is key-pool-independent.
-fn apply_credential_auth(
-    mut req: reqwest::RequestBuilder,
-    credential: &crate::workbuddy_auth::WorkBuddyCredential,
-) -> reqwest::RequestBuilder {
-    req = req.header("Authorization", format!("Bearer {}", credential.bearer()));
-    req = req.header("X-API-Key", credential.bearer());
-    for (name, value) in crate::workbuddy_auth::upstream_headers(credential) {
-        req = req.header(name, value);
+/// Every value is inserted with replace semantics. This matters because the
+/// caller applies the map to a `reqwest::RequestBuilder` whose `.header()` API
+/// *appends*: building the map here and applying it once means a credential and
+/// a static key can never both contribute an `Authorization`/`x-api-key` value,
+/// which is what produced the duplicate-header `400 Bad Request` from `stgw`.
+fn upstream_auth_headers(
+    config: &Config,
+    api_key: &Option<String>,
+    credential: Option<&crate::workbuddy_auth::WorkBuddyCredential>,
+) -> HeaderMap {
+    let workbuddy = config.models_flavor == ModelsFlavor::WorkBuddyConfig;
+    let mut headers = HeaderMap::new();
+
+    if workbuddy {
+        // Official-client fingerprint; cheap and validated as passing.
+        let mut put = |name: &'static str, value: &str| {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(value).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        };
+        put("user-agent", crate::providers::WORKBUDDY_USER_AGENT);
+        put("x-codebuddy-request", "1");
+        put("accept", "application/json, text/event-stream");
+        put("x-requested-with", "XMLHttpRequest");
     }
-    req
+
+    match credential {
+        // Login-state credential: one consistent identity. The token is the
+        // bearer *and* the api key (mirroring the proven `fetch_points` call),
+        // and the session-bound fingerprint headers are added alongside. No
+        // static-key value is ever inserted, so none can survive.
+        Some(cred) => {
+            let token = cred.bearer();
+            headers.insert(
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_str(&format!("Bearer {}", token))
+                    .unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            for (name, value) in crate::workbuddy_auth::upstream_headers(cred) {
+                if let (Ok(header_name), Ok(header_value)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_str(&value),
+                ) {
+                    headers.insert(header_name, header_value);
+                }
+            }
+            // Set x-api-key last so it always matches the token.
+            headers.insert(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_str(token).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        }
+        // Static key path (unchanged behaviour): Authorization always, plus the
+        // WorkBuddy `x-api-key` mirror.
+        None => {
+            if let Some(key) = api_key {
+                if workbuddy {
+                    headers.insert(
+                        HeaderName::from_static("x-api-key"),
+                        HeaderValue::from_str(key).unwrap_or_else(|_| HeaderValue::from_static("")),
+                    );
+                }
+                headers.insert(
+                    HeaderName::from_static("authorization"),
+                    HeaderValue::from_str(&format!("Bearer {}", key))
+                        .unwrap_or_else(|_| HeaderValue::from_static("")),
+                );
+            }
+        }
+    }
+
+    headers
 }
 
 /// Whether an upstream failure should relocate the session onto another
@@ -1820,6 +1875,7 @@ async fn retry_as_stream(
     client: &Client,
     openai_req: &openai::OpenAIRequest,
     api_key: &Option<String>,
+    credential: Option<&crate::workbuddy_auth::WorkBuddyCredential>,
     gui_logs: &Arc<crate::settings::LogBuffer>,
     client_model: &str,
     stats: &Arc<StatsDb>,
@@ -1841,7 +1897,7 @@ async fn retry_as_stream(
     // Always a streamed response here, so no total timeout: it would kill any
     // stream outliving it. The shared client's idle read_timeout covers stalls
     // — see forward_request for the rationale.
-    let response = apply_upstream_auth(builder, config, api_key)
+    let response = apply_upstream_auth(builder, config, api_key, credential)
         .send()
         .await
         .map_err(ProxyError::Http)?;
@@ -2469,7 +2525,9 @@ fn json_request<T: serde::Serialize>(value: &T) -> Request {
 mod tests {
     use super::create_sse_stream;
     use super::json_request;
-    use super::{apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported};
+    use super::{
+        apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported, upstream_auth_headers,
+    };
     use crate::models::{openai, responses};
     use crate::session::SessionInfo;
     use axum::response::IntoResponse;
@@ -2488,6 +2546,97 @@ mod tests {
         assert!(!is_content_blocked(502, "11128"));
         // 400 without the block signature is a generic upstream failure.
         assert!(!is_content_blocked(400, "{\"error\":\"bad request\"}"));
+    }
+
+    /// A config in the WorkBuddy flavor, which is the one that mirrors the
+    /// `x-api-key`/`Authorization` pair.
+    fn workbuddy_config() -> crate::config::Config {
+        crate::config::Config {
+            models_flavor: crate::config::ModelsFlavor::WorkBuddyConfig,
+            ..Default::default()
+        }
+    }
+
+    /// A login-state credential with a token distinct from any static key.
+    fn test_credential() -> crate::workbuddy_auth::WorkBuddyCredential {
+        crate::workbuddy_auth::WorkBuddyCredential {
+            id: "wb-abc123".to_string(),
+            access_token: "credential-token".to_string(),
+            machine_id: "machine-1".to_string(),
+            account: crate::workbuddy_auth::WorkBuddyAccount {
+                uid: "uid-1".to_string(),
+                enterprise_id: "ent-1".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A static key and a credential must never both authenticate one request.
+    /// reqwest's `.header()` appends, so a naive implementation emits two
+    /// `Authorization` values and Tencent's `stgw` gateway answers a bare HTML
+    /// 400. Regression for the "都是 400 / Bad Request" report.
+    #[test]
+    fn credential_auth_replaces_the_static_key_on_every_shared_header() {
+        let config = workbuddy_config();
+        let key = Some("static-key".to_string());
+        let cred = test_credential();
+
+        let headers = upstream_auth_headers(&config, &key, Some(&cred));
+
+        // Exactly one value per auth header, and it is the credential's.
+        assert_eq!(
+            headers.get_all("authorization").iter().count(),
+            1,
+            "must be a single Authorization header"
+        );
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer credential-token"
+        );
+        assert_eq!(headers.get_all("x-api-key").iter().count(), 1);
+        assert_eq!(headers.get("x-api-key").unwrap(), "credential-token");
+        // No trace of the static key anywhere.
+        assert!(
+            !headers
+                .values()
+                .any(|v| v.to_str().unwrap_or_default().contains("static-key")),
+            "the static key must not survive alongside a credential"
+        );
+        // The session fingerprint is still present.
+        assert_eq!(headers.get("x-user-id").unwrap(), "uid-1");
+        assert_eq!(headers.get("x-enterprise-id").unwrap(), "ent-1");
+        assert_eq!(headers.get("x-machine-id").unwrap(), "machine-1");
+    }
+
+    /// Without a credential the static key keeps its 1.7.x behaviour.
+    #[test]
+    fn static_key_path_still_sends_authorization_and_x_api_key() {
+        let config = workbuddy_config();
+        let key = Some("static-key".to_string());
+
+        let headers = upstream_auth_headers(&config, &key, None);
+
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer static-key");
+        assert_eq!(headers.get("x-api-key").unwrap(), "static-key");
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(headers.get_all("x-api-key").iter().count(), 1);
+    }
+
+    /// A non-WorkBuddy provider keeps a single `Authorization` and never gains
+    /// the WorkBuddy `x-api-key`.
+    #[test]
+    fn openai_flavor_uses_authorization_only() {
+        let config = crate::config::Config {
+            models_flavor: crate::config::ModelsFlavor::OpenAI,
+            ..Default::default()
+        };
+        let key = Some("provider-key".to_string());
+
+        let headers = upstream_auth_headers(&config, &key, None);
+
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer provider-key");
+        assert!(headers.get("x-api-key").is_none());
     }
 
     #[test]
