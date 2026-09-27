@@ -12,19 +12,24 @@ use futures::stream::StreamExt;
 /// Character-based (never byte-based) so it cannot split a multi-byte UTF-8
 /// sequence and panic, which is why every caller funnels through here instead
 /// of slicing strings directly.
+/// The argument is counted in **characters**, and so is the guard below: the
+/// previous loop compared a *byte* index against `max`, so multi-byte text was
+/// cut far shorter than asked (`truncate("中文中文中文", 4)` returned two
+/// characters, not four). Every caller passes attacker-controlled upstream
+/// bodies, and a short cut hides the part of an error that explains the
+/// failure.
 pub fn truncate(text: &str, max: usize) -> String {
     let text = text.trim();
     if text.chars().count() <= max {
         return text.to_string();
     }
-    let mut end = 0;
-    for (i, ch) in text.char_indices() {
-        if i > max {
-            break;
-        }
-        end = i + ch.len_utf8();
+    // `nth` counts characters; the returned byte offset is therefore always on
+    // a character boundary, so the slice below cannot panic.
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        // Fewer than `max + 1` characters: nothing to cut.
+        None => text.to_string(),
     }
-    format!("{}…", &text[..end])
 }
 
 /// Render a header map as a single `k: v | k: v` log line.
@@ -444,6 +449,25 @@ mod tests {
         let out = truncate(text, 4);
         assert!(out.ends_with('…'));
         assert!(out.starts_with('中'));
+    }
+
+    /// `max` is documented in characters, and the loop used to compare a *byte*
+    /// index against it — so multi-byte text was cut far shorter than asked
+    /// (`truncate("中文中文中文", 4)` returned 2 characters, not 4). Callers
+    /// feed upstream error bodies, so a short cut hides the part that explains
+    /// the failure.
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // Six 3-byte characters: a byte-based cut at 4 bytes yields 2 chars.
+        assert_eq!(truncate("中文中文中文", 4).chars().count(), 5); // 4 + ellipsis
+        assert_eq!(truncate("中文中文中文", 4), "中文中文…");
+        // ASCII is unaffected.
+        assert_eq!(truncate("abcdefgh", 4), "abcd…");
+        // Mixed widths, with a multi-byte char straddling the cut.
+        assert_eq!(truncate("a中b文c", 3), "a中b…");
+        // Exactly at the limit: no ellipsis, no cut.
+        assert_eq!(truncate("中文", 2), "中文");
+        assert_eq!(truncate("ab", 2), "ab");
     }
 
     #[test]

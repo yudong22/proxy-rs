@@ -346,9 +346,32 @@ fn write_batch(file: &mut Option<(PathBuf, std::fs::File)>, batch: &str) {
     if let Some((_, f)) = file.as_mut() {
         // One write call per batch: this thread is the only writer, so no other
         // line can land in the middle of one.
-        let _ = f.write_all(batch.as_bytes());
-        // Flush per batch so a crash does not lose recent history.
-        let _ = f.flush();
+        //
+        // Failures are reported (once) rather than dropped. A silent failure
+        // here is nearly unobservable: the in-memory buffer keeps filling, so
+        // the console's live view looks perfectly healthy while
+        // `~/.proxy-rs/logs/proxy.log` quietly stops growing — and the history
+        // the user expects after a restart is simply gone. This thread has no
+        // channel back to the GUI, so stderr (and hence Console.app / the
+        // terminal) is the only place it can say so.
+        if let Err(err) = f.write_all(batch.as_bytes()) {
+            warn_log_mirror_once(&err);
+        } else if let Err(err) = f.flush() {
+            // Flush per batch so a crash does not lose recent history.
+            warn_log_mirror_once(&err);
+        }
+    }
+}
+
+/// Emit a log-mirror failure once per process.
+///
+/// A full disk or a bad handle fails every subsequent batch, so reporting each
+/// one would produce a log line per request — burying the very message that
+/// explains why the log stopped.
+fn warn_log_mirror_once(err: &std::io::Error) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("proxy-rs: could not write to the log file: {err}");
     }
 }
 

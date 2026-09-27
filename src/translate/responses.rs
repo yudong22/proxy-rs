@@ -283,10 +283,10 @@ pub fn translate_responses_request(
     if let Some(ref r) = req.reasoning {
         let effort = if let Some(s) = r.as_str() {
             Some(s.to_string())
-        } else if let Some(eff) = r.get("effort").and_then(|v| v.as_str()) {
-            Some(eff.to_string())
         } else {
-            None
+            r.get("effort")
+                .and_then(|v| v.as_str())
+                .map(|eff| eff.to_string())
         };
         if let Some(effort) = effort {
             extra.insert("reasoning_effort".to_string(), Value::String(effort));
@@ -592,6 +592,16 @@ pub fn translate_responses_response(
     })
 }
 
+/// Cap on concurrently streamed tool calls tracked by one response.
+///
+/// Purely a resource guard. The upstream frame supplies the tool-call `index`,
+/// and the translator grows `active_tool_calls` until it covers that index — so
+/// an unvalidated index is an allocation primitive. Real traffic uses a
+/// handful; 256 is generous while keeping one malicious frame from exhausting
+/// memory (the release profile is `panic = "abort"`, so an OOM here would take
+/// the whole desktop app down, not just this request).
+const MAX_STREAMING_TOOL_CALLS: usize = 256;
+
 /// State tracker for translating an upstream OpenAI Chat SSE stream to Responses API SSE events.
 #[derive(Debug)]
 pub struct ResponsesStreamState {
@@ -774,6 +784,23 @@ pub fn translate_stream_chunk(
     if let Some(ref tool_calls) = choice.delta.tool_calls {
         for call in tool_calls {
             let index = call.index;
+            // `index` comes straight off the upstream frame, so it is not
+            // trusted: it is only ever used to *extend* `active_tool_calls`,
+            // and `while len <= index { push }` with a hostile value (e.g.
+            // `usize::MAX`) allocates until the process dies — fatal here,
+            // because the release profile is `panic = "abort"`.
+            //
+            // A real response carries one tool call per distinct index and
+            // never needs thousands, so anything past the cap is a malformed
+            // or hostile frame: skip it rather than growing the vector.
+            if index >= MAX_STREAMING_TOOL_CALLS {
+                tracing::warn!(
+                    "ignoring tool call with out-of-range index {} (cap {})",
+                    index,
+                    MAX_STREAMING_TOOL_CALLS
+                );
+                continue;
+            }
             while state.active_tool_calls.len() <= index {
                 let output_index = state.output_index_counter;
                 state.output_index_counter += 1;
@@ -801,9 +828,7 @@ pub fn translate_stream_chunk(
 
             // Only start the tool call item when we have both call_id and a non-empty name,
             // avoiding empty tool name events on initial ID-only chunks.
-            if !tool_entry.started
-                && !tool_entry.name.is_empty()
-                && !tool_entry.call_id.is_empty()
+            if !tool_entry.started && !tool_entry.name.is_empty() && !tool_entry.call_id.is_empty()
             {
                 tool_entry.started = true;
                 events.push(responses::ResponsesStreamEvent::OutputItemAdded {
@@ -1748,10 +1773,7 @@ mod tests {
         let types: Vec<&str> = last.iter().map(|e| e.event_type()).collect();
         assert_eq!(
             types,
-            vec![
-                "response.output_text.done",
-                "response.output_item.done",
-            ]
+            vec!["response.output_text.done", "response.output_item.done",]
         );
 
         match &last[0] {
@@ -1989,6 +2011,76 @@ mod tests {
             .messages
     }
 
+    /// A tool-call `index` arrives on the upstream frame and used to drive an
+    /// unbounded `while len <= index { push }` loop: one frame with a huge
+    /// index allocated until the process died (fatal, since release builds use
+    /// `panic = "abort"`). Out-of-range indices are now skipped.
+    #[test]
+    fn a_hostile_tool_call_index_does_not_grow_the_tracker() {
+        let mut state = initial_stream_state("m".to_string());
+        let chunk: openai::StreamChunk = serde_json::from_str(
+            &json!({
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "created": 0i64,
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": usize::MAX,
+                            "id": "call_hostile",
+                            "type": "function",
+                            "function": { "name": "f", "arguments": "{}" }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .expect("fixture parses");
+
+        // Must not hang, allocate, or panic.
+        translate_stream_chunk(&mut state, &chunk);
+        assert!(
+            state.active_tool_calls.is_empty(),
+            "a tool call above the cap must be ignored, got {}",
+            state.active_tool_calls.len()
+        );
+    }
+
+    /// ...but an ordinary index still works, so the guard did not disable the
+    /// feature it protects.
+    #[test]
+    fn a_normal_tool_call_index_is_still_tracked() {
+        let mut state = initial_stream_state("m".to_string());
+        let chunk: openai::StreamChunk = serde_json::from_str(
+            &json!({
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "created": 0i64,
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_ok",
+                            "type": "function",
+                            "function": { "name": "f", "arguments": "{}" }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .expect("fixture parses");
+
+        translate_stream_chunk(&mut state, &chunk);
+        assert_eq!(state.active_tool_calls.len(), 1);
+        assert_eq!(state.active_tool_calls[0].call_id, "call_ok");
+    }
+
     #[test]
     fn parallel_tool_calls_share_one_assistant_message() {
         // Responses sends parallel calls as consecutive items; Chat Completions
@@ -2101,7 +2193,10 @@ mod tests {
         };
         let events2 = translate_stream_chunk(&mut state, &chunk2);
         let types2: Vec<&str> = events2.iter().map(|e| e.event_type()).collect();
-        assert_eq!(types2, vec!["response.output_text.done", "response.output_item.done"]);
+        assert_eq!(
+            types2,
+            vec!["response.output_text.done", "response.output_item.done"]
+        );
 
         // Chunk 3: trailing usage chunk with empty choices
         let chunk3 = openai::StreamChunk {
@@ -2164,7 +2259,10 @@ mod tests {
         };
         let events1 = translate_stream_chunk(&mut state, &chunk1);
         let types1: Vec<&str> = events1.iter().map(|e| e.event_type()).collect();
-        assert!(!types1.contains(&"response.output_item.added"), "must not emit output_item.added when name is empty");
+        assert!(
+            !types1.contains(&"response.output_item.added"),
+            "must not emit output_item.added when name is empty"
+        );
 
         // Chunk 2: Name arrives
         let chunk2 = openai::StreamChunk {
@@ -2197,17 +2295,18 @@ mod tests {
         };
         let events2 = translate_stream_chunk(&mut state, &chunk2);
         let types2: Vec<&str> = events2.iter().map(|e| e.event_type()).collect();
-        assert!(types2.contains(&"response.output_item.added"), "must emit output_item.added now that name is known");
+        assert!(
+            types2.contains(&"response.output_item.added"),
+            "must emit output_item.added now that name is known"
+        );
         match &events2[0] {
-            responses::ResponsesStreamEvent::OutputItemAdded { item, .. } => {
-                match item {
-                    responses::OutputItem::FunctionCall { id, name, .. } => {
-                        assert_eq!(id, "call_abc123");
-                        assert_eq!(name, "apply_patch");
-                    }
-                    other => panic!("expected FunctionCall, got {other:?}"),
+            responses::ResponsesStreamEvent::OutputItemAdded { item, .. } => match item {
+                responses::OutputItem::FunctionCall { id, name, .. } => {
+                    assert_eq!(id, "call_abc123");
+                    assert_eq!(name, "apply_patch");
                 }
-            }
+                other => panic!("expected FunctionCall, got {other:?}"),
+            },
             other => panic!("expected OutputItemAdded, got {other:?}"),
         }
     }

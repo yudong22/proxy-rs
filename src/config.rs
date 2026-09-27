@@ -326,23 +326,31 @@ impl Config {
         Ok(())
     }
 
+    /// Resolve every configured base URL to its chat-completions endpoint.
+    ///
+    /// Unresolvable entries are skipped rather than panicking. The URLs are
+    /// validated when the configuration is built, so in practice nothing is
+    /// ever skipped — but `upstream_urls` is a public field, and the previous
+    /// `.expect("URLs should be validated during configuration loading")` would
+    /// then panic on *every request*; with the release profile's
+    /// `panic = "abort"` that took the whole desktop app down. Skipping keeps
+    /// one bad entry from being fatal, while an all-bad list still produces the
+    /// caller's "All upstreams failed" error.
     pub fn chat_completions_urls(&self) -> Vec<String> {
         self.upstream_urls
             .iter()
-            .map(|url| {
-                Self::resolve_chat_completions_url(url)
-                    .expect("URLs should be validated during configuration loading")
-            })
+            .filter_map(|url| Self::resolve_chat_completions_url(url).ok())
             .collect()
     }
 
+    /// Resolve every configured base URL to its models endpoint.
+    ///
+    /// Skips unresolvable entries for the same reason as
+    /// [`Config::chat_completions_urls`].
     pub fn models_urls(&self) -> Vec<String> {
         self.upstream_urls
             .iter()
-            .map(|url| {
-                Self::resolve_models_url(url)
-                    .expect("URLs should be validated during configuration loading")
-            })
+            .filter_map(|url| Self::resolve_models_url(url).ok())
             .collect()
     }
 
@@ -795,6 +803,32 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0], "https://openrouter.ai/api/v1/chat/completions");
         assert_eq!(urls[1], "https://api.openai.com/v1/chat/completions");
+    }
+
+    /// `upstream_urls` is a public field, so it can hold a value that never
+    /// went through `parse_upstream_urls`. Both resolvers used to `.expect()`
+    /// here, which panicked on *every request* — fatal with the release
+    /// profile's `panic = "abort"`. A bad entry is now skipped so one bad
+    /// value cannot take the app down.
+    #[test]
+    fn unresolvable_urls_are_skipped_instead_of_panicking() {
+        let config = Config {
+            upstream_urls: vec![
+                "https://api.openai.com".to_string(),
+                "ftp://not-http.example.com".to_string(),
+                "https://gateway.example.com/v2#section".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let chat = config.chat_completions_urls();
+        assert_eq!(chat.len(), 1, "only the valid entry survives: {chat:?}");
+        assert_eq!(chat[0], "https://api.openai.com/v1/chat/completions");
+
+        assert_eq!(
+            config.models_urls(),
+            vec!["https://api.openai.com/v1/models".to_string()]
+        );
     }
 
     #[test]

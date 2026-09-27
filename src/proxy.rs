@@ -630,20 +630,23 @@ async fn reject_request(
     let message = error.to_string();
     let duration_ms = start.elapsed().as_millis() as i64;
 
-    let _ = stats.record_request_log(RequestOutcome {
-        model: "",
-        route,
-        tokens: &TokenRecord::default(),
-        duration_ms,
-        streamed: false,
-        status,
-        error: Some(&message),
-        session_id: &session.session_id,
-        client: session.client.tag(),
-        override_key: "",
-        override_model: "",
-        override_reason: "",
-    });
+    record_stats_row(
+        stats,
+        RequestOutcome {
+            model: "",
+            route,
+            tokens: &TokenRecord::default(),
+            duration_ms,
+            streamed: false,
+            status,
+            error: Some(&message),
+            session_id: &session.session_id,
+            client: session.client.tag(),
+            override_key: "",
+            override_model: "",
+            override_reason: "",
+        },
+    );
     gui_logs
         .push(
             "ERROR",
@@ -656,6 +659,29 @@ async fn reject_request(
     tracing::warn!("POST {} rejected: {} ({})", route, message, tag);
 
     error
+}
+
+/// Record one request row, reporting a failure instead of dropping it.
+///
+/// Every call site used to be `let _ = stats.record_request_log(..)`, which
+/// makes a dead stats writer indistinguishable from a healthy one: requests
+/// keep being served, so the user sees a perfectly working proxy whose 请求日志
+/// and 用量统计 panels simply stop moving, with nothing anywhere to explain
+/// why. (`record_request_log` fails when the writer thread is gone.)
+///
+/// The warning is emitted at most once per process — a dead writer fails every
+/// subsequent request, and one line per request would bury the log it is meant
+/// to explain.
+fn record_stats_row(stats: &Arc<StatsDb>, outcome: RequestOutcome<'_>) {
+    if let Err(err) = stats.record_request_log(outcome) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "request statistics are no longer being recorded: {} (the 请求日志/用量统计 views are frozen until the app is restarted)",
+                err
+            );
+        }
+    }
 }
 
 /// Resolve the session identity of an incoming request.
@@ -741,20 +767,23 @@ async fn finalize_request(
                 cache_write: 0,
                 output: 0,
             };
-            let _ = stats.record_request_log(RequestOutcome {
-                model: client_model,
-                route,
-                tokens: &failed_tokens,
-                duration_ms,
-                streamed: is_streaming,
-                status,
-                error: Some(&message),
-                session_id: &session.session_id,
-                client: session.client.tag(),
-                override_key: &overrides.key,
-                override_model: &overrides.model,
-                override_reason: &overrides.reason(),
-            });
+            record_stats_row(
+                stats,
+                RequestOutcome {
+                    model: client_model,
+                    route,
+                    tokens: &failed_tokens,
+                    duration_ms,
+                    streamed: is_streaming,
+                    status,
+                    error: Some(&message),
+                    session_id: &session.session_id,
+                    client: session.client.tag(),
+                    override_key: &overrides.key,
+                    override_model: &overrides.model,
+                    override_reason: &overrides.reason(),
+                },
+            );
             gui_logs
                 .push(
                     "ERROR",
@@ -1246,7 +1275,10 @@ async fn forward_request(
                                         .await;
                                     if let Ok(mut t) = overrides.lock() {
                                         t.set_key(next.id.clone(), format!("{status} from {from}"));
-                                        t.set_model(openai_req.model.clone(), format!("failover {status} from {from}"));
+                                        t.set_model(
+                                            openai_req.model.clone(),
+                                            format!("failover {status} from {from}"),
+                                        );
                                     }
                                     active_credential = Some(next);
                                     continue 'credential; // retry the request on the replacement
@@ -1258,8 +1290,12 @@ async fn forward_request(
 
                                     // Fallback: check if API key pool has available keys for failover
                                     if config.session_switch_enabled {
-                                        let available_keys = crate::workbuddy_auth::enabled_api_keys();
-                                        if let Some(key) = available_keys.into_iter().find(|k| !tried_key_ids.contains(&k.id)) {
+                                        let available_keys =
+                                            crate::workbuddy_auth::enabled_api_keys();
+                                        if let Some(key) = available_keys
+                                            .into_iter()
+                                            .find(|k| !tried_key_ids.contains(&k.id))
+                                        {
                                             tried_key_ids.insert(key.id.clone());
                                             gui_logs
                                                 .push(
@@ -1271,8 +1307,14 @@ async fn forward_request(
                                                 )
                                                 .await;
                                             if let Ok(mut t) = overrides.lock() {
-                                                t.set_key(key.id.clone(), format!("{status} from {from} (降级密钥池)"));
-                                                t.set_model(openai_req.model.clone(), format!("failover {status} from {from}"));
+                                                t.set_key(
+                                                    key.id.clone(),
+                                                    format!("{status} from {from} (降级密钥池)"),
+                                                );
+                                                t.set_model(
+                                                    openai_req.model.clone(),
+                                                    format!("failover {status} from {from}"),
+                                                );
                                             }
                                             active_credential = None;
                                             current_api_key = Some(key.key.clone());
@@ -1294,10 +1336,15 @@ async fn forward_request(
                             }
                         } else if config.session_switch_enabled {
                             // Currently using API key (current_credential is None)
-                            let from = current_key_id.clone().unwrap_or_else(|| "api-key".to_string());
+                            let from = current_key_id
+                                .clone()
+                                .unwrap_or_else(|| "api-key".to_string());
                             tried_key_ids.insert(from.clone());
                             let available_keys = crate::workbuddy_auth::enabled_api_keys();
-                            if let Some(key) = available_keys.into_iter().find(|k| !tried_key_ids.contains(&k.id)) {
+                            if let Some(key) = available_keys
+                                .into_iter()
+                                .find(|k| !tried_key_ids.contains(&k.id))
+                            {
                                 tried_key_ids.insert(key.id.clone());
                                 gui_logs
                                     .push(
@@ -1310,7 +1357,10 @@ async fn forward_request(
                                     .await;
                                 if let Ok(mut t) = overrides.lock() {
                                     t.set_key(key.id.clone(), format!("{status} from {from}"));
-                                    t.set_model(openai_req.model.clone(), format!("failover {status} from {from}"));
+                                    t.set_model(
+                                        openai_req.model.clone(),
+                                        format!("failover {status} from {from}"),
+                                    );
                                 }
                                 active_credential = None;
                                 current_api_key = Some(key.key.clone());
@@ -1328,8 +1378,14 @@ async fn forward_request(
                                         )
                                         .await;
                                     if let Ok(mut t) = overrides.lock() {
-                                        t.set_key(next.id.clone(), format!("{status} from {from} (切换账号池)"));
-                                        t.set_model(openai_req.model.clone(), format!("failover {status} from {from}"));
+                                        t.set_key(
+                                            next.id.clone(),
+                                            format!("{status} from {from} (切换账号池)"),
+                                        );
+                                        t.set_model(
+                                            openai_req.model.clone(),
+                                            format!("failover {status} from {from}"),
+                                        );
                                     }
                                     active_credential = Some(next);
                                     continue 'credential;
@@ -1529,9 +1585,18 @@ async fn collect_stream_into_response(
         let bytes = chunk.map_err(ProxyError::Http)?;
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
+        // Same guard as the streaming path: an upstream that never emits a
+        // frame separator must not grow this buffer for the whole request.
+        if buffer.len() > MAX_SSE_FRAME_BYTES {
+            return Err(ProxyError::Upstream(format!(
+                "upstream sent an unterminated SSE frame ({} bytes without a blank line)",
+                buffer.len()
+            )));
+        }
+
         while let Some(pos) = buffer.find("\n\n") {
             let frame = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
+            buffer.drain(..pos + 2);
             for line in frame.lines() {
                 let Some(data) = line.strip_prefix("data: ") else {
                     continue;
@@ -1712,23 +1777,26 @@ async fn non_streaming_response(
         (t.key.clone(), t.model.clone(), t.reason())
     };
     // Record token breakdown and request log in the persistent stats DB.
-    let _ = stats.record_request_log(RequestOutcome {
-        model: &client_model,
-        route,
-        tokens: &tokens,
-        duration_ms,
-        streamed: false,
-        status: 200,
-        error: None,
-        session_id: &session.session_id,
-        client: session.client.tag(),
-        // One lock for both fields: two `.lock()` temporaries in the same
-        // expression would leave the first guard alive while the second
-        // acquires, self-deadlocking the request thread.
-        override_key: &override_key,
-        override_model: &override_model,
-        override_reason: &override_reason,
-    });
+    record_stats_row(
+        &stats,
+        RequestOutcome {
+            model: &client_model,
+            route,
+            tokens: &tokens,
+            duration_ms,
+            streamed: false,
+            status: 200,
+            error: None,
+            session_id: &session.session_id,
+            client: session.client.tag(),
+            // One lock for both fields: two `.lock()` temporaries in the same
+            // expression would leave the first guard alive while the second
+            // acquires, self-deadlocking the request thread.
+            override_key: &override_key,
+            override_model: &override_model,
+            override_reason: &override_reason,
+        },
+    );
 
     if config.verbose {
         tracing::trace!(
@@ -2483,22 +2551,32 @@ impl StreamLedger {
 impl Drop for StreamLedger {
     fn drop(&mut self) {
         let status = if self.error.is_some() { 500 } else { 200 };
-        let _ = self.stats.record_request_log(RequestOutcome {
-            model: &self.model,
-            route: self.route,
-            tokens: &self.tokens,
-            duration_ms: self.start.elapsed().as_millis() as i64,
-            streamed: true,
-            status,
-            error: self.error.as_deref(),
-            session_id: &self.session.session_id,
-            client: self.session.client.tag(),
-            override_key: &self.override_key,
-            override_model: &self.override_model,
-            override_reason: &self.override_reason,
-        });
+        record_stats_row(
+            &self.stats,
+            RequestOutcome {
+                model: &self.model,
+                route: self.route,
+                tokens: &self.tokens,
+                duration_ms: self.start.elapsed().as_millis() as i64,
+                streamed: true,
+                status,
+                error: self.error.as_deref(),
+                session_id: &self.session.session_id,
+                client: self.session.client.tag(),
+                override_key: &self.override_key,
+                override_model: &self.override_model,
+                override_reason: &self.override_reason,
+            },
+        );
     }
 }
+
+/// Cap on how much of an unterminated SSE frame the reassembly buffer keeps.
+///
+/// A well-formed event is one `data:` line, so this is generous; it exists only
+/// so an upstream that never emits a frame separator cannot grow the buffer for
+/// the whole life of a stream (see `create_flavor_sse_stream`).
+const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Shared SSE framer for all three API flavors.
 ///
@@ -2578,9 +2656,57 @@ fn create_flavor_sse_stream(
                 Ok(bytes) => {
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
 
+                    // The buffer only ever holds the tail of an unterminated
+                    // frame. An upstream that never sends a blank line — a
+                    // stalled or hostile one — would grow it without limit
+                    // while the stream stays open, which is reachable from any
+                    // client that opts into streaming. Past the cap the frame
+                    // cannot be a legitimate SSE event, so stop and surface the
+                    // error instead of accumulating.
+                    if buffer.len() > MAX_SSE_FRAME_BYTES {
+                        let summary = format!(
+                            "upstream sent an unterminated SSE frame ({} bytes without a blank line)",
+                            buffer.len()
+                        );
+                        let msg = format!(
+                            "UPSTREAM ERROR [stream] model={} {} | {}",
+                            client_model, tag, summary
+                        );
+                        gui_logs.push("ERROR", msg.clone()).await;
+                        tracing::warn!("{}", msg);
+                        ledger.error = Some(summary.clone());
+
+                        // Close the stream the same way a read error does, so
+                        // the client is told instead of just seeing the
+                        // connection end after a long silence.
+                        match flavor {
+                            ApiFlavor::Anthropic => {
+                                for event in stream::translate_error(format!("Upstream error: {}", summary)) {
+                                    yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
+                                }
+                            }
+                            ApiFlavor::Responses => {
+                                if let Some(state) = responses_state.as_mut() {
+                                    for event in responses_pipeline::translate_stream_error(
+                                        state,
+                                        format!("Upstream error: {}", summary),
+                                    ) {
+                                        yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
+                                    }
+                                }
+                            }
+                            ApiFlavor::Chat => {
+                                // Passthrough: an `error` event keeps the
+                                // framing but is not part of Chat's schema, so
+                                // the log line above is the report.
+                            }
+                        }
+                        break;
+                    }
+
                     while let Some(pos) = buffer.find("\n\n") {
                         let line = buffer[..pos].to_string();
-                        buffer = buffer[pos + 2..].to_string();
+                        buffer.drain(..pos + 2);
 
                         if line.trim().is_empty() {
                             continue;
@@ -2842,7 +2968,7 @@ mod tests {
     use super::json_request;
     use super::{
         apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported,
-        upstream_auth_headers, OverrideTrace,
+        upstream_auth_headers, OverrideTrace, MAX_SSE_FRAME_BYTES,
     };
     use crate::models::{openai, responses};
     use crate::session::SessionInfo;
@@ -3303,7 +3429,10 @@ mod tests {
         assert!(super::is_switchable_error(402, "payment required"));
         assert!(super::is_switchable_error(403, "forbidden"));
         assert!(super::is_switchable_error(429, "too many requests"));
-        assert!(super::is_switchable_error(200, r#"{"code":11105,"message":"quota exhausted"}"#));
+        assert!(super::is_switchable_error(
+            200,
+            r#"{"code":11105,"message":"quota exhausted"}"#
+        ));
         assert!(!super::is_switchable_error(500, "internal server error"));
         assert!(!super::is_switchable_error(400, "bad request"));
     }
@@ -3497,6 +3626,85 @@ mod tests {
         }
         let error_events: Vec<_> = events.iter().filter(|e| e["type"] == "error").collect();
         assert_eq!(error_events.len(), 1);
+    }
+
+    /// An upstream that never emits a blank line used to grow the reassembly
+    /// buffer for the whole life of the stream. Past the cap the stream now
+    /// stops with an error instead of accumulating — reachable from any client
+    /// that opts into streaming.
+    #[tokio::test]
+    async fn an_unterminated_sse_frame_stops_the_stream_with_an_error() {
+        // One chunk well past the cap, with no frame separator anywhere.
+        let body: Vec<u8> = "data: "
+            .bytes()
+            .chain(std::iter::repeat_n(b'x', MAX_SSE_FRAME_BYTES + 1))
+            .collect();
+        let items: Vec<Result<Bytes, TestError>> = vec![Ok(Bytes::from(body))];
+        let sse = create_sse_stream(
+            stream::iter(items),
+            "fallback".to_string(),
+            std::sync::Arc::new(crate::settings::LogBuffer::new(2000)),
+            mock_stats(),
+        );
+        tokio::pin!(sse);
+
+        let mut events = Vec::new();
+        while let Some(Ok(bytes)) = sse.next().await {
+            let text = String::from_utf8_lossy(&bytes);
+            for segment in text.split("\n\n").filter(|s| !s.is_empty()) {
+                if let Some(data_line) = segment.lines().find(|l| l.starts_with("data: ")) {
+                    let json_str = data_line.strip_prefix("data: ").unwrap();
+                    if let Ok(v) = serde_json::from_str::<Value>(json_str) {
+                        events.push(v);
+                    }
+                }
+            }
+        }
+
+        // The client is told, rather than seeing the stream just stop.
+        let error_events: Vec<_> = events.iter().filter(|e| e["type"] == "error").collect();
+        assert_eq!(error_events.len(), 1, "got: {events:?}");
+    }
+
+    /// Below the cap nothing changes: normal frames are still delivered, so the
+    /// guard did not disable the streaming it protects.
+    #[tokio::test]
+    async fn a_normal_sse_frame_below_the_cap_is_still_delivered() {
+        let items: Vec<Result<Bytes, TestError>> = vec![Ok(Bytes::from(openai_chunk(
+            "chatcmpl-cap",
+            "gpt-4o",
+            Some("hi"),
+            None,
+        )))];
+        let sse = create_sse_stream(
+            stream::iter(items),
+            "fallback".to_string(),
+            std::sync::Arc::new(crate::settings::LogBuffer::new(2000)),
+            mock_stats(),
+        );
+        tokio::pin!(sse);
+
+        let mut events = Vec::new();
+        while let Some(Ok(bytes)) = sse.next().await {
+            let text = String::from_utf8_lossy(&bytes);
+            for segment in text.split("\n\n").filter(|s| !s.is_empty()) {
+                if let Some(data_line) = segment.lines().find(|l| l.starts_with("data: ")) {
+                    let json_str = data_line.strip_prefix("data: ").unwrap();
+                    if let Ok(v) = serde_json::from_str::<Value>(json_str) {
+                        events.push(v);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            events.iter().any(|e| e["type"] == "message_start"),
+            "got: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["type"] == "error"),
+            "a normal frame must not error: {events:?}"
+        );
     }
 
     #[tokio::test]

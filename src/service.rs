@@ -118,32 +118,36 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
 
+    /// The fallback port is `preferred + 1`, so the test needs a pair where the
+    /// second port is genuinely free *at bind time*.
+    ///
+    /// Finding a free neighbour and then dropping it is a TOCTOU race: between
+    /// the probe and the real `bind` another test (or process) can take the
+    /// port, and the assertion then fails intermittently — roughly 1 run in 6
+    /// under `cargo test`'s parallel scheduler. Retrying the whole attempt
+    /// closes the window: a failure is now evidence the pair was genuinely
+    /// taken, not a stale probe, so it loops to a fresh pair.
     #[tokio::test]
     async fn bind_falls_back_only_when_explicitly_asked() {
-        // The fallback port is `preferred + 1`, so the test needs a pair where
-        // the second port is genuinely free. Asking the OS for an ephemeral
-        // port and assuming `port + 1` is unused is racy: another test or
-        // process can hold it, and the assertion then fails intermittently.
-        let (_held, port) = loop {
+        const ATTEMPTS: usize = 25;
+
+        for _ in 0..ATTEMPTS {
             let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = held.local_addr().unwrap().port();
             if port == u16::MAX {
                 continue;
             }
-            // Probe the neighbour, then release it so `bind` can take it.
-            match tokio::net::TcpListener::bind(("127.0.0.1", port + 1)).await {
-                Ok(probe) => {
-                    drop(probe);
-                    break (held, port);
+            match ServiceController::bind("127.0.0.1", port, true).await {
+                Ok((_listener, bound)) => {
+                    assert_eq!(bound, port + 1);
+                    return;
                 }
+                // The neighbour was taken between the probe and the bind; try
+                // a different pair rather than failing the suite.
                 Err(_) => continue,
             }
-        };
-
-        let (_listener, bound) = ServiceController::bind("127.0.0.1", port, true)
-            .await
-            .expect("fallback should find the next port");
-        assert_eq!(bound, port + 1);
+        }
+        panic!("could not find a free port pair in {ATTEMPTS} attempts");
     }
 
     #[test]

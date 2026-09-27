@@ -278,13 +278,26 @@ impl WorkBuddyCredential {
     /// Masked display form for the GUI (`sk-…abcd` style): never emit the full
     /// token back to the UI layer.
     pub fn masked_token(&self) -> String {
-        let t = &self.access_token;
-        if t.len() <= 8 {
-            "••••".to_string()
-        } else {
-            format!("{}••••{}", &t[..4], &t[t.len() - 4..])
-        }
+        mask_secret(&self.access_token)
     }
+}
+
+/// Masked display form shared by credentials and API keys (`sk-a…wxyz`).
+///
+/// Slicing is done on *character* boundaries rather than byte offsets: the
+/// obvious `&t[..4]` / `&t[len-4..]` panics as soon as a multi-byte character
+/// straddles byte 4 or `len - 4`, and the release profile is
+/// `panic = "abort"` — one non-ASCII token in the list would take the whole
+/// desktop app down rather than merely failing to render. The length guard is
+/// in characters for the same reason.
+fn mask_secret(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 8 {
+        return "••••".to_string();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}••••{tail}")
 }
 
 /// Derive a stable short credential id from the token material.
@@ -531,12 +544,7 @@ pub struct ApiKeyEntry {
 impl ApiKeyEntry {
     /// Masked display form: the key never goes back to the UI whole.
     pub fn masked(&self) -> String {
-        let k = &self.key;
-        if k.len() <= 8 {
-            "••••".to_string()
-        } else {
-            format!("{}••••{}", &k[..4], &k[k.len() - 4..])
-        }
+        mask_secret(&self.key)
     }
 }
 
@@ -1749,6 +1757,54 @@ mod tests {
         assert_eq!(c.machine_id, "machine-abc");
         assert!(c.id.starts_with("wb-"));
         assert_eq!(c.label, "孙东");
+    }
+
+    /// Masking used to slice on byte offsets (`&t[..4]` / `&t[len-4..]`), which
+    /// panics when a multi-byte character straddles the cut — and release
+    /// builds use `panic = "abort"`, so one non-ASCII token in the credential
+    /// list killed the whole app instead of just failing to render.
+    #[test]
+    fn masking_a_multibyte_secret_does_not_panic() {
+        // A 3-byte character placed so it straddles byte 4, and another that
+        // straddles `len - 4`. Byte slicing panics on both.
+        let secret = "sk-中 token 文";
+        let masked = mask_secret(secret);
+
+        assert!(masked.contains("••••"), "got: {masked}");
+        // Character-based: exactly four characters on each side.
+        let head: String = masked.chars().take(4).collect();
+        assert_eq!(head, "sk-中");
+        let tail: String = masked.chars().skip(8).collect();
+        assert_eq!(tail, "en 文", "tail must be the last 4 characters");
+        // 4 chars + separator + 4 chars.
+        assert_eq!(masked.chars().count(), 12, "got: {masked}");
+    }
+
+    /// Short and empty secrets stay fully masked rather than panicking on an
+    /// underflow (`len - 4`).
+    #[test]
+    fn masking_handles_short_and_empty_secrets() {
+        assert_eq!(mask_secret(""), "••••");
+        assert_eq!(mask_secret("短"), "••••");
+        assert_eq!(mask_secret("12345678"), "••••");
+        // Nine characters is the first length that reveals anything.
+        assert_eq!(mask_secret("123456789"), "1234••••6789");
+    }
+
+    /// The credential and API-key entry points share the safe implementation.
+    #[test]
+    fn public_masking_helpers_use_the_safe_implementation() {
+        let cred = WorkBuddyCredential {
+            access_token: "sk-中 token 文".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(cred.masked_token(), mask_secret("sk-中 token 文"));
+
+        let key = ApiKeyEntry {
+            key: "sk-中 token 文".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(key.masked(), mask_secret("sk-中 token 文"));
     }
 
     #[test]
