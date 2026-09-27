@@ -31,6 +31,57 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+impl OpenAIRequest {
+    /// Rough estimation of input tokens from request messages and tools when
+    /// the upstream fails and returns no usage object.
+    ///
+    /// Roughly: 1 token ~= 4 chars for English/code, 1.5 chars for CJK.
+    /// Fast and allocation-free.
+    pub fn estimate_input_tokens(&self) -> i64 {
+        let mut chars = 0usize;
+        for msg in &self.messages {
+            chars += msg.role.len() + 4; // role framing overhead
+            if let Some(content) = &msg.content {
+                match content {
+                    MessageContent::Text(t) => chars += t.len(),
+                    MessageContent::Parts(parts) => {
+                        for p in parts {
+                            match p {
+                                ContentPart::Text { text } => chars += text.len(),
+                                ContentPart::ImageUrl { .. } => chars += 200, // rough per-image token equivalent
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(r) = &msg.reasoning_content {
+                chars += r.len();
+            }
+            if let Some(calls) = &msg.tool_calls {
+                for c in calls {
+                    chars += c.function.name.len() + c.function.arguments.len() + 10;
+                }
+            }
+            if let Some(id) = &msg.tool_call_id {
+                chars += id.len();
+            }
+            if let Some(name) = &msg.name {
+                chars += name.len();
+            }
+        }
+        if let Some(tools) = &self.tools {
+            for t in tools {
+                chars += t.function.name.len() + t.function.parameters.to_string().len();
+                if let Some(desc) = &t.function.description {
+                    chars += desc.len();
+                }
+            }
+        }
+        // Conservative: average ~3.5 chars per token
+        (chars as f64 / 3.5).ceil() as i64
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,

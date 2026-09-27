@@ -45,12 +45,25 @@ export function showRequestModal(id) {
       </tr>`
     : '';
 
+  const isErr = item.status >= 400 || Boolean(item.error);
+
   const overrideRows = (item.override_key || item.override_model)
     ? html`
-      <tr><td class="detail-key">Override Key</td><td class="detail-val"><span class="mono">${item.override_key || '—'}</span></td></tr>
-      <tr><td class="detail-key">Override Model</td><td class="detail-val"><span class="mono">${item.override_model || '—'}</span></td></tr>
-      <tr><td class="detail-key">Override 原因</td><td class="detail-val">${item.override_reason || '—'}</td></tr>`
+      <tr>
+        <td class="detail-key">Override 结果</td>
+        <td class="detail-val">
+          <span class="badge-pill override-pill ${isErr ? 'override-failed' : 'override-ok'}">
+            ${isErr ? '✗ 纠错尝试后仍失败' : '✓ 纠错切换成功'}
+          </span>
+        </td>
+      </tr>
+      <tr><td class="detail-key">有效账号 / 模型</td><td class="detail-val"><span class="mono">${[item.override_key, item.override_model].filter(Boolean).join(' @ ') || '—'}</span></td></tr>
+      <tr><td class="detail-key">纠错与切换轨迹</td><td class="detail-val">${item.override_reason || '—'}</td></tr>`
     : '';
+
+  const tokenInputLabel = (isErr && inputTokens > 0)
+    ? html`输入 Tokens <span style="font-size:10px;color:var(--muted);font-weight:normal;">(估算值)</span>`
+    : '输入 Tokens';
 
   openModal('请求详情', html`
     <table class="detail-table">
@@ -62,7 +75,7 @@ export function showRequestModal(id) {
       <tr><td class="detail-key">状态</td><td class="detail-val">${raw(statusBadge(item))}</td></tr>
       <tr><td class="detail-key">传输模式</td><td class="detail-val">${item.streamed ? '是 (Stream)' : '否 (Non-stream)'}</td></tr>
       <tr><td class="detail-key">响应耗时</td><td class="detail-val">${formatDuration(item.duration_ms)} (${item.duration_ms} ms)</td></tr>
-      <tr><td class="detail-key">输入 Tokens</td><td class="detail-val">${inputTokens.toLocaleString()}</td></tr>
+      <tr><td class="detail-key">${raw(tokenInputLabel)}</td><td class="detail-val">${inputTokens.toLocaleString()}</td></tr>
       <tr><td class="detail-key">缓存读取</td><td class="detail-val">${cacheRead.toLocaleString()}</td></tr>
       <tr><td class="detail-key">缓存写入</td><td class="detail-val">${cacheWrite.toLocaleString()}</td></tr>
       <tr><td class="detail-key">输出 Tokens</td><td class="detail-val">${outputTokens.toLocaleString()}</td></tr>

@@ -145,6 +145,7 @@ pub async fn proxy_handler(
                 &tag,
                 in_flight,
                 &Arc::new(std::sync::Mutex::new(OverrideTrace::default())),
+                0,
             )
             .await;
             return Err(err);
@@ -167,6 +168,8 @@ pub async fn proxy_handler(
             ),
         )
         .await;
+
+    let estimated_input_tokens = openai_req.estimate_input_tokens();
 
     // Folded by forward_request: which credential/model an exception override
     // ended up using, for the `override_key`/`override_model` DB columns.
@@ -216,6 +219,7 @@ pub async fn proxy_handler(
         &tag,
         in_flight,
         &overrides,
+        estimated_input_tokens,
     )
     .await;
 
@@ -299,6 +303,7 @@ pub async fn responses_proxy_handler(
                 &tag,
                 in_flight,
                 &Arc::new(std::sync::Mutex::new(OverrideTrace::default())),
+                0,
             )
             .await;
             return Err(err);
@@ -321,6 +326,8 @@ pub async fn responses_proxy_handler(
             ),
         )
         .await;
+
+    let estimated_input_tokens = openai_req.estimate_input_tokens();
 
     // Folded by forward_request: which credential/model an exception override
     // ended up using, for the `override_key`/`override_model` DB columns.
@@ -370,6 +377,7 @@ pub async fn responses_proxy_handler(
         &tag,
         in_flight,
         &overrides,
+        estimated_input_tokens,
     )
     .await;
 
@@ -475,6 +483,8 @@ pub async fn chat_completions_proxy_handler(
         )
         .await;
 
+    let estimated_input_tokens = req.estimate_input_tokens();
+
     // Folded by forward_request: which credential/model an exception override
     // ended up using, for the `override_key`/`override_model` DB columns.
     let overrides = Arc::new(std::sync::Mutex::new(OverrideTrace::default()));
@@ -523,6 +533,7 @@ pub async fn chat_completions_proxy_handler(
         &tag,
         in_flight,
         &overrides,
+        estimated_input_tokens,
     )
     .await;
 
@@ -683,6 +694,7 @@ async fn finalize_request(
     tag: &str,
     in_flight: metrics::InFlightGuard,
     overrides: &Arc<std::sync::Mutex<OverrideTrace>>,
+    estimated_input_tokens: i64,
 ) {
     in_flight.finish(start, status);
     let overrides = overrides.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -710,11 +722,17 @@ async fn finalize_request(
         }
         Some(message) => {
             let duration_ms = start.elapsed().as_millis() as i64;
-            // Record the failed request in the stats DB (no tokens) and request_logs.
+            // Record the failed request in the stats DB with estimated input tokens.
+            let failed_tokens = TokenRecord {
+                input: estimated_input_tokens,
+                cache_read: 0,
+                cache_write: 0,
+                output: 0,
+            };
             let _ = stats.record_request_log(RequestOutcome {
                 model: client_model,
                 route,
-                tokens: &TokenRecord::default(),
+                tokens: &failed_tokens,
                 duration_ms,
                 streamed: is_streaming,
                 status,

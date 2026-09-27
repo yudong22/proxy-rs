@@ -47,11 +47,15 @@ function overrideCell(item) {
   if (!key && !model) {
     return html`<span class="cell-override-none">—</span>`;
   }
+  const isErr = item.status >= 400 || Boolean(item.error);
+  const pillClass = isErr ? 'override-failed' : 'override-ok';
+  const prefix = isErr ? '✗ ' : '✓ ';
   const label = [key, model].filter(Boolean).join(' @ ');
+  const displayLabel = isErr ? `${prefix}${label} (仍失败)` : `${prefix}${label}`;
   // The reason explains *why* a non-default credential/model served the
   // request; the short cell shows it on hover alongside the full pair.
   const title = item.override_reason ? `${label} · ${item.override_reason}` : label;
-  return html`<span class="badge-pill override-pill" title="${title}">${label}</span>`;
+  return html`<span class="badge-pill override-pill ${pillClass}" title="${title}">${displayLabel}</span>`;
 }
 
 /**

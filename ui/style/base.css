@@ -265,7 +265,21 @@ input:checked + .toggle-slider::before {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.override-pill.override-ok {
+  background: rgba(40, 167, 69, 0.12);
+  color: #28a745;
+  border-color: rgba(40, 167, 69, 0.35);
+}
+
+.override-pill.override-failed {
+  background: rgba(220, 53, 69, 0.10);
+  color: #dc3545;
+  border-color: rgba(220, 53, 69, 0.30);
 }
 
 .cell-override-none {
