@@ -1749,11 +1749,21 @@ fn apply_upstream_auth(
 /// The bearer token replaces the static key path, and the session-bound
 /// headers (user/enterprise/machine/domain) reproduce what the genuine desktop
 /// client sends — exactly what the `11128 unapproved channel` rejection checks.
+///
+/// Critically, when a credential is in use the request must present a *single*,
+/// consistent identity. `apply_upstream_auth` (for the WorkBuddy flavor) may
+/// have already injected an `x-api-key` from the key-pool default; leaving a
+/// mismatched `x-api-key` (a different key than the bearer token) alongside the
+/// login-state bearer is exactly what makes the gateway reject the request with
+/// an opaque 502. So we overwrite `x-api-key` with the token here, mirroring the
+/// proven `fetch_points` call which authenticates with the token in both
+/// `Authorization` and `X-API-Key`. A credential session is key-pool-independent.
 fn apply_credential_auth(
     mut req: reqwest::RequestBuilder,
     credential: &crate::workbuddy_auth::WorkBuddyCredential,
 ) -> reqwest::RequestBuilder {
     req = req.header("Authorization", format!("Bearer {}", credential.bearer()));
+    req = req.header("X-API-Key", credential.bearer());
     for (name, value) in crate::workbuddy_auth::upstream_headers(credential) {
         req = req.header(name, value);
     }

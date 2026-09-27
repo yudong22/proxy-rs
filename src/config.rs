@@ -257,10 +257,15 @@ impl Config {
 
         // The credential pool turns itself on when the store has an enabled
         // credential, so importing a login state in the GUI is the only setup
-        // step. `PROXY_CREDENTIAL_POOL` can still force-disable it entirely.
-        config.credential_pool_enabled = crate::workbuddy_auth::load_credentials()
-            .iter()
-            .any(|c| c.enabled);
+        // step. The unified 身份池 selector can also pin "use the key/static
+        // path" (`__none__`), which forces the pool off. `PROXY_CREDENTIAL_POOL`
+        // can still force-disable it entirely.
+        let desired_identity = crate::workbuddy_auth::resolve_default_identity();
+        let force_no_pool = desired_identity == crate::workbuddy_auth::NO_ACCOUNT_POOL_SENTINEL;
+        config.credential_pool_enabled = !force_no_pool
+            && crate::workbuddy_auth::load_credentials()
+                .iter()
+                .any(|c| c.enabled);
 
         config.apply_env_overrides()?;
         Ok(config)

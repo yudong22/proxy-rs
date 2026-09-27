@@ -96,6 +96,14 @@ pub struct PoolPreferences {
     /// single `GuiSettings::api_key` field is used.
     #[serde(default)]
     pub default_key_id: String,
+    /// Unified default identity: either a credential id (`wb-…`) or a key id
+    /// (`k-…`). Empty means "first usable credential, else first enabled key,
+    /// else the single `GuiSettings::api_key`", the pre-1.8.5 behaviour. A
+    /// literal `"__none__"` disables the account pool and forces the key/static
+    /// path. This field is what the unified 身份池 selector writes; the two
+    /// legacy `*_id` fields are retained only for first-run migration.
+    #[serde(default)]
+    pub default_identity_id: String,
 }
 
 fn default_checkin_time() -> String {
@@ -571,9 +579,10 @@ pub fn upsert_api_key(item: ApiKeyEntry) -> Result<ApiKeyEntry> {
 
 /// The upstream key the proxy should use right now.
 ///
-/// Resolution: the pool's default enabled key if one is set, else the first
-/// enabled key, else `None` — which leaves [`crate::config::Config::api_key`]
-/// (the single GUI field / env var) in charge, so a 1.7.x setup is untouched.
+/// Resolution: a key pinned by the unified default identity wins, else the
+/// pool's `default_key_id`, else the first enabled key, else `None` — which
+/// leaves [`crate::config::Config::api_key`] (the single GUI field / env var) in
+/// charge, so a 1.7.x setup is untouched.
 pub fn active_api_key() -> Option<String> {
     let items = load_api_keys();
     if items.is_empty() {
@@ -581,6 +590,16 @@ pub fn active_api_key() -> Option<String> {
     }
     let prefs = load_preferences();
     let enabled = |k: &ApiKeyEntry| k.enabled && !k.key.trim().is_empty();
+    // The unified 身份池 selector can pin a key directly (`k-…`). Honour it
+    // first, but fall through (not disable) if that pinned key is gone/disabled.
+    if prefs.default_identity_id.starts_with("k-") {
+        if let Some(k) = items
+            .iter()
+            .find(|k| k.id == prefs.default_identity_id && enabled(k))
+        {
+            return Some(k.key.trim().to_string());
+        }
+    }
     if !prefs.default_key_id.is_empty() {
         if let Some(k) = items
             .iter()
@@ -626,6 +645,89 @@ pub fn set_default_api_key(id: &str) -> Result<PoolPreferences> {
             .find(|k| k.id == id)
             .map(|_| id.to_string())
             .ok_or_else(|| anyhow::anyhow!("密钥不存在: {}", id))?
+    };
+    save_preferences(&prefs)?;
+    Ok(prefs)
+}
+
+/// The literal value the unified selector stores to mean "no account pool; use
+/// the key/static path". Credentials always start with `wb-` and keys with `k-`,
+/// so this sentinel can never collide with a real id.
+pub const NO_ACCOUNT_POOL_SENTINEL: &str = "__none__";
+
+/// Resolve the unified default identity: which credential id (or key id, or
+/// "none") the unified selector last chose. Falls back to the legacy separate
+/// fields when the unified field has not been set yet, so an upgraded install
+/// keeps behaving as before until the user touches the new control.
+pub fn resolve_default_identity() -> String {
+    let prefs = load_preferences();
+    if !prefs.default_identity_id.is_empty() {
+        return prefs.default_identity_id.clone();
+    }
+    // Migration: honour the old separate defaults. A selected account wins over
+    // a selected key, matching the 1.8.4 behaviour where a pool default account
+    // and a key default could both be set independently. Once the user picks in
+    // the new UI this branch is never taken again.
+    if !prefs.default_credential_id.is_empty() {
+        return prefs.default_credential_id.clone();
+    }
+    if !prefs.default_key_id.is_empty() {
+        return prefs.default_key_id.clone();
+    }
+    String::new()
+}
+
+/// The identity actually in force right now, including first-usable fallbacks.
+///
+/// Returns `"__none__"` when the account pool is explicitly disabled, a
+/// credential id (`wb-…`) when an account is the default, a key id (`k-…`) when
+/// a key is, or `""` when nothing in the pools is used (the static
+/// `GuiSettings::api_key` path). The unified 身份池 selector uses this to mark
+/// the "default" badge, mirroring exactly the resolution the proxy request path
+/// applies.
+pub fn effective_default_identity() -> String {
+    let prefs = load_preferences();
+    if !prefs.default_identity_id.is_empty() {
+        return prefs.default_identity_id.clone();
+    }
+    let creds = load_credentials();
+    if let Some(c) = creds
+        .iter()
+        .find(|c| c.is_usable(crate::util::unix_millis()))
+    {
+        return c.id.clone();
+    }
+    let keys = load_api_keys();
+    if let Some(k) = keys.iter().find(|k| k.enabled && !k.key.trim().is_empty()) {
+        return k.id.clone();
+    }
+    String::new()
+}
+
+/// Set the unified default identity id. Validates that the id names a real
+/// credential or key (or the explicit "none" sentinel); an empty string clears
+/// it back to the first-usable fallback.
+pub fn set_default_identity(id: &str) -> Result<PoolPreferences> {
+    let mut prefs = load_preferences();
+    prefs.default_identity_id = if id.is_empty() || id == NO_ACCOUNT_POOL_SENTINEL {
+        id.to_string()
+    } else if id.starts_with("wb-") {
+        let items = load_credentials();
+        items
+            .iter()
+            .find(|c| c.id == id)
+            .map(|_| id.to_string())
+            .ok_or_else(|| anyhow::anyhow!("账号不存在: {}", id))?;
+        id.to_string()
+    } else if id.starts_with("k-") {
+        let items = load_api_keys();
+        items
+            .iter()
+            .find(|k| k.id == id)
+            .map(|_| id.to_string())
+            .ok_or_else(|| anyhow::anyhow!("密钥不存在: {}", id))?
+    } else {
+        anyhow::bail!("未知的默认身份类型: {}", id)
     };
     save_preferences(&prefs)?;
     Ok(prefs)

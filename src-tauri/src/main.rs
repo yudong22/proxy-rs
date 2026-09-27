@@ -451,6 +451,7 @@ async fn wb_credentials_list(ctx: State<'_, Arc<AppContext>>) -> Result<Value, S
     Ok(json!({
         "credentials": list,
         "default_credential_id": prefs.default_credential_id,
+        "default_identity_id": prefs.default_identity_id,
     }))
 }
 
@@ -544,14 +545,52 @@ async fn reload_pool(ctx: &Arc<AppContext>) {
     ctx.credential_pool.reload_from_store().await;
 }
 
+/// Fold the legacy single `GuiSettings::api_key` into the key pool.
+///
+/// Called once at startup. The model-provider API Key field is removed from the
+/// GUI (the key pool now owns all keys), but existing installs still have a key
+/// there; importing it as a key entry means the unified 身份池 selector can
+/// manage it and the proxy keeps using it. Existing keys take precedence: a key
+/// whose material already exists is left untouched (its id is content-derived),
+/// so we only add when the pool has nothing matching yet.
+fn migrate_legacy_api_key(settings: &GuiSettings) {
+    let key = settings.api_key.trim();
+    if key.is_empty() {
+        return;
+    }
+    let id = proxy_rs::workbuddy_auth::api_key_id(key);
+    let items = proxy_rs::workbuddy_auth::load_api_keys();
+    if items.iter().any(|k| k.id == id) {
+        return;
+    }
+    let entry = proxy_rs::workbuddy_auth::ApiKeyEntry {
+        id,
+        label: "默认 API Key".to_string(),
+        key: key.to_string(),
+        enabled: true,
+        points: None,
+        points_fetched_at_ms: None,
+    };
+    let mut merged = items;
+    merged.push(entry);
+    let _ = proxy_rs::workbuddy_auth::save_api_keys(&merged);
+}
+
 #[tauri::command]
-async fn wb_set_default(ctx: State<'_, Arc<AppContext>>, id: String) -> Result<Value, String> {
-    let prefs = proxy_rs::workbuddy_auth::set_default_credential(&id).map_err(|e| e.to_string())?;
+async fn wb_set_default(
+    app: tauri::AppHandle,
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<Value, String> {
+    // Route through the unified 身份池 so a single "default" always wins; the
+    // legacy credential/key selectors both funnel into the same field now.
+    let prefs = proxy_rs::workbuddy_auth::set_default_identity(&id).map_err(|e| e.to_string())?;
     reload_pool(&ctx).await;
+    start_proxy_server(app, ctx.inner().clone());
     ctx.logs
         .push("INFO", format!("已设置默认 WorkBuddy 账号: {}", id))
         .await;
-    Ok(json!({ "ok": true, "default_credential_id": prefs.default_credential_id }))
+    Ok(json!({ "ok": true, "default_identity_id": prefs.default_identity_id }))
 }
 
 #[tauri::command]
@@ -560,6 +599,7 @@ async fn wb_preferences() -> Result<Value, String> {
     Ok(json!({
         "default_credential_id": prefs.default_credential_id,
         "default_key_id": prefs.default_key_id,
+        "default_identity_id": prefs.default_identity_id,
         "daily_checkin_enabled": prefs.daily_checkin_enabled,
         "daily_checkin_time": prefs.daily_checkin_time,
         "last_checkin_run_date": prefs.last_checkin_run_date,
@@ -681,7 +721,11 @@ async fn api_keys_list() -> Result<Value, String> {
             mask_api_key(k, is_default)
         })
         .collect();
-    Ok(json!({ "keys": list, "default_key_id": prefs.default_key_id }))
+    Ok(json!({
+        "keys": list,
+        "default_key_id": prefs.default_key_id,
+        "default_identity_id": prefs.default_identity_id,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -760,14 +804,47 @@ async fn api_keys_toggle(
 
 #[tauri::command]
 async fn api_keys_set_default(
+    app: tauri::AppHandle,
     ctx: State<'_, Arc<AppContext>>,
     id: String,
 ) -> Result<Value, String> {
-    let prefs = proxy_rs::workbuddy_auth::set_default_api_key(&id).map_err(|e| e.to_string())?;
+    // Route through the unified 身份池; an empty id clears back to the key/
+    // static fallback. Hot-applies by rebuilding the running proxy, which
+    // resolves its effective key from the pool via `active_api_key()`.
+    let prefs = proxy_rs::workbuddy_auth::set_default_identity(&id).map_err(|e| e.to_string())?;
+    start_proxy_server(app, ctx.inner().clone());
     ctx.logs
         .push("INFO", format!("已设置默认上游密钥: {}", id))
         .await;
-    Ok(json!({ "ok": true, "default_key_id": prefs.default_key_id }))
+    Ok(json!({ "ok": true, "default_identity_id": prefs.default_identity_id }))
+}
+
+/// Unified 身份池 default selector: choose the default account, the default
+/// key, or "use the key/static path" (`__none__`). Supersedes both the legacy
+/// `wb_set_default` and `api_keys_set_default` controls.
+#[tauri::command]
+async fn wb_set_default_identity(
+    app: tauri::AppHandle,
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<Value, String> {
+    let prefs = proxy_rs::workbuddy_auth::set_default_identity(&id).map_err(|e| e.to_string())?;
+    reload_pool(&ctx).await;
+    start_proxy_server(app, ctx.inner().clone());
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "已设置默认身份: {}",
+                if id.is_empty() {
+                    "默认（账号优先，否则密钥/单 Key）".to_string()
+                } else {
+                    id
+                }
+            ),
+        )
+        .await;
+    Ok(json!({ "ok": true, "default_identity_id": prefs.default_identity_id }))
 }
 
 #[tauri::command]
@@ -829,12 +906,16 @@ async fn wb_oauth_poll(ctx: State<'_, Arc<AppContext>>, state: String) -> Result
 async fn fetch_models(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     let settings = ctx.settings.read().await;
     let preset = settings.models_preset();
-    let api_key = settings.api_key.clone();
+    let static_key = settings.api_key.clone();
     drop(settings);
 
-    if api_key.is_empty() {
-        return Err("未配置 API Key".to_string());
-    }
+    let api_key = proxy_rs::workbuddy_auth::active_api_key()
+        .or_else(|| Some(static_key))
+        .filter(|k| !k.trim().is_empty());
+    let api_key = match api_key {
+        Some(k) => k,
+        None => return Err("未配置 API Key".to_string()),
+    };
 
     match providers::fetch_models(&ctx.client, &preset, &api_key).await {
         Ok(models) => {
@@ -1011,15 +1092,21 @@ async fn test_upstream(
 ) -> Result<Value, String> {
     let settings = ctx.settings.read().await;
     let url = settings.chat_url(&providers::builtin_presets());
-    let api_key = settings.api_key.clone();
+    // Capture the static key before dropping the guard; the key pool's active
+    // key (which now also includes the migrated legacy single API Key) takes
+    // priority, matching what the running proxy actually sends.
+    let static_key = settings.api_key.clone();
+    drop(settings);
+    let api_key = proxy_rs::workbuddy_auth::active_api_key()
+        .or_else(|| Some(static_key))
+        .filter(|k| !k.trim().is_empty());
+    let api_key = match api_key {
+        Some(k) => k,
+        None => return Err("API Key 尚未配置".to_string()),
+    };
     let model = body
         .model
         .unwrap_or_else(|| "deepseek-v4-flash".to_string());
-    drop(settings);
-
-    if api_key.is_empty() {
-        return Err("API Key 尚未配置".to_string());
-    }
 
     let payload = json!({
         "model": model,
@@ -1261,6 +1348,12 @@ fn stop_proxy_server(ctx: Arc<AppContext>) {
 
 fn main() {
     let settings = GuiSettings::load();
+    // Migrate the legacy single API Key field into the key pool so the unified
+    // 身份池 selector can manage it alongside the other keys. This runs before
+    // the proxy builds its config, so the migrated key is already in force. A
+    // key that already exists in the pool (same material) is deduped by id and
+    // simply re-enables/re-labels the existing entry.
+    migrate_legacy_api_key(&settings);
     // No port fallback. Every client CLI is configured against one fixed
     // gateway URL, so silently binding a different port breaks them with no
     // visible cause — the busy port is surfaced as an error instead, and the
@@ -1490,6 +1583,7 @@ fn main() {
             wb_preferences,
             wb_set_schedule,
             wb_refresh_points,
+            wb_set_default_identity,
             api_keys_list,
             api_keys_add,
             api_keys_delete,
