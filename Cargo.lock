@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-rs"
-version = "1.8.7"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-rs-gui"
-version = "1.8.7"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "axum",

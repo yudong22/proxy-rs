@@ -1092,11 +1092,43 @@ async fn forward_request(
                     // that session so its prompt cache survives, and the current
                     // request is retried on the replacement immediately.
                     if let Some(cred) = current_credential.as_ref() {
-                        // A 401 means the access token is stale/revoked. Renew it
-                        // and retry the *same* credential once before failing
-                        // over: with a single account, failing over has nowhere
-                        // to go and would just surface the 401 to the client.
-                        if status.as_u16() == 401 && !token_refresh_attempted {
+                        // ── 401 special-case: distinguish token expiry from routing failure ──
+                        //
+                        // Tencent / WorkBuddy upstreams return HTTP 401 for two very
+                        // different root causes that call for opposite treatments:
+                        //
+                        //  a) {"message":"not_found"} — the gateway could not route to
+                        //     the session / pod. The access token is fine; refreshing it
+                        //     wastes ~200 ms and won't fix a routing hiccup.  A brief
+                        //     wait lets the load-balancer resolve the bad path; if the
+                        //     retry still fails we fall through to the account switch.
+                        //
+                        //  b) Any other 401 — the access token is stale or revoked.
+                        //     Renew it and retry the *same* credential once before
+                        //     switching; with a single account, failing over has nowhere
+                        //     to go and would surface the 401 to the client directly.
+                        if status.as_u16() == 401 && body.contains("not_found") && !token_refresh_attempted {
+                            if attempt == 0 {
+                                // First attempt: brief pause, then retry without refresh.
+                                gui_logs
+                                    .push(
+                                        "WARN",
+                                        format!(
+                                            "UPSTREAM 401 not_found (疑似瞬时路由故障), 1.5s 后重试同一凭据 model={} {}",
+                                            openai_req.model, tag
+                                        ),
+                                    )
+                                    .await;
+                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                                continue; // attempt 0 → 1, no token refresh
+                            }
+                            // attempt ≥ 1: two tries already failed; fall through to
+                            // is_switchable_error → account switch (or 5 s cooldown).
+                        } else if status.as_u16() == 401 && !token_refresh_attempted {
+                            // Normal 401: the access token is stale/revoked. Renew it
+                            // and retry the *same* credential once before failing
+                            // over: with a single account, failing over has nowhere
+                            // to go and would just surface the 401 to the client.
                             token_refresh_attempted = true;
                             let updated = cred.clone();
                             if let Ok(fresh) = refresh_workbuddy_credential(
@@ -1112,6 +1144,7 @@ async fn forward_request(
                                 {
                                     if let Ok(mut t) = overrides.lock() {
                                         t.set_key(fresh.id.clone(), "401 刷新令牌后重试");
+                                        t.set_model(openai_req.model.clone(), "401 refresh 后重试");
                                     }
                                 }
                                 active_credential = Some(fresh.clone());
@@ -1120,9 +1153,22 @@ async fn forward_request(
                             }
                         }
 
+
                         if is_switchable_error(status.as_u16(), &body) {
                             let from = cred.id.clone();
-                            pool.mark_limited(&from, 60_000).await;
+                            // Attempt the switch BEFORE marking the failing
+                            // credential as limited, so we can use the
+                            // availability of a healthy replacement to decide
+                            // how long the cooldown should be:
+                            //
+                            //  • Switch succeeds → full 60 s: the error is
+                            //    likely account-specific (rate-limited, banned).
+                            //  • Switch fails (pool exhausted) → short 5 s: the
+                            //    error may be transient/global (e.g. upstream
+                            //    hiccup hitting all accounts simultaneously).
+                            //    A 60 s cooldown would make pool.is_enabled()
+                            //    return false and take every subsequent request
+                            //    offline for the full minute.
                             let replacement = if config.session_switch_enabled {
                                 pool.switch(&session.session_id, &from).await
                             } else {
@@ -1130,6 +1176,9 @@ async fn forward_request(
                             };
                             match replacement {
                                 Some(next) => {
+                                    // Park the failing credential for the full
+                                    // cooldown — we have somewhere else to go.
+                                    pool.mark_limited(&from, 60_000).await;
                                     gui_logs
                                         .push(
                                             "WARN",
@@ -1145,18 +1194,24 @@ async fn forward_request(
                                         .await;
                                     if let Ok(mut t) = overrides.lock() {
                                         t.set_key(next.id.clone(), format!("{status} from {from}"));
+                                        t.set_model(openai_req.model.clone(), format!("failover {status} from {from}"));
                                     }
                                     active_credential = Some(next);
                                     continue 'credential; // retry the request on the replacement
                                 }
                                 None => {
-                                    // No healthy replacement: fall through and
-                                    // return the real upstream error.
+                                    // No healthy replacement available. Apply only
+                                    // a short cooldown so the pool stays online
+                                    // for the next client retry (transient errors
+                                    // resolve; a 60 s full park would silence the
+                                    // pool and make every following request fail
+                                    // immediately without trying the upstream).
+                                    pool.mark_limited(&from, 5_000).await;
                                     gui_logs
                                         .push(
                                             "WARN",
                                             format!(
-                                                "凭据池无可用替换凭据 from={} reason={} {}",
+                                                "凭据池无可用替换凭据 from={} reason={} {} (短暂冷却5s后恢复)",
                                                 from, status, tag
                                             ),
                                         )
@@ -1926,11 +1981,16 @@ fn upstream_auth_headers(
 
 /// Whether an upstream failure should relocate the session onto another
 /// credential: the plan's limit/failure classes — 429 rate limit, 402 out of
-/// credit, and WorkBuddy quota business codes (11105/11106 family). The 11128
-/// content-policy code is deliberately absent: switching accounts cannot fix
-/// a content-policy rejection.
+/// credit, 403 banned/permission denied, and WorkBuddy quota business codes
+/// (11105/11106 family). The 11128 content-policy code is deliberately absent:
+/// switching accounts cannot fix a content-policy rejection.
 fn is_switchable_error(status: u16, body: &str) -> bool {
-    matches!(status, 401 | 402 | 429) || is_quota_business_code(body)
+    // 401: stale/revoked token (handled first with a refresh, then failover)
+    // 402: payment required / quota exceeded
+    // 403: account banned / permission denied
+    // 429: rate limited
+    // WorkBuddy quota business codes always switch regardless of HTTP status.
+    matches!(status, 401 | 402 | 403 | 429) || is_quota_business_code(body)
 }
 
 /// WorkBuddy business codes that signal quota/rate exhaustion for this account.
