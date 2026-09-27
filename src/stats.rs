@@ -47,6 +47,9 @@ pub struct RequestOutcome<'a> {
     /// Upstream model name selected by an exception override (e.g. the degraded
     /// retry's model). Empty when no override changed the model.
     pub override_model: &'a str,
+    /// Why the override(s) fired, e.g. `429 from wb-a1; content_blocked 400`.
+    /// Empty when the request ran exactly as configured.
+    pub override_reason: &'a str,
 }
 
 impl RequestOutcome<'_> {
@@ -69,6 +72,7 @@ impl RequestOutcome<'_> {
             client: self.client.to_string(),
             override_key: self.override_key.to_string(),
             override_model: self.override_model.to_string(),
+            override_reason: self.override_reason.to_string(),
         }
     }
 }
@@ -92,6 +96,7 @@ struct RequestRow {
     client: String,
     override_key: String,
     override_model: String,
+    override_reason: String,
 }
 
 impl RequestRow {
@@ -100,8 +105,8 @@ impl RequestRow {
             date, created_at, model, route,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
             duration_ms, streamed, status, error, session_id, client,
-            override_key, override_model
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+            override_key, override_model, override_reason
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
     }
 
     fn bind_to(&self, stmt: &mut rusqlite::Statement<'_>) -> rusqlite::Result<()> {
@@ -122,6 +127,7 @@ impl RequestRow {
             self.client,
             self.override_key,
             self.override_model,
+            self.override_reason,
         ])?;
         Ok(())
     }
@@ -151,6 +157,8 @@ pub struct RequestLogItem {
     pub override_key: String,
     /// Upstream model chosen by an exception override, or empty.
     pub override_model: String,
+    /// Why the override fired, or empty when nothing was overridden.
+    pub override_reason: String,
 }
 
 /// Filter criteria for querying request logs.
@@ -433,7 +441,8 @@ impl StatsDb {
                 session_id          TEXT NOT NULL DEFAULT '',
                 client              TEXT NOT NULL DEFAULT '',
                 override_key        TEXT NOT NULL DEFAULT '',
-                override_model      TEXT NOT NULL DEFAULT ''
+                override_model      TEXT NOT NULL DEFAULT '',
+                override_reason     TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_request_logs_id_desc ON request_logs(id DESC);
             CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at DESC);
@@ -469,7 +478,13 @@ impl StatsDb {
         // `session_id`/`client` arrived with session-aware logging. SQLite has
         // no `ADD COLUMN IF NOT EXISTS`, so each is probed first and old rows
         // keep the empty-string default.
-        for column in ["session_id", "client", "override_key", "override_model"] {
+        for column in [
+            "session_id",
+            "client",
+            "override_key",
+            "override_model",
+            "override_reason",
+        ] {
             let exists = conn
                 .prepare("PRAGMA table_info(request_logs)")?
                 .query_map([], |row| row.get::<_, String>(1))?
@@ -655,7 +670,7 @@ impl StatsDb {
             "SELECT id, created_at, model, route,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                     duration_ms, streamed, status, error, session_id, client,
-                    override_key, override_model
+                    override_key, override_model, override_reason
              FROM request_logs
              {}
              ORDER BY id DESC
@@ -690,6 +705,7 @@ impl StatsDb {
                 client: row.get(13)?,
                 override_key: row.get(14)?,
                 override_model: row.get(15)?,
+                override_reason: row.get(16)?,
             })
         })?;
 
@@ -861,6 +877,7 @@ mod tests {
             client: "",
             override_key: "",
             override_model: "",
+            override_reason: "",
         }
     }
 
@@ -1101,6 +1118,65 @@ mod tests {
         let stats = db.query_date("2026-09-22").unwrap();
         assert_eq!(stats.requests_total, 1, "date backfilled from created_at");
         assert_eq!(stats.requests_success, 1);
+    }
+
+    /// The override trio round-trips through the DB, so the detail view can
+    /// explain *why* a non-default credential served a request.
+    #[test]
+    fn override_fields_round_trip_through_the_database() {
+        let db = StatsDb::in_memory().unwrap();
+        let tokens = TokenRecord::default();
+        let mut o = outcome("hy3", "/v1/responses", &tokens, 200, None, true);
+        o.override_key = "wb-b1";
+        o.override_model = "glm-5.3";
+        o.override_reason = "429 from wb-a1; content_blocked 400";
+        let _ = db.record_request_log(o);
+
+        let res = db
+            .query_request_logs(&RequestLogFilter {
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        let item = &res.items[0];
+        assert_eq!(item.override_key, "wb-b1");
+        assert_eq!(item.override_model, "glm-5.3");
+        assert_eq!(item.override_reason, "429 from wb-a1; content_blocked 400");
+    }
+
+    /// An older database gains the `override_reason` column (defaulting to the
+    /// empty string) instead of failing to open.
+    #[test]
+    fn migration_adds_the_override_reason_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE request_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                model TEXT NOT NULL,
+                route TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                streamed INTEGER NOT NULL DEFAULT 0,
+                status INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                session_id TEXT NOT NULL DEFAULT '',
+                client TEXT NOT NULL DEFAULT '',
+                override_key TEXT NOT NULL DEFAULT '',
+                override_model TEXT NOT NULL DEFAULT ''
+             );",
+        )
+        .unwrap();
+
+        StatsDb::init_schema(&conn).unwrap();
+
+        // The new column exists and old rows read back as an empty reason.
+        let db = StatsDb::from_conn(conn);
+        let res = db.query_request_logs(&RequestLogFilter::default()).unwrap();
+        assert!(res.items.is_empty());
     }
 
     #[test]

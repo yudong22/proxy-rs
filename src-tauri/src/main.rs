@@ -910,7 +910,7 @@ async fn fetch_models(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> 
     drop(settings);
 
     let api_key = proxy_rs::workbuddy_auth::active_api_key()
-        .or_else(|| Some(static_key))
+        .or(Some(static_key))
         .filter(|k| !k.trim().is_empty());
     let api_key = match api_key {
         Some(k) => k,
@@ -1098,7 +1098,7 @@ async fn test_upstream(
     let static_key = settings.api_key.clone();
     drop(settings);
     let api_key = proxy_rs::workbuddy_auth::active_api_key()
-        .or_else(|| Some(static_key))
+        .or(Some(static_key))
         .filter(|k| !k.trim().is_empty());
     let api_key = match api_key {
         Some(k) => k,

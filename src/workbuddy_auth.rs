@@ -231,6 +231,27 @@ pub struct WorkBuddyAccount {
 }
 
 impl WorkBuddyCredential {
+    /// Whether the credential is in a rate-limit cooldown right now.
+    pub fn is_cooling_down(&self, now_ms: i64) -> bool {
+        matches!(self.cooldown_until_ms, Some(until) if now_ms < until)
+    }
+
+    /// Whether the access token has expired (or is within the renewal margin)
+    /// and a refresh token is available to renew it.
+    ///
+    /// A token with an *unknown* expiry is never refreshed proactively — only a
+    /// reactive 401 can justify that — because guessing here would burn a
+    /// refresh round-trip on every healthy request.
+    pub fn needs_refresh(&self, now_ms: i64) -> bool {
+        if !self.enabled || self.refresh_token.is_none() {
+            return false;
+        }
+        match self.expires_at_ms {
+            Some(exp) => now_ms >= exp - 60_000,
+            None => false,
+        }
+    }
+
     /// Whether the access token is still believed valid: not expired (with a
     /// 60-second margin, matching the reference client's renewal threshold)
     /// and not in a rate-limit cooldown.
@@ -238,10 +259,8 @@ impl WorkBuddyCredential {
         if !self.enabled {
             return false;
         }
-        if let Some(until) = self.cooldown_until_ms {
-            if now_ms < until {
-                return false;
-            }
+        if self.is_cooling_down(now_ms) {
+            return false;
         }
         match self.expires_at_ms {
             Some(exp) => now_ms < exp - 60_000,
@@ -742,18 +761,40 @@ pub fn set_default_identity(id: &str) -> Result<PoolPreferences> {
 pub fn ordered_credentials() -> Vec<WorkBuddyCredential> {
     let mut items = load_credentials();
     let prefs = load_preferences();
-    if prefs.default_credential_id.is_empty() {
+    // The unified 身份池 selector is the source of truth when it pins a
+    // credential; the legacy `default_credential_id` is only consulted for
+    // installs that predate it. A key/`__none__` selection must not reorder the
+    // credential pool at all.
+    let target = if prefs.default_identity_id.starts_with("wb-") {
+        prefs.default_identity_id.clone()
+    } else {
+        prefs.default_credential_id.clone()
+    };
+    if target.is_empty() {
         return items;
     }
-    let Some(pos) = items
-        .iter()
-        .position(|c| c.id == prefs.default_credential_id)
-    else {
+    let Some(pos) = items.iter().position(|c| c.id == target) else {
         return items;
     };
     let chosen = items.remove(pos);
     items.insert(0, chosen);
     items
+}
+
+/// The auth endpoint to refresh this credential against.
+///
+/// The stored `domain` is the authority the login state was issued for, so the
+/// token must be renewed there; an empty/unknown domain falls back to the
+/// domestic default. Accepts a bare host or a full URL.
+pub fn auth_endpoint_for(credential: &WorkBuddyCredential) -> String {
+    let domain = credential.domain.trim();
+    if domain.is_empty() {
+        DEFAULT_WORKBUDDY_ENDPOINT.to_string()
+    } else if domain.starts_with("http://") || domain.starts_with("https://") {
+        domain.trim_end_matches('/').to_string()
+    } else {
+        format!("https://{}", domain.trim_end_matches('/'))
+    }
 }
 
 /// Record a successful check-in for one credential on today's local day.
@@ -1733,6 +1774,44 @@ mod tests {
         c.cooldown_until_ms = None;
         c.enabled = false;
         assert!(!c.is_usable(0));
+    }
+
+    /// Proactive renewal triggers only when the token is near expiry AND a
+    /// refresh token exists; an unknown expiry is never guessed at.
+    #[test]
+    fn needs_refresh_only_when_expiring_with_a_refresh_token() {
+        let mut c = parse_login_state(r#"{"accessToken":"t","refreshToken":"r"}"#).unwrap();
+        // Unknown expiry: never proactively refreshed.
+        assert!(!c.needs_refresh(9_999_999_999));
+
+        c.expires_at_ms = Some(1_000_000);
+        assert!(!c.needs_refresh(0));
+        // Inside the 60s renewal margin.
+        assert!(c.needs_refresh(940_000));
+        assert!(c.needs_refresh(1_000_000));
+
+        // Without a refresh token there is nothing to refresh with.
+        c.refresh_token = None;
+        assert!(!c.needs_refresh(1_000_000));
+
+        // Disabled credentials are never refreshed.
+        c.refresh_token = Some("r".to_string());
+        c.enabled = false;
+        assert!(!c.needs_refresh(1_000_000));
+    }
+
+    /// The refresh endpoint follows the credential's own domain.
+    #[test]
+    fn auth_endpoint_follows_the_credential_domain() {
+        let mut c = WorkBuddyCredential::default();
+        assert_eq!(auth_endpoint_for(&c), DEFAULT_WORKBUDDY_ENDPOINT);
+
+        c.domain = "copilot.tencent.com".to_string();
+        assert_eq!(auth_endpoint_for(&c), "https://copilot.tencent.com");
+
+        // A full URL (with a trailing slash) is used as-is.
+        c.domain = "https://www.codebuddy.cn/".to_string();
+        assert_eq!(auth_endpoint_for(&c), "https://www.codebuddy.cn");
     }
 
     #[test]

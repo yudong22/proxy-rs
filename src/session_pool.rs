@@ -189,6 +189,56 @@ impl CredentialPool {
         }
     }
 
+    /// Replace one credential in place, preserving pool order.
+    ///
+    /// Used after a successful token refresh so the very next request picks up
+    /// the new access token without waiting for a pool reload.
+    pub async fn update_credential(&self, credential: WorkBuddyCredential) -> bool {
+        let mut entries = self.entries.write().await;
+        if let Some(slot) = entries.iter_mut().find(|c| c.id == credential.id) {
+            *slot = credential;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Park a credential for a short while after a failed token refresh, so
+    /// every in-flight request does not re-hit the refresh endpoint.
+    pub async fn mark_refresh_failed(&self, id: &str, cooldown_ms: i64, message: &str) {
+        let now = crate::util::unix_millis();
+        let mut entries = self.entries.write().await;
+        if let Some(c) = entries.iter_mut().find(|c| c.id == id) {
+            c.cooldown_until_ms = Some(now + cooldown_ms);
+            c.last_error = message.to_string();
+        }
+    }
+
+    /// The id of the credential that counts as "the default" for override
+    /// attribution.
+    ///
+    /// This is the first **enabled** entry in pool order — deliberately
+    /// independent of health. The caller orders the pool so the configured
+    /// default is first (see [`crate::workbuddy_auth::ordered_credentials`]),
+    /// which means the answer is stable across requests.
+    ///
+    /// Using the first *usable* entry instead was a bug: the moment the
+    /// configured default hit a cooldown, the sticky replacement became the
+    /// "first usable" entry, so the very session that had failed over stopped
+    /// looking like an override — the override column went blank after one
+    /// switch. Health must not change what "default" means.
+    pub async fn configured_default_id(&self) -> Option<String> {
+        let entries = self.entries.read().await;
+        entries.iter().find(|c| c.enabled).map(|c| c.id.clone())
+    }
+
+    /// The credential that counts as the configured default (first enabled
+    /// entry), for proactive token renewal before selection.
+    pub async fn default_credential(&self) -> Option<WorkBuddyCredential> {
+        let entries = self.entries.read().await;
+        entries.iter().find(|c| c.enabled).cloned()
+    }
+
     /// Replace the credential list, preserving the sticky bindings.
     ///
     /// Called when the GUI changes the default account or imports/deletes one.
@@ -375,6 +425,46 @@ mod tests {
         let p = CredentialPool::empty();
         assert!(!p.is_enabled().await);
         assert!(p.pick("claude:s1").await.is_none());
+    }
+
+    /// The override label must survive the default going unhealthy.
+    ///
+    /// Regression: the default was computed as the first *usable* entry. As soon
+    /// as the configured default hit a cooldown it dropped out, so the sticky
+    /// replacement became "first usable" — the very session that had failed over
+    /// stopped looking like an override, and the override column went blank after
+    /// one switch. The default must be the first *enabled* entry in pool order.
+    #[tokio::test]
+    async fn configured_default_stays_put_when_the_default_cools_down() {
+        let p = pool(&["wb-a", "wb-b"]);
+        assert_eq!(p.configured_default_id().await.as_deref(), Some("wb-a"));
+
+        // The default is rate-limited and a session relocates to wb-b.
+        p.mark_limited("wb-a", 60_000).await;
+        p.switch("claude:s1", "wb-a").await.unwrap();
+        let served = p.pick("claude:s1").await.unwrap();
+        assert_eq!(served.id, "wb-b");
+
+        // It must STILL report wb-a as the default, so `served != default` and
+        // the session keeps being labelled an override on every later request.
+        assert_eq!(
+            p.configured_default_id().await.as_deref(),
+            Some("wb-a"),
+            "health must not redefine which credential is the default"
+        );
+    }
+
+    /// `update_credential` replaces the token in place, keeping pool order.
+    #[tokio::test]
+    async fn update_credential_preserves_order_and_swaps_the_token() {
+        let p = pool(&["wb-a", "wb-b"]);
+        let mut fresh = cred("wb-b");
+        fresh.access_token = "new-token".to_string();
+        assert!(p.update_credential(fresh).await);
+
+        let items = p.snapshot().await;
+        assert_eq!(items[0].id, "wb-a", "order is preserved");
+        assert_eq!(items[1].access_token, "new-token");
     }
 
     /// Failover prefers the credential with the most remaining points.

@@ -48,7 +48,10 @@ function overrideCell(item) {
     return html`<span class="cell-override-none">—</span>`;
   }
   const label = [key, model].filter(Boolean).join(' @ ');
-  return html`<span class="badge-pill override-pill" title="${label}">${label}</span>`;
+  // The reason explains *why* a non-default credential/model served the
+  // request; the short cell shows it on hover alongside the full pair.
+  const title = item.override_reason ? `${label} · ${item.override_reason}` : label;
+  return html`<span class="badge-pill override-pill" title="${title}">${label}</span>`;
 }
 
 /**

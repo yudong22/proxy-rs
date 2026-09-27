@@ -48,7 +48,8 @@ export function showRequestModal(id) {
   const overrideRows = (item.override_key || item.override_model)
     ? html`
       <tr><td class="detail-key">Override Key</td><td class="detail-val"><span class="mono">${item.override_key || '—'}</span></td></tr>
-      <tr><td class="detail-key">Override Model</td><td class="detail-val"><span class="mono">${item.override_model || '—'}</span></td></tr>`
+      <tr><td class="detail-key">Override Model</td><td class="detail-val"><span class="mono">${item.override_model || '—'}</span></td></tr>
+      <tr><td class="detail-key">Override 原因</td><td class="detail-val">${item.override_reason || '—'}</td></tr>`
     : '';
 
   openModal('请求详情', html`

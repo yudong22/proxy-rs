@@ -180,24 +180,9 @@ pub async fn proxy_handler(
     } else {
         None
     };
-    // Only a session that a previous failover *moved off* the default records
-    // its sticky key; the plain default pick is not an override and must leave
-    // `override_key` empty. The MutexGuard must be dropped before any `.await`
-    // (std's guard is !Send), so the default check resolves first.
-    if let Some(cred) = &credential {
-        let default_id = pool
-            .snapshot()
-            .await
-            .into_iter()
-            .find(|c| c.is_usable(crate::util::unix_millis()))
-            .map(|c| c.id);
-        let is_default = default_id.as_deref() == Some(cred.id.as_str());
-        if !is_default {
-            if let Ok(mut t) = overrides.lock() {
-                t.set_key(cred.id.clone(), "sticky failover");
-            }
-        }
-    }
+    // A credential other than the configured default is an override, and stays
+    // labelled as one on every request it serves (not just the first).
+    record_credential_override(&pool, &credential, &overrides).await;
     let result = forward_request(
         config,
         client,
@@ -349,24 +334,9 @@ pub async fn responses_proxy_handler(
     } else {
         None
     };
-    // Only a session that a previous failover *moved off* the default records
-    // its sticky key; the plain default pick is not an override and must leave
-    // `override_key` empty. The MutexGuard must be dropped before any `.await`
-    // (std's guard is !Send), so the default check resolves first.
-    if let Some(cred) = &credential {
-        let default_id = pool
-            .snapshot()
-            .await
-            .into_iter()
-            .find(|c| c.is_usable(crate::util::unix_millis()))
-            .map(|c| c.id);
-        let is_default = default_id.as_deref() == Some(cred.id.as_str());
-        if !is_default {
-            if let Ok(mut t) = overrides.lock() {
-                t.set_key(cred.id.clone(), "sticky failover");
-            }
-        }
-    }
+    // A credential other than the configured default is an override, and stays
+    // labelled as one on every request it serves (not just the first).
+    record_credential_override(&pool, &credential, &overrides).await;
     let result = forward_request(
         config,
         client,
@@ -517,24 +487,9 @@ pub async fn chat_completions_proxy_handler(
     } else {
         None
     };
-    // Only a session that a previous failover *moved off* the default records
-    // its sticky key; the plain default pick is not an override and must leave
-    // `override_key` empty. The MutexGuard must be dropped before any `.await`
-    // (std's guard is !Send), so the default check resolves first.
-    if let Some(cred) = &credential {
-        let default_id = pool
-            .snapshot()
-            .await
-            .into_iter()
-            .find(|c| c.is_usable(crate::util::unix_millis()))
-            .map(|c| c.id);
-        let is_default = default_id.as_deref() == Some(cred.id.as_str());
-        if !is_default {
-            if let Ok(mut t) = overrides.lock() {
-                t.set_key(cred.id.clone(), "sticky failover");
-            }
-        }
-    }
+    // A credential other than the configured default is an override, and stays
+    // labelled as one on every request it serves (not just the first).
+    record_credential_override(&pool, &credential, &overrides).await;
     let result = forward_request(
         config,
         client,
@@ -664,6 +619,7 @@ async fn reject_request(
         client: session.client.tag(),
         override_key: "",
         override_model: "",
+        override_reason: "",
     });
     gui_logs
         .push(
@@ -767,6 +723,7 @@ async fn finalize_request(
                 client: session.client.tag(),
                 override_key: &overrides.key,
                 override_model: &overrides.model,
+                override_reason: &overrides.reason(),
             });
             gui_logs
                 .push(
@@ -790,48 +747,139 @@ async fn finalize_request(
 /// What an exception override (failover session switch, degraded retry, token
 /// refresh, stream upgrade) changed about one request.
 ///
-/// The retry chain folds its events into these two fields: the last override
-/// wins, because the row must answer "which credential/model actually served
-/// this request". Empty fields mean the request ran exactly as configured.
+/// The retry chain folds its events into these fields. `key` and `model` are the
+/// *served* values, kept independent of each other and each with its own reason,
+/// so a model override can never erase the credential reason (or vice versa) —
+/// sharing one `reason` slot made the log drop half of a two-part override.
+/// Empty fields mean the request ran exactly as configured.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OverrideTrace {
-    /// Credential short id chosen by the override (the "override_key" column).
+    /// Credential short id actually served (the `override_key` column). Set
+    /// whenever it differs from the configured default, not merely once.
     pub key: String,
-    /// Upstream model chosen by the override (the "override_model" column).
+    /// Why the credential differs, e.g. `429 from wb-a1` / `sticky failover`.
+    pub key_reason: String,
+    /// Upstream model actually served when it was changed (the
+    /// `override_model` column).
     pub model: String,
-    /// One-line reason summary for the log suffix, e.g. `429 from wb-a1`.
-    pub reason: String,
+    /// Why the model was changed, e.g. `content_blocked 400`.
+    pub model_reason: String,
 }
 
 impl OverrideTrace {
-    /// Record a credential-level override (session switch / failover).
+    /// Record that the request was served by a credential other than the
+    /// configured default. Always overwrites, so the column keeps reporting the
+    /// override on every subsequent request rather than only the first one.
     fn set_key(&mut self, key: impl Into<String>, reason: impl fmt::Display) {
         self.key = key.into();
-        self.reason = reason.to_string();
+        self.key_reason = reason.to_string();
     }
 
-    /// Record a model-level override (degraded retry / model remap on error).
+    /// Record a model-level override (degraded retry / stream upgrade).
     fn set_model(&mut self, model: impl Into<String>, reason: impl fmt::Display) {
         self.model = model.into();
-        self.reason = reason.to_string();
+        self.model_reason = reason.to_string();
     }
 
-    /// ` override=degraded(429 from wb-a1)` for log lines; empty when clean.
+    /// One-line combined reason for the log suffix and the `override_reason`
+    /// column. Both halves are reported when both fired.
+    fn reason(&self) -> String {
+        match (self.key_reason.is_empty(), self.model_reason.is_empty()) {
+            (false, false) => format!("{}; {}", self.key_reason, self.model_reason),
+            (false, true) => self.key_reason.clone(),
+            (true, false) => self.model_reason.clone(),
+            (true, true) => String::new(),
+        }
+    }
+
+    /// ` override=wb-b1@glm-5.3(429 from wb-a1; content_blocked 400)` for log
+    /// lines; empty when the request ran on its configured credential/model.
     fn log_suffix(&self) -> String {
         if self.key.is_empty() && self.model.is_empty() {
             return String::new();
         }
-        let what = if !self.key.is_empty() && !self.model.is_empty() {
-            format!("{}@{}", self.key, self.model)
-        } else if self.key.is_empty() {
-            self.model.clone()
-        } else {
-            self.key.clone()
+        let what = match (self.key.is_empty(), self.model.is_empty()) {
+            (false, false) => format!("{}@{}", self.key, self.model),
+            (false, true) => self.key.clone(),
+            (true, false) => self.model.clone(),
+            (true, true) => String::new(),
         };
-        if self.reason.is_empty() {
+        let reason = self.reason();
+        if reason.is_empty() {
             format!(" override={}", what)
         } else {
-            format!(" override={}({})", what, self.reason)
+            format!(" override={}({})", what, reason)
+        }
+    }
+}
+
+/// Record that the picked credential differs from the configured default.
+///
+/// Shared by all three API handlers. The comparison is against the pool's
+/// *configured* default (pool order), not the first healthy entry, so the label
+/// persists for every request the session is relocated — see
+/// [`crate::session_pool::CredentialPool::configured_default_id`].
+async fn record_credential_override(
+    pool: &crate::session_pool::SharedCredentialPool,
+    credential: &Option<crate::workbuddy_auth::WorkBuddyCredential>,
+    overrides: &Arc<std::sync::Mutex<OverrideTrace>>,
+) {
+    let Some(cred) = credential else {
+        return;
+    };
+    let default_id = pool.configured_default_id().await;
+    if default_id.as_deref() != Some(cred.id.as_str()) {
+        if let Ok(mut t) = overrides.lock() {
+            t.set_key(cred.id.clone(), "非默认身份(sticky)");
+        }
+    }
+}
+
+/// Renew one WorkBuddy access token and push the fresh copy into the pool.
+///
+/// The login-state credential is useless once its access token expires; the
+/// gateway answers `401`. The refresh endpoint (and its `refreshToken`) is the
+/// only way back, so a 401 must renew before it fails over — otherwise a single
+/// account just surfaces the 401 to the client. On success the pool entry is
+/// replaced in place so the next attempt (and every later request) uses the new
+/// token without a reload; on failure the credential is parked briefly so a
+/// burst of requests does not hammer the refresh endpoint.
+async fn refresh_workbuddy_credential(
+    client: &Client,
+    cred: &crate::workbuddy_auth::WorkBuddyCredential,
+    pool: &crate::session_pool::SharedCredentialPool,
+    gui_logs: &Arc<crate::settings::LogBuffer>,
+    tag: &str,
+) -> Result<crate::workbuddy_auth::WorkBuddyCredential, String> {
+    let endpoint = crate::workbuddy_auth::auth_endpoint_for(cred);
+    let mut fresh = cred.clone();
+    match crate::workbuddy_auth::refresh_credential(client, &endpoint, &mut fresh).await {
+        Ok(()) => {
+            pool.update_credential(fresh.clone()).await;
+            gui_logs
+                .push(
+                    "INFO",
+                    format!(
+                        "已刷新 WorkBuddy 访问令牌 id={} endpoint={} {}",
+                        fresh.id, endpoint, tag
+                    ),
+                )
+                .await;
+            Ok(fresh)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            pool.mark_refresh_failed(&cred.id, 60_000, &msg).await;
+            gui_logs
+                .push(
+                    "WARN",
+                    format!(
+                        "刷新 WorkBuddy 访问令牌失败 id={} endpoint={} {} | {}",
+                        cred.id, endpoint, tag, msg
+                    ),
+                )
+                .await;
+            Err(msg)
         }
     }
 }
@@ -924,7 +972,29 @@ async fn forward_request(
     };
 
     'credential: for credential_attempt in 0..max_credential_attempts {
-        let current_credential = active_credential.clone();
+        let mut current_credential = active_credential.clone();
+
+        // Proactive renewal: a token already past (or within the margin of) its
+        // expiry is renewed before spending a round-trip on it. This is what
+        // keeps a long-idle app working on the first request after the login
+        // state's access token expired.
+        if let Some(cred) = current_credential.clone() {
+            if cred.needs_refresh(crate::util::unix_millis()) {
+                if let Ok(fresh) =
+                    refresh_workbuddy_credential(&client, &cred, &pool, &gui_logs, &tag).await
+                {
+                    active_credential = Some(fresh.clone());
+                    current_credential = Some(fresh);
+                }
+                // On failure fall through: the request will 401 and the
+                // reactive handler below makes one more (bounded) attempt,
+                // then fails over.
+            }
+        }
+
+        // One token refresh per credential attempt: a 401 is retried once on
+        // the same credential with a fresh token before any failover.
+        let mut token_refresh_attempted = false;
 
         'url: for url in &urls {
             let mode = if streaming {
@@ -1022,6 +1092,34 @@ async fn forward_request(
                     // that session so its prompt cache survives, and the current
                     // request is retried on the replacement immediately.
                     if let Some(cred) = current_credential.as_ref() {
+                        // A 401 means the access token is stale/revoked. Renew it
+                        // and retry the *same* credential once before failing
+                        // over: with a single account, failing over has nowhere
+                        // to go and would just surface the 401 to the client.
+                        if status.as_u16() == 401 && !token_refresh_attempted {
+                            token_refresh_attempted = true;
+                            let updated = cred.clone();
+                            if let Ok(fresh) = refresh_workbuddy_credential(
+                                &client, &updated, &pool, &gui_logs, &tag,
+                            )
+                            .await
+                            {
+                                // A transparent renewal of the *default* account is
+                                // not an identity override: only label it when the
+                                // credential itself differs from the default.
+                                if pool.configured_default_id().await.as_deref()
+                                    != Some(fresh.id.as_str())
+                                {
+                                    if let Ok(mut t) = overrides.lock() {
+                                        t.set_key(fresh.id.clone(), "401 刷新令牌后重试");
+                                    }
+                                }
+                                active_credential = Some(fresh.clone());
+                                current_credential = Some(fresh);
+                                continue; // retry this URL with the renewed token
+                            }
+                        }
+
                         if is_switchable_error(status.as_u16(), &body) {
                             let from = cred.id.clone();
                             pool.mark_limited(&from, 60_000).await;
@@ -1418,9 +1516,9 @@ async fn non_streaming_response(
     // Snapshot the override trace before the row is built: borrowing through a
     // MutexGuard inside this struct literal self-deadlocks (a second `.lock()`
     // in the same expression waits on the first temporary guard).
-    let (override_key, override_model) = {
+    let (override_key, override_model, override_reason) = {
         let t = overrides.lock().unwrap_or_else(|p| p.into_inner());
-        (t.key.clone(), t.model.clone())
+        (t.key.clone(), t.model.clone(), t.reason())
     };
     // Record token breakdown and request log in the persistent stats DB.
     let _ = stats.record_request_log(RequestOutcome {
@@ -1438,6 +1536,7 @@ async fn non_streaming_response(
         // acquires, self-deadlocking the request thread.
         override_key: &override_key,
         override_model: &override_model,
+        override_reason: &override_reason,
     });
 
     if config.verbose {
@@ -2143,6 +2242,7 @@ struct StreamLedger {
     /// Exception-override fields for the row (see [`OverrideTrace`]).
     override_key: String,
     override_model: String,
+    override_reason: String,
 }
 
 impl StreamLedger {
@@ -2154,7 +2254,12 @@ impl StreamLedger {
         session: SessionInfo,
         overrides: &Arc<std::sync::Mutex<OverrideTrace>>,
     ) -> Self {
-        let overrides = overrides.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        // Snapshot the trace once: a stream's row must reflect the overrides in
+        // force when the stream started, and `reason()` needs both halves.
+        let (override_key, override_model, override_reason) = {
+            let t = overrides.lock().unwrap_or_else(|p| p.into_inner());
+            (t.key.clone(), t.model.clone(), t.reason())
+        };
         Self {
             model,
             route,
@@ -2163,8 +2268,9 @@ impl StreamLedger {
             session,
             tokens: TokenRecord::default(),
             error: None,
-            override_key: overrides.key,
-            override_model: overrides.model,
+            override_key,
+            override_model,
+            override_reason,
         }
     }
 }
@@ -2184,6 +2290,7 @@ impl Drop for StreamLedger {
             client: self.session.client.tag(),
             override_key: &self.override_key,
             override_model: &self.override_model,
+            override_reason: &self.override_reason,
         });
     }
 }
@@ -2526,7 +2633,8 @@ mod tests {
     use super::create_sse_stream;
     use super::json_request;
     use super::{
-        apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported, upstream_auth_headers,
+        apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported,
+        upstream_auth_headers, OverrideTrace,
     };
     use crate::models::{openai, responses};
     use crate::session::SessionInfo;
@@ -2535,6 +2643,35 @@ mod tests {
     use futures::stream::{self, StreamExt};
     use serde_json::{json, Value};
     use std::fmt;
+
+    /// A credential override and a model override must both survive: they used
+    /// to share one `reason` field, so the second `set_*` call erased the first
+    /// reason and the log showed only half of a two-part override.
+    #[test]
+    fn override_trace_keeps_both_reasons() {
+        let mut t = OverrideTrace::default();
+        t.set_key("wb-b1", "429 from wb-a1");
+        t.set_model("glm-5.3", "content_blocked 400");
+
+        assert_eq!(t.key, "wb-b1");
+        assert_eq!(t.model, "glm-5.3");
+        let reason = t.reason();
+        assert!(
+            reason.contains("429 from wb-a1") && reason.contains("content_blocked 400"),
+            "both reasons must be reported, got: {reason}"
+        );
+        let suffix = t.log_suffix();
+        assert!(suffix.contains("wb-b1@glm-5.3"), "got: {suffix}");
+        assert!(suffix.contains("429 from wb-a1"), "got: {suffix}");
+    }
+
+    /// A clean request leaves both the columns and the log suffix empty.
+    #[test]
+    fn override_trace_is_empty_when_nothing_was_overridden() {
+        let t = OverrideTrace::default();
+        assert!(t.log_suffix().is_empty());
+        assert!(t.reason().is_empty());
+    }
 
     #[test]
     fn content_blocked_detects_11128() {
