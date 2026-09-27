@@ -26,61 +26,65 @@ use tokio_util::sync::CancellationToken;
 /// cheap enough to be invisible.
 const TICK_SECS: u64 = 60;
 
-/// Spawn the daily check-in scheduler. Returns immediately.
+/// Run the daily check-in scheduler. Does not return until `shutdown` fires.
+///
+/// This is an `async fn` rather than a self-spawning one: it uses
+/// `tokio::time::interval`, which needs an active Tokio reactor, and Tauri's
+/// `.setup()` closure runs on the main thread with none — spawning from there
+/// panicked ("there is no reactor running") and, because a panic cannot unwind
+/// through the Objective-C launch callback, aborted the whole app at startup.
+/// The caller must spawn this onto a runtime (`tauri::async_runtime::spawn`).
 ///
 /// `client` is the shared GUI HTTP client; `logs` receives one line per run so
-/// an unattended claim is visible in the 实时日志 tab. The task stops when
-/// `shutdown` is cancelled.
-pub fn spawn_daily_checkin(
+/// an unattended claim is visible in the 实时日志 tab.
+pub async fn run_daily_checkin(
     client: reqwest::Client,
     logs: Arc<crate::settings::LogBuffer>,
     shutdown: CancellationToken,
 ) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(TICK_SECS));
-        // The first tick resolves immediately, which is what performs the
-        // catch-up run on start; `interval` is fine with that.
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tick.tick() => {}
-            }
-
-            let prefs = workbuddy_auth::load_preferences();
-            if !prefs.daily_checkin_enabled {
-                continue;
-            }
-
-            let now = crate::util::unix_millis();
-            let today = workbuddy_auth::local_day(now);
-            if prefs.last_checkin_run_date.as_deref() == Some(today.as_str()) {
-                continue;
-            }
-            if !is_due(now, &prefs.daily_checkin_time) {
-                continue;
-            }
-
-            // Mark the day *before* the run: a crash or a hang mid-claim then
-            // costs one day's points rather than looping on every restart.
-            let mut marked = prefs.clone();
-            marked.last_checkin_run_date = Some(today.clone());
-            if let Err(e) = workbuddy_auth::save_preferences(&marked) {
-                logs.push("ERROR", format!("定时打卡无法写入运行记录: {}", e))
-                    .await;
-                continue;
-            }
-
-            let report = workbuddy_auth::batch_claim_daily_checkin(&client).await;
-            logs.push(
-                "INFO",
-                format!(
-                    "定时打卡完成: 共 {} 个账号，成功 {} 个，已打卡 {} 个，失败 {} 个",
-                    report.total, report.success, report.already_checked_in, report.failed
-                ),
-            )
-            .await;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(TICK_SECS));
+    // The first tick resolves immediately, which is what performs the
+    // catch-up run on start; `interval` is fine with that.
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tick.tick() => {}
         }
-    });
+
+        let prefs = workbuddy_auth::load_preferences();
+        if !prefs.daily_checkin_enabled {
+            continue;
+        }
+
+        let now = crate::util::unix_millis();
+        let today = workbuddy_auth::local_day(now);
+        if prefs.last_checkin_run_date.as_deref() == Some(today.as_str()) {
+            continue;
+        }
+        if !is_due(now, &prefs.daily_checkin_time) {
+            continue;
+        }
+
+        // Mark the day *before* the run: a crash or a hang mid-claim then
+        // costs one day's points rather than looping on every restart.
+        let mut marked = prefs.clone();
+        marked.last_checkin_run_date = Some(today.clone());
+        if let Err(e) = workbuddy_auth::save_preferences(&marked) {
+            logs.push("ERROR", format!("定时打卡无法写入运行记录: {}", e))
+                .await;
+            continue;
+        }
+
+        let report = workbuddy_auth::batch_claim_daily_checkin(&client).await;
+        logs.push(
+            "INFO",
+            format!(
+                "定时打卡完成: 共 {} 个账号，成功 {} 个，已打卡 {} 个，失败 {} 个",
+                report.total, report.success, report.already_checked_in, report.failed
+            ),
+        )
+        .await;
+    }
 }
 
 /// Whether the configured time has arrived on the local clock.
@@ -128,5 +132,35 @@ mod tests {
         assert_eq!(workbuddy_auth::normalize_checkin_time("25:00"), "09:00");
         assert_eq!(workbuddy_auth::normalize_checkin_time("9:5"), "09:05");
         assert_eq!(workbuddy_auth::normalize_checkin_time("09:00:30"), "09:00");
+    }
+
+    /// Regression: the scheduler must run inside a Tokio runtime.
+    ///
+    /// It was originally self-spawning with `tokio::spawn`, which panics with
+    /// "there is no reactor running" when called from Tauri's `.setup()`
+    /// closure (main thread, no reactor). Because a panic cannot unwind through
+    /// the Objective-C launch callback, that aborted the app at every startup.
+    /// Driving the future on a runtime here is what the caller now does.
+    #[tokio::test]
+    async fn runs_and_stops_inside_a_tokio_runtime() {
+        let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(10));
+        let shutdown = CancellationToken::new();
+        let cancel = shutdown.clone();
+
+        // Drive the scheduler and cancel it from a background task. Reaching
+        // completion proves the interval was created on a live reactor.
+        let handle = tokio::spawn(run_daily_checkin(
+            reqwest::Client::new(),
+            logs.clone(),
+            shutdown,
+        ));
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(joined.is_ok(), "scheduler did not stop within 5s");
+        assert!(joined.unwrap().is_ok(), "scheduler task panicked");
     }
 }

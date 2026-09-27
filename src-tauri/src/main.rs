@@ -1374,11 +1374,19 @@ fn main() {
             // must run whether or not the local gateway is up, and it lives for
             // the whole process, so it gets its own cancellation token that is
             // never cancelled in practice (dropping it on exit stops the task).
-            proxy_rs::scheduler::spawn_daily_checkin(
+            //
+            // It must be spawned onto Tauri's async runtime rather than with
+            // `tokio::spawn`: this `.setup()` closure runs on the main thread
+            // with no Tokio reactor, and the scheduler's
+            // `tokio::time::interval` needs one — spawning from there panicked
+            // ("there is no reactor running") and, because a panic cannot
+            // unwind through the Objective-C launch callback, aborted the app
+            // at startup.
+            tauri::async_runtime::spawn(proxy_rs::scheduler::run_daily_checkin(
                 ctx_for_scheduler.client.clone(),
                 ctx_for_scheduler.logs.clone(),
                 tokio_util::sync::CancellationToken::new(),
-            );
+            ));
 
             // Build Tray Menu
             let status_i =
