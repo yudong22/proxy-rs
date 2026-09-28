@@ -9,12 +9,15 @@
 
 /* ── Settings: form ───────────────────────────────────────────── */
 
+/* A plain block, not a card. Every group inside is already its own framed card
+   (`details.form-section` / `.form-section--fixed`), so a frame here would draw
+   a box around boxes. The page's 16px padding (from `.tab-content`) is the only
+   outer spacing it needs.
+   Deliberately NOT `display: flex`: these groups rely on adjacent vertical
+   margins collapsing (each carries `margin-bottom`, the save bar carries
+   `margin-top`), which a flex column would stop doing and so double every gap. */
 .settings-form {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 16px;
-  box-shadow: var(--shadow-sm);
+  display: block;
 }
 
 /* Each settings group is a <details>, so it collapses without any JS. The
@@ -23,11 +26,20 @@
    markup that `views/settings.js` builds matches the rules here. */
 details.form-section {
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  /* Same radius as the page cards elsewhere (`.section` / `.logs-panel`): these
+     groups *are* this page's cards, so a different corner radius reads as a
+     different kind of object. */
+  border-radius: var(--radius);
   padding: 0;
   margin-bottom: 14px;
   overflow: hidden;
-  background: transparent;
+  /* White like every other card. `transparent` let the grey page background
+     through, so the body of each group looked recessed next to the overview's
+     cards instead of matching them. */
+  background: var(--surface);
+  /* `.section` and `.logs-panel` both carry this; the settings page used to get
+     its elevation from the outer `.settings-form` frame, which is now gone. */
+  box-shadow: var(--shadow-sm);
 }
 
 details.form-section > summary {
@@ -91,6 +103,33 @@ details.form-section[open] > summary {
 
 .form-section-body {
   padding: 12px 14px;
+}
+
+/* A non-collapsible group (身份池): the same card frame and the same heading row
+   as a `<summary>`, but static — no `<details>`, no caret, nothing to fold away.
+   Sharing the border/radius/background/margins keeps it visually one of the set
+   (and matching the `.section` cards on the other pages). */
+.form-section--fixed {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0;
+  margin-bottom: 14px;
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.form-section--fixed > .form-section-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
 }
 
 .form-group {
@@ -200,14 +239,12 @@ details.form-section[open] > summary {
 
 /* ── Logs: console view ───────────────────────────────────────── */
 
-/* The logs tab is the one view whose toolbar is its own first row, so the
-   pane's 16px top padding reads as a gap between the tab bar and the toolbar
-   rather than as padding around content. Zero it and let the toolbar keep its
-   own bottom margin. */
-#tab-logs.tab-content {
-  padding-top: 0;
-}
-
+/* The logs tab keeps the pane's standard 16px padding: its first child is now
+   the `.logs-panel` card, so the padding is the gap between the tab bar and that
+   card — the same offset 运行概览 and 服务设置 get. It used to be zeroed when the
+   toolbar itself was the first row and the padding read as a gap inside the
+   page; with the panel in place that override pulled the card flush to the tab
+   bar instead of level with the other pages. */
 /* The console pane fills the logs tab below its own subbar. The `hidden`
    attribute is what switches it off, and base.css's `[hidden]` rule outranks
    the `display: flex` set here — without that, both log panes would share the

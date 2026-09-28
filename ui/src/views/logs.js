@@ -101,62 +101,68 @@ export function renderLogsView() {
   const tableFilters = TABLE_FILTERS.map(f => options(f.options, f.id, f.title)).join('');
 
   root.innerHTML = html`
-    <!-- Row 1 (shared by both views): view toggle + log-directory shortcut. -->
-    <div class="logs-toolbar">
-      <div class="view-mode-group">
-        <button type="button" class="btn-toggle active" id="view-mode-table" title="表格视图">表格</button>
-        <button type="button" class="btn-toggle" id="view-mode-console" title="原始控制台日志">控制台</button>
+    <!-- One white panel wrapping the whole page, matching the card frame the
+         overview (.section) uses. The settings page needs no wrapper because
+         each of its groups is framed already. The inner panes drop their own
+         border/shadow so this reads as a single card rather than nested boxes. -->
+    <div class="logs-panel">
+      <!-- Row 1 (shared by both views): view toggle + log-directory shortcut. -->
+      <div class="logs-toolbar">
+        <div class="view-mode-group">
+          <button type="button" class="btn-toggle active" id="view-mode-table" title="表格视图">表格</button>
+          <button type="button" class="btn-toggle" id="view-mode-console" title="原始控制台日志">控制台</button>
+        </div>
+        <button class="btn btn-small" id="btn-reveal-logs" title="在访达中显示日志文件">日志目录</button>
       </div>
-      <button class="btn btn-small" id="btn-reveal-logs" title="在访达中显示日志文件">日志目录</button>
-    </div>
 
-    <!-- Row 2 (table view): filters on the left, table actions on the right,
-         mirroring the console subbar's layout. -->
-    <div class="logs-filter-row" id="table-filter-row">
-      <div class="logs-filter-group">
-        ${raw(tableFilters)}
-        <input type="text" id="table-search-input" class="log-input" placeholder="搜索模型/路由/会话/错误...">
-      </div>
-      <div class="logs-actions">
-        <span class="log-count" id="table-log-count">0 条记录</span>
-        <label class="auto-scroll-label">
-          <input type="checkbox" id="table-autorefresh" checked> 实时刷新
-        </label>
-        <button class="btn btn-small btn-danger" id="btn-clear-db-logs" title="清空数据库记录">清空记录</button>
-      </div>
-    </div>
-
-    <!-- Table view (default). -->
-    <div id="table-view" class="pane">
-      <div class="table-responsive">
-        <table class="data-table" id="request-logs-table">
-          <thead>${raw(tableHead())}</thead>
-          <tbody id="request-logs-tbody">
-            <tr><td colspan="10" class="table-empty">暂无请求记录</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="table-pagination">
-        <div class="pagination-info" id="pagination-info">第 1 页 · 共 0 条</div>
-        <div class="pagination-buttons">
-          <button class="btn btn-small" id="btn-prev-page" disabled>上一页</button>
-          <button class="btn btn-small" id="btn-next-page" disabled>下一页</button>
+      <!-- Row 2 (table view): filters on the left, table actions on the right,
+           mirroring the console subbar's layout. -->
+      <div class="logs-filter-row" id="table-filter-row">
+        <div class="logs-filter-group">
+          ${raw(tableFilters)}
+          <input type="text" id="table-search-input" class="log-input" placeholder="搜索模型/路由/会话/错误...">
+        </div>
+        <div class="logs-actions">
+          <span class="log-count" id="table-log-count">0 条记录</span>
+          <label class="auto-scroll-label">
+            <input type="checkbox" id="table-autorefresh" checked> 实时刷新
+          </label>
+          <button class="btn btn-small btn-danger" id="btn-clear-db-logs" title="清空数据库记录">清空记录</button>
         </div>
       </div>
-    </div>
 
-    <!-- Console view (secondary). -->
-    <div id="console-view" class="logs-console-view" hidden>
-      <div class="console-subbar">
-        ${raw(options(LEVEL_FILTERS, 'log-level-filter', '按级别筛选'))}
-        <input type="text" id="log-search-input" class="log-input" placeholder="搜索控制台内容...">
-        <span class="log-count" id="log-count">0 条日志</span>
-        <label class="auto-scroll-label auto-scroll-label--end">
-          <input type="checkbox" id="log-autoscroll" checked> 自动滚动
-        </label>
-        <button class="btn btn-small" id="btn-clear-logs">清空控制台</button>
+      <!-- Table view (default). -->
+      <div id="table-view" class="pane">
+        <div class="table-responsive">
+          <table class="data-table" id="request-logs-table">
+            <thead>${raw(tableHead())}</thead>
+            <tbody id="request-logs-tbody">
+              <tr><td colspan="10" class="table-empty">暂无请求记录</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-pagination">
+          <div class="pagination-info" id="pagination-info">第 1 页 · 共 0 条</div>
+          <div class="pagination-buttons">
+            <button class="btn btn-small" id="btn-prev-page" disabled>上一页</button>
+            <button class="btn btn-small" id="btn-next-page" disabled>下一页</button>
+          </div>
+        </div>
       </div>
-      <div id="logs" class="logs-container"></div>
+
+      <!-- Console view (secondary). -->
+      <div id="console-view" class="logs-console-view" hidden>
+        <div class="console-subbar">
+          ${raw(options(LEVEL_FILTERS, 'log-level-filter', '按级别筛选'))}
+          <input type="text" id="log-search-input" class="log-input" placeholder="搜索控制台内容...">
+          <span class="log-count" id="log-count">0 条日志</span>
+          <label class="auto-scroll-label auto-scroll-label--end">
+            <input type="checkbox" id="log-autoscroll" checked> 自动滚动
+          </label>
+          <button class="btn btn-small btn-danger" id="btn-clear-logs">清空控制台</button>
+        </div>
+        <div id="logs" class="logs-container"></div>
+      </div>
     </div>
   `;
 }

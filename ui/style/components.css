@@ -206,11 +206,45 @@
 /* Both log views are laid out the same way: a toolbar row, an optional
    filter/action row, then one scrolling pane that fills the rest. */
 
+/* One white card for the whole page, matching `.section` (overview). The
+   settings page has no such wrapper — its groups are each framed already — so
+   this is the pattern for a page whose content is a single pane. It is the flex
+   column that fills the tab, so the rows inside keep their natural height and
+   the scrolling pane still gets the remainder. */
+.logs-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* The inner panes drop their own frame: they sit inside `.logs-panel`, so
+   keeping border/shadow here would render a card inside a card. Their
+   background is inherited from the panel for the same reason. */
+.logs-panel .pane,
+.logs-panel .logs-container {
+  border: none;
+  box-shadow: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+}
+
+/* The table's own header band separates it from the filter row once the pane
+   frame is gone. */
+.logs-panel .data-table thead th {
+  border-top: 1px solid var(--border);
+}
+
 .logs-toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding-top: 4px;
   margin-bottom: 12px;
   flex-wrap: wrap;
   flex: 0 0 auto;
@@ -252,11 +286,14 @@
   background: var(--surface2);
 }
 
+/* Sized to match `.btn-small` so the segmented control and the buttons beside
+   it share one height and baseline; only the active state differs (accent fill
+   vs the neutral button surface). */
 .btn-toggle {
   background: transparent;
   border: none;
-  padding: 6px 16px;
-  font-size: 12px;
+  padding: 5px 12px;
+  font-size: 11px;
   font-weight: 600;
   color: var(--muted);
   cursor: pointer;

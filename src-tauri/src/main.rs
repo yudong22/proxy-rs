@@ -445,6 +445,27 @@ struct SaveSettingsBody {
     force_stream: Option<bool>,
 }
 
+/// Resolve the stored `GuiSettings::api_key` from what the settings form posted.
+///
+/// `GuiSettings::api_key` is legacy (pre-1.8.5): keys now live in the key pool,
+/// and the form has no field for it any more. So an **empty** value means "the
+/// form did not carry it", not "clear it" — the form used to post `""` on every
+/// save, and assigning that straight through silently wiped a key that
+/// `migrate_legacy_api_key` still reads at startup. A masked value is the older
+/// guard for the same intent: the UI echoed back a secret it never had in the
+/// clear, so it must not be stored as if it were the key.
+///
+/// Returns the value to store: the existing key unless the form supplied a real,
+/// unmasked replacement.
+fn resolve_api_key(incoming: &str, existing: &str) -> String {
+    let trimmed = incoming.trim();
+    if trimmed.is_empty() || trimmed.contains('•') || trimmed.contains('*') {
+        existing.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[tauri::command]
 async fn save_settings(
     body: SaveSettingsBody,
@@ -452,11 +473,7 @@ async fn save_settings(
     ctx: State<'_, Arc<AppContext>>,
 ) -> Result<Value, String> {
     let mut s = ctx.settings.write().await;
-    let new_key = if body.api_key.contains('•') || body.api_key.contains('*') {
-        s.api_key.clone()
-    } else {
-        body.api_key.trim().to_string()
-    };
+    let new_key = resolve_api_key(&body.api_key, &s.api_key);
 
     s.provider_id = body.provider_id.trim().to_string();
     s.custom_url = body.custom_url.trim().to_string();
@@ -1748,4 +1765,40 @@ fn main() {
                 focus_main_window(app);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_api_key;
+
+    /// Saving the settings form must never clear the stored key.
+    ///
+    /// Regression: the form has no `api_key` field since v1.8.5, so it posted an
+    /// empty string on every save and the backend assigned it straight through —
+    /// silently wiping a value `migrate_legacy_api_key` reads at startup. The
+    /// damage was masked only because `gui-settings.json` kept the old key from
+    /// before the field was removed.
+    #[test]
+    fn save_settings_keeps_the_stored_key_when_the_form_omits_it() {
+        // Omitted / blank: keep what is stored.
+        assert_eq!(resolve_api_key("", "ck-stored"), "ck-stored");
+        assert_eq!(resolve_api_key("   ", "ck-stored"), "ck-stored");
+    }
+
+    /// A masked value is not a key: it is the UI echoing back a secret it was
+    /// never given in the clear, so it must not overwrite the real one.
+    #[test]
+    fn save_settings_does_not_store_a_masked_placeholder() {
+        assert_eq!(resolve_api_key("ck-••••wxyz", "ck-stored"), "ck-stored");
+        assert_eq!(resolve_api_key("ck-****wxyz", "ck-stored"), "ck-stored");
+    }
+
+    /// A genuine new key still replaces the old one, trimmed.
+    #[test]
+    fn save_settings_accepts_a_real_replacement_key() {
+        assert_eq!(resolve_api_key("ck-new", "ck-stored"), "ck-new");
+        assert_eq!(resolve_api_key("  ck-new  ", "ck-stored"), "ck-new");
+        // No stored key and nothing posted stays empty rather than erroring.
+        assert_eq!(resolve_api_key("", ""), "");
+    }
 }

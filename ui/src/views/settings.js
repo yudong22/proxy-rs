@@ -37,13 +37,27 @@ function input(id, label, placeholder, { type = 'text', group = '', attrs = '' }
 }
 
 /**
- * A collapsible group: `<details>` + `<summary>` + body.
+ * A settings group.
  *
- * `section` doubles as the `data-section` value the badge code matches on, and
- * as the accented caret's anchor. A group with no tracked fields (codex) still
- * gets a caret so every summary reads the same.
+ * By default a collapsible `<details>` + `<summary>` + body. `section` doubles as
+ * the `data-section` value the badge code matches on, and as the accented
+ * caret's anchor. A group with no tracked fields (codex) still gets a caret so
+ * every summary reads the same.
+ *
+ * `collapsible: false` renders a fixed card instead: same heading row and same
+ * `data-section` hook, but no `<details>` and no caret, so the group cannot be
+ * folded away. Used for 身份池, which is the page's primary control — burying it
+ * behind a disclosure is how a user misses the thing they came to change.
  */
-function section(section, legend, body, { open = false } = {}) {
+function section(section, legend, body, { open = false, collapsible = true } = {}) {
+  if (!collapsible) {
+    return html`
+      <div class="form-section form-section--fixed" data-section="${section}">
+        <div class="form-section-heading">${legend}</div>
+        <div class="form-section-body">${raw(body)}</div>
+      </div>
+    `;
+  }
   return html`
     <details class="form-section" data-section="${section}"${raw(open ? ' open' : '')}>
       <summary><span class="form-section-caret"></span>${legend}</summary>
@@ -71,9 +85,12 @@ function toggle(id, label, desc) {
 /**
  * Build the settings form.
  *
- * Every group is open except the two advanced ones: the first group is what a
- * new user must fill in, while 网络与自启 and 模型重定向 (高级) are only revisited
- * when something needs changing.
+ * Order is deliberate: 身份池 first (the page's primary control, and not
+ * collapsible), then 模型提供商, then the per-client writers, then the two groups
+ * that are only revisited when something needs changing.
+ *
+ * Only 模型提供商 opens by default — it is what a new user must fill in. Every
+ * other collapsible group starts folded.
  */
 export function renderSettings() {
   const root = $('#tab-settings');
@@ -90,8 +107,19 @@ export function renderSettings() {
       '留空使用服务商默认接口地址',
     ))}
     <p class="hint">
-      上游密钥请在下方「身份池」中添加与管理（已合并原此处的单个 API Key）。
+      上游密钥在这里添加：粘贴 API Key 后会加入身份池（账号 / 密钥）并可在其中切换默认身份。
     </p>
+    <!-- The key-entry row lives here rather than in 身份池: this is the
+         provider section, and a key belongs to the provider being configured.
+         身份池 manages which saved identity is the default, not how to add one. -->
+    <div class="wb-key-add-row">
+      <input type="password" id="wb-new-key" class="log-input wb-key-input"
+        placeholder="粘贴上游 API Key" autocomplete="off">
+      <input type="text" id="wb-new-key-label" class="log-input wb-label-input"
+        placeholder="备注 (可选)" autocomplete="off">
+      <button type="button" class="btn btn-small btn-primary" id="btn-wb-key-add">＋ 添加密钥</button>
+      <button type="button" class="btn btn-small btn-show-hide" id="btn-wb-key-visibility">显示</button>
+    </div>
     <div class="actions-row form-actions">
       <button type="button" class="btn btn-small" id="btn-fetch-models">🔍 拉取可用模型</button>
       <button type="button" class="btn btn-small" id="btn-test-upstream-settings">⚡️ 测试连接</button>
@@ -161,7 +189,7 @@ export function renderSettings() {
   const identityPool = section('identity-pool', '身份池 (账号 / 密钥)', html`
     <p class="hint">
       账号与密钥合并管理：支持<b>微信 / QQ 扫码一键登录授权</b>并自动保存至账号池（登录态）；
-      也支持直接粘贴上游 <b>API Key</b>。两者可随时切换<b>默认身份</b>——
+      也支持直接粘贴上游 <b>API Key</b>（在上方「模型提供商」中添加）。两者可随时切换<b>默认身份</b>——
       默认身份下的请求走该账号/密钥，某会话遇到限流/超额 (429/402) 时自动切换到备用身份并保持粘滞。
     </p>
 
@@ -199,24 +227,15 @@ export function renderSettings() {
       <span class="wb-schedule-hint" id="wb-schedule-hint"></span>
     </div>
 
-    <div class="wb-key-add-row">
-      <input type="password" id="wb-new-key" class="log-input wb-key-input"
-        placeholder="粘贴上游 API Key" autocomplete="off">
-      <input type="text" id="wb-new-key-label" class="log-input wb-label-input"
-        placeholder="备注 (可选)" autocomplete="off">
-      <button type="button" class="btn btn-small btn-primary" id="btn-wb-key-add">＋ 添加密钥</button>
-      <button type="button" class="btn btn-small btn-show-hide" id="btn-wb-key-visibility">显示</button>
-    </div>
-
     <div id="wb-identity-list" class="wb-credential-list"></div>
     <div class="hint" id="wb-status"></div>
-  `);
+  `, { collapsible: false });
 
 
   root.innerHTML = html`
     <form id="settings-form" class="settings-form">
-      ${raw(provider)}
       ${raw(identityPool)}
+      ${raw(provider)}
       ${raw(claude)}
       ${raw(codex)}
       ${raw(network)}
@@ -325,8 +344,9 @@ export async function loadSettings() {
 
     $('#setting-provider').value = s.provider_id || 'workbuddy-cn';
     $('#setting-custom-url').value = s.custom_url || '';
-    const legacyKeyEl = $('#setting-api-key');
-    if (legacyKeyEl) legacyKeyEl.value = s.api_key || '';
+    // No api_key field: this form no longer carries one (keys live in the pool,
+    // added from 模型提供商). The backend therefore keeps the stored value when
+    // the field is absent, instead of clearing it.
     $('#setting-port').value = s.port || 3456;
     $('#setting-bind').value = s.bind || '127.0.0.1';
     $('#setting-reasoning-model').value = s.reasoning_model || '';
@@ -431,7 +451,9 @@ async function saveSettings() {
   const payload = {
     provider_id: $('#setting-provider').value,
     custom_url: $('#setting-custom-url').value,
-    api_key: $('#setting-api-key')?.value || '',
+    // Deliberately no `api_key`: the form has no field for it, and the backend
+    // treats an empty value as "keep the stored one". Posting a phantom "" would
+    // be indistinguishable from clearing it.
     port: parseInt($('#setting-port').value, 10) || 3456,
     bind: $('#setting-bind').value || '127.0.0.1',
     reasoning_model: $('#setting-reasoning-model').value,
@@ -617,7 +639,7 @@ async function renderIdentityPool() {
 
     if (!hasAny) {
       listEl.innerHTML = html`<div class="hint">
-        身份池为空。点击上方「📱 扫码添加账号」完成微信/QQ 扫码，或在下方粘贴上游 API Key 添加密钥。
+        身份池为空。点击「📱 扫码添加账号」完成微信/QQ 扫码，或在上方「模型提供商」中粘贴上游 API Key 添加密钥。
       </div>`;
       return;
     }
