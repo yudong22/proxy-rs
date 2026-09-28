@@ -23,16 +23,25 @@ import { toast } from '../components/toast.js';
  *
  * @param {string} id       Element the value is written into.
  * @param {string} label
- * @param {{cardId?: string, clickable?: boolean, title?: string, sub?: string}} [opts]
- *        `cardId` is only needed when something targets the card itself (the
- *        cards that expand a detail panel below).
+ * @param {{cardId?: string, clickable?: boolean, expandable?: boolean,
+ *          title?: string, sub?: string}} [opts]
+ *        `cardId` is only needed when something targets the card itself.
+ *        `clickable` means the card does something on click (cursor + hover
+ *        shadow). `expandable` means it opens a detail panel *below itself*, and
+ *        is what earns the disclosure caret and the open-state surface — a
+ *        caret on a card that merely refreshes a value or jumps to another tab
+ *        would promise content that never appears.
  *        `sub` renders a secondary element (an id for the sub-line) so a card
  *        can carry a second, smaller line under its value.
  */
-function metric(id, label, { cardId = '', clickable = false, title = '', sub = '' } = {}) {
+function metric(
+  id,
+  label,
+  { cardId = '', clickable = false, expandable = false, title = '', sub = '' } = {},
+) {
   return html`
-    <div class="metric-card${clickable ? ' clickable' : ''}"${raw(cardId ? ` id="${cardId}"` : '')}${raw(title ? ` title="${title}"` : '')}>
-      <div class="metric-label">${label}${raw(clickable ? ' <span class="stat-caret"></span>' : '')}</div>
+    <div class="metric-card${raw(clickable ? ' clickable' : '')}${raw(expandable ? ' expandable' : '')}"${raw(cardId ? ` id="${cardId}"` : '')}${raw(title ? ` title="${title}"` : '')}>
+      <div class="metric-label">${label}${raw(expandable ? ' <span class="stat-caret"></span>' : '')}</div>
       <div class="metric-value" id="${id}">-</div>
       ${raw(sub ? `<div class="metric-sub" id="${sub}"></div>` : '')}
     </div>
@@ -70,7 +79,8 @@ export function renderOverview() {
         sub: 'metric-points-account',
       }))}
       ${raw(metric('metric-speed', '输出速度', {
-        cardId: 'stat-card-speed', clickable: true, title: '点击查看本次生成详情',
+        cardId: 'stat-card-speed', clickable: true, expandable: true,
+        title: '点击查看本次生成详情',
       }))}
       ${raw(metric('metric-overrides', '今日 override 次数', {
         cardId: 'stat-card-overrides', clickable: true, title: '点击查看请求日志',
@@ -81,7 +91,8 @@ export function renderOverview() {
       ${raw(metric('stat-requests', '请求总数'))}
       ${raw(metric('stat-tokens-total', 'Token 总量'))}
       ${raw(metric('stat-cache-pct', '缓存命中率', {
-        cardId: 'stat-card-cache', clickable: true, title: '点击查看缓存明细',
+        cardId: 'stat-card-cache', clickable: true, expandable: true,
+        title: '点击查看缓存明细',
       }))}
       ${raw(metric('stat-requests-failed', '失败请求'))}
     </div>

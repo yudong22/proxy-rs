@@ -120,25 +120,46 @@
 .metric-card.running .metric-value { color: var(--success); }
 .metric-card.stopped .metric-value { color: var(--error); }
 
-/* A card that expands a detail panel below it (the cache-hit drill-down). */
+/* A card that does something on click. Hover lifts it on its own shadow — no
+   accent border in any state, so a clickable card never draws a blue outline. */
 .metric-card.clickable {
   cursor: pointer;
-  transition: border-color .15s, box-shadow .15s;
+  transition: background-color .15s, box-shadow .15s;
 }
 
-.metric-card.clickable:hover,
-.metric-card.clickable.active {
-  border-color: var(--accent);
+.metric-card.clickable:hover {
   box-shadow: var(--shadow);
 }
 
+/* A card that expands a panel *below itself* (缓存命中率 / 输出速度). Open state is
+   a light surface plus the flipped caret — deliberately not an accent border: a
+   blue outline read as a stray line across the page and competed with the value.
+   Scoped to `.expandable` so the refresh/navigate cards, which are clickable but
+   reveal nothing, never take an "open" appearance. */
+.metric-card.expandable.active {
+  background: var(--surface2);
+  box-shadow: var(--shadow);
+}
+
+/* The disclosure caret. Drawn as a CSS triangle rather than a "▾" glyph, for the
+   same reason `views.css` draws the settings caret: a typed glyph renders at
+   inconsistent size and baseline across the fonts this webview can fall back to.
+   Points down while collapsed ("click to expand"), rotated up while open. The
+   span is empty text, so without these borders it measured 0×0 and the rotation
+   had nothing to turn — the caret was invisible in both states. */
 .stat-caret {
   display: inline-block;
-  font-size: 9px;
+  width: 0;
+  height: 0;
+  margin-left: 3px;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  vertical-align: middle;
   transition: transform .15s;
 }
 
-.metric-card.clickable.active .stat-caret {
+.metric-card.expandable.active .stat-caret {
   transform: rotate(180deg);
 }
 
