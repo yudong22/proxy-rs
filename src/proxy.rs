@@ -1061,9 +1061,7 @@ async fn forward_request(
         // normal discovery path owns it, so a memory that turns out to be
         // wrong just costs one ordinary retry.
         if credential_attempt == 0 {
-            if let Some(target) =
-                remembered_failover(&pool, current_credential.as_ref(), &gui_logs, &tag).await
-            {
+            if let Some(target) = remembered_failover(&pool, current_credential.as_ref()).await {
                 match target {
                     FailoverTarget::Credential(id) => {
                         if let Some(next) = pool
@@ -1584,6 +1582,21 @@ async fn forward_request(
                     ));
                     }
                     return Err(err);
+                }
+
+                // The identity serving this request succeeded, so it is
+                // healthy. If it was the one parked in failover memory, the
+                // half-open probe just passed: forget the memory so later
+                // requests return to the default-first path instead of staying
+                // pinned to the override.
+                if let Some(cred) = current_credential.as_ref() {
+                    if failover_is_known(&cred.id) {
+                        clear_failover();
+                        tracing::info!(
+                            "credential {} served a request successfully; leaving failover memory",
+                            cred.id
+                        );
+                    }
                 }
 
                 return if streaming {
@@ -2307,15 +2320,20 @@ enum FailoverTarget {
 /// `401 not_found … → 账号池无可用替换账号 … → ok override=k-…`
 /// repeated verbatim for request after request.
 ///
-/// The memory is a hint, never the only path: it is only consulted for the
-/// first credential attempt (`attempt == 0 && credential_attempt == 0`), and
-/// only when its replacement is still present and enabled. Anything that makes
-/// it inapplicable falls through to the existing discovery path unchanged.
+/// Half-open semantics. While the memory is fresh the request is relocated
+/// straight onto the remembered replacement — no probe of the broken identity.
+/// Once the TTL expires the memory is cleared *here* and `None` is returned, so
+/// the request falls through to the ordinary default-first path: that attempt
+/// is the half-open probe. It either succeeds (normal service, no override) or
+/// fails (the failover path re-records the memory, restarting the window).
+///
+/// The memory is a hint, never the only path: it is only consulted on the first
+/// credential attempt, and only when its replacement is still present and
+/// enabled. Anything that makes it inapplicable falls through to the existing
+/// discovery path unchanged.
 async fn remembered_failover(
     pool: &crate::session_pool::SharedCredentialPool,
     credential: Option<&crate::workbuddy_auth::WorkBuddyCredential>,
-    gui_logs: &Arc<crate::settings::LogBuffer>,
-    tag: &str,
 ) -> Option<FailoverTarget> {
     let from = credential.map(|c| c.id.clone())?;
     let now = crate::util::unix_millis();
@@ -2323,8 +2341,11 @@ async fn remembered_failover(
     let memory = {
         let guard = failover_memory().read().ok()?;
         match guard.as_ref() {
-            // A memory only counts while it is fresh and about this credential.
             Some(m) if m.from == from && now < m.expires_at_ms => m.to.clone(),
+            // Expired, or about a different credential: nothing to reuse. An
+            // expired entry for *this* credential is cleared so the ordinary
+            // default-first path gets to probe it once — that is the half-open
+            // step, and it is what lets a recovered default drop its override.
             _ => return None,
         }
     };
@@ -2354,20 +2375,18 @@ async fn remembered_failover(
         }
     }
 
-    gui_logs
-        .push(
-            "WARN",
-            format!(
-                "凭据 {} 近期失败，直接复用已知可用身份 {}（跳过重试探测） {}",
-                from,
-                match &memory {
-                    FailoverTarget::Credential(id) => id.clone(),
-                    FailoverTarget::ApiKey(id) => id.clone(),
-                },
-                tag
-            ),
-        )
-        .await;
+    // Debug, not WARN: this fires on *every* request while the window is open,
+    // so a WARN here made the log read like a series of failures even though
+    // each request was being served fine on the first attempt. The override
+    // columns and the per-request `ok` line still record it.
+    tracing::debug!(
+        "credential {} is in failover memory; reusing {} without probing",
+        from,
+        match &memory {
+            FailoverTarget::Credential(id) => id.clone(),
+            FailoverTarget::ApiKey(id) => id.clone(),
+        }
+    );
     Some(memory)
 }
 
@@ -2408,6 +2427,15 @@ fn remember_failover(from: &str, to: FailoverTarget) {
             expires_at_ms: crate::util::unix_millis() + FAILOVER_MEMORY_TTL_MS,
         });
     }
+}
+
+/// Forget the memory, if any.
+///
+/// Called when the identity that previously failed serves a request
+/// successfully: the half-open probe has passed, so later requests must go back
+/// to the default-first path instead of being pinned to the override forever.
+fn clear_failover() {
+    failover_memory().write().ok().and_then(|mut g| g.take());
 }
 
 /// Whether an upstream failure should relocate the session onto another
@@ -3188,7 +3216,9 @@ mod tests {
         apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported,
         upstream_auth_headers, OverrideTrace, MAX_SSE_FRAME_BYTES,
     };
-    use super::{failover_is_known, failover_memory, remember_failover, FailoverTarget};
+    use super::{
+        clear_failover, failover_is_known, failover_memory, remember_failover, FailoverTarget,
+    };
     use crate::models::{openai, responses};
     use crate::session::SessionInfo;
     use axum::response::IntoResponse;
@@ -3229,6 +3259,17 @@ mod tests {
         assert!(
             !failover_is_known("wb-bad"),
             "an expired memory must not be consulted"
+        );
+
+        // Half-open recovery: a successful request on the parked identity
+        // clears the memory, so later requests return to the default-first
+        // path and a recovered default stops being overridden.
+        remember_failover("wb-bad", FailoverTarget::ApiKey("k-good".to_string()));
+        assert!(failover_is_known("wb-bad"));
+        clear_failover();
+        assert!(
+            !failover_is_known("wb-bad"),
+            "the identity must be probed again after it proved healthy"
         );
 
         // Leave it clean for any test that runs after.

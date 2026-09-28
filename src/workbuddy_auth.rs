@@ -1352,11 +1352,72 @@ pub async fn fetch_points(client: &reqwest::Client, cred: &WorkBuddyCredential) 
 /// The WorkBuddy billing host, shared with `credits.rs`.
 const WORKBUDDY_BILLING_HOST: &str = "https://www.codebuddy.cn";
 
-/// Refresh stored points for every enabled credential and return a report.
+/// Query the remaining points for one API key.
 ///
-/// Each account is queried once and persisted, so the GUI can show a balance
-/// immediately on load and so a failover decision can prefer the account with
+/// The billing endpoint accepts the raw key material exactly as it
+/// authenticates a chat request (`Authorization: Bearer <key>` plus
+/// `X-API-Key`), and `credits.rs` already uses that pairing against this same
+/// URL — so a key's balance is readable without any account login state.
+pub async fn fetch_points_for_key(client: &reqwest::Client, key: &ApiKeyEntry) -> Option<f64> {
+    if key.key.trim().is_empty() {
+        return None;
+    }
+    let url = format!(
+        "{}{}",
+        WORKBUDDY_BILLING_HOST,
+        crate::credits::WORKBUDDY_RESOURCE_PATH
+    );
+    let resp = client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .header("Authorization", format!("Bearer {}", key.key))
+        .header("X-API-Key", &key.key)
+        .header("Content-Type", "application/json")
+        .header("X-Client-Platform", "web")
+        .header("Origin", WORKBUDDY_BILLING_HOST)
+        .header(
+            "Referer",
+            format!("{}/profile/plans-usage", WORKBUDDY_BILLING_HOST),
+        )
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        )
+        .json(&serde_json::json!({
+            "PageNumber": 1,
+            "PageSize": 100,
+            "ProductCode": crate::credits::WORKBUDDY_RESOURCE_PRODUCT_CODE,
+            "Status": [0, 3],
+        }))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+
+    // A business error is not a balance; reporting 0 would read as exhausted.
+    if let Some(code) = value.get("code").and_then(|c| c.as_i64()) {
+        if code != 0 {
+            return None;
+        }
+    }
+    Some(crate::credits::remaining_from_response(&value))
+}
+
+/// Refresh stored points for every enabled credential **and every enabled API
+/// key**, returning a report covering both pools.
+///
+/// Each identity is queried once and persisted, so the GUI can show a balance
+/// immediately on load and so a failover decision can prefer the identity with
 /// the most remaining points without a network call on the request path.
+///
+/// Keys were previously skipped entirely — `set_api_key_points` had no caller —
+/// which is why the overview's 剩余积分 card showed "—" whenever the identity in
+/// force was a key: the value was never fetched, not genuinely unknown.
 pub async fn refresh_all_points(client: &reqwest::Client) -> PointsReport {
     let items = load_credentials();
     let mut results = Vec::new();
@@ -1368,6 +1429,24 @@ pub async fn refresh_all_points(client: &reqwest::Client) -> PointsReport {
         results.push(PointsResult {
             id: cred.id.clone(),
             label: display_label(cred),
+            points,
+        });
+    }
+
+    // API keys hit the same billing endpoint with the raw key material, so
+    // their balances are readable too — previously they were skipped entirely,
+    // which is why the overview card read "—" whenever the identity in force
+    // was a key. Same persist-on-failure rule: a dead key clears its figure.
+    for key in load_api_keys().into_iter().filter(|k| k.enabled) {
+        let points = fetch_points_for_key(client, &key).await;
+        let _ = set_api_key_points(&key.id, points);
+        results.push(PointsResult {
+            id: key.id.clone(),
+            label: if key.label.is_empty() {
+                key.id.clone()
+            } else {
+                key.label
+            },
             points,
         });
     }

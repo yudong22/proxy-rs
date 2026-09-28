@@ -709,13 +709,19 @@ async fn wb_refresh_points(ctx: State<'_, Arc<AppContext>>) -> Result<Value, Str
         .push(
             "INFO",
             format!(
-                "已刷新账号池积分: {} 个账号，{} 个读取成功",
+                "已刷新身份池积分: 共 {} 个（账号+密钥），{} 个读取成功",
                 report.results.len(),
                 known
             ),
         )
         .await;
-    Ok(json!({ "results": report.results }))
+    // The refreshed balance belongs to the identity in force, so hand back the
+    // same shape the overview header already consumes — a manual refresh and a
+    // status poll update the card through one code path.
+    Ok(json!({
+        "results": report.results,
+        "current_identity": current_identity_summary(),
+    }))
 }
 
 #[tauri::command]

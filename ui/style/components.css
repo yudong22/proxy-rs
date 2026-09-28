@@ -56,6 +56,23 @@
   transform: rotate(180deg);
 }
 
+/* In-flight feedback for the 剩余积分 card, whose click triggers an upstream
+   billing request: dimmed value plus a caret spin makes the wait legible and
+   signals that clicking again will not speed it up. */
+.metric-card.loading {
+  pointer-events: none;
+  opacity: .65;
+}
+
+.metric-card.loading .metric-value {
+  animation: pulse-soft 1.1s ease-in-out infinite;
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .45; }
+}
+
 /* ── Section & Key/Value List ─────────────────────────────────── */
 
 .section {

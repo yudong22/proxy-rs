@@ -37,6 +37,11 @@ export const appState = {
 
   /** Whether the API key input is currently revealed. */
   keyVisible: false,
+
+  /** The identity currently in force, as last seen from `get_status`
+   *  (`current_identity`). The overview's per-identity refresh debounce keys
+   *  off this, so it must be kept current on every status repaint. */
+  currentIdentity: null,
 };
 
 /** Reset the request-log facet lists, e.g. after the table is cleared. */

@@ -55,7 +55,9 @@ export function renderOverview() {
   root.innerHTML = html`
     <div class="metrics-grid">
       ${raw(metric('metric-provider', '配置厂商'))}
-      ${raw(metric('metric-points', '剩余积分'))}
+      ${raw(metric('metric-points', '剩余积分', {
+        cardId: 'stat-card-points', clickable: true, title: '点击刷新剩余积分',
+      }))}
       ${raw(metric('metric-account', '当前账号'))}
       ${raw(metric('metric-overrides', '今日 override 次数', {
         cardId: 'stat-card-overrides', clickable: true, title: '点击查看请求日志',
@@ -117,6 +119,7 @@ export async function refreshStatus() {
 
   // The identity in force right now: 配置厂商 / 剩余积分 / 当前账号.
   const identity = status.current_identity || {};
+  appState.currentIdentity = identity;
   // 配置厂商: the backend reports the provider id, as before. An identity
   // label describes *who* is serving, this describes *where* — and only the
   // latter is known unconditionally (it survives a stopped pool).
@@ -197,6 +200,55 @@ export function initOverview() {
   // reason is spelled out in the override column.
   $('#stat-card-overrides')?.addEventListener('click', () => {
     window.switchTab('logs');
+  });
+
+  // The 剩余积分 card refreshes on click. Debounced **per identity**: each
+  // click costs one upstream billing request per identity, so hammering the
+  // card would hammer the billing endpoint — but the window must not follow the
+  // *card*. Otherwise refreshing account A, then switching to B, left B locked
+  // out for the rest of A's window, which is what the 3 分钟 prompt was
+  // complaining about. MATCHES_COOLDOWN_MS mirrors the server-side failover
+  // memory TTL (3 min).
+  const MATCHES_COOLDOWN_MS = 3 * 60 * 1000;
+  /** Identity id → wall-clock ms of its last successful refresh. */
+  const lastPointsRefreshById = new Map();
+  let refreshingPoints = false;
+
+  $('#stat-card-points')?.addEventListener('click', async () => {
+    if (refreshingPoints) return;
+
+    const identityId = appState.currentIdentity?.id || '';
+    const lastMs = lastPointsRefreshById.get(identityId) || 0;
+    const elapsed = Date.now() - lastMs;
+    if (elapsed < MATCHES_COOLDOWN_MS) {
+      const remainSec = Math.ceil((MATCHES_COOLDOWN_MS - elapsed) / 1000);
+      toast(`该账号积分刚刚刷新过，${remainSec}s 后可再次刷新`);
+      return;
+    }
+
+    const card = $('#stat-card-points');
+    const value = $('#metric-points');
+    refreshingPoints = true;
+    if (value) value.textContent = '⏳ 刷新中…';
+    if (card) card.classList.add('loading');
+    try {
+      await invoke('wb_refresh_points');
+      lastPointsRefreshById.set(identityId, Date.now());
+      // `refreshStatus` in the finally block repaints the card from
+      // `get_status`, so the fresh balance flows through the same path as a
+      // status poll — one way for the card to update.
+      toast('剩余积分已刷新');
+    } catch (err) {
+      console.error('refresh points failed:', err);
+      toast('刷新剩余积分失败: ' + err, 'error');
+      // Allow a retry immediately: nothing was fetched, so the window would
+      // otherwise pointlessly block the user for three minutes.
+      lastPointsRefreshById.delete(identityId);
+    } finally {
+      refreshingPoints = false;
+      if (card) card.classList.remove('loading');
+      await refreshStatus();
+    }
   });
 
   // Copy-to-clipboard buttons on the endpoint rows.

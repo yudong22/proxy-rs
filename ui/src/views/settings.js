@@ -707,6 +707,10 @@ async function renderIdentityPool() {
           await invoke('wb_set_default_identity', { id: btn.dataset.default });
           showWbStatus('已设置默认身份，立即生效（无需重启）');
           await renderIdentityPool();
+          // The overview's 当前账号/剩余积分 cards follow the identity in
+          // force; without this they kept showing the previous account until
+          // the next unrelated status push happened to fire.
+          await refreshStatus();
         } catch (e) {
           showWbStatus('设置默认身份失败: ' + e, true);
           btn.disabled = false;
@@ -1109,6 +1113,7 @@ function initCredentialPool() {
             : '已清除默认身份，回退到「账号优先，否则密钥 / 单 Key」',
       );
       await renderIdentityPool();
+      await refreshStatus();
     } catch (err) {
       showWbStatus('设置默认身份失败: ' + err, true);
     }
