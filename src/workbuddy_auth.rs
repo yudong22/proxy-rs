@@ -340,7 +340,16 @@ fn md5_hex(data: &[u8]) -> [u8; 16] {
     // values are the standard constants spelled out via the reference series.
     const K: [u32; 64] = MD5_K;
 
-    for chunk in msg.chunks_exact(64) {
+    // `msg` was padded above to a whole number of 64-byte blocks, so the
+    // remainder is always empty; `as_chunks` states that fixed block size in the
+    // type instead of leaving it as a runtime invariant. (Clippy 1.98's
+    // `chunks_exact_to_as_chunks` prefers this over `chunks_exact`.)
+    let (blocks, remainder) = msg.as_chunks::<64>();
+    debug_assert!(
+        remainder.is_empty(),
+        "msg must be padded to a multiple of 64 bytes"
+    );
+    for chunk in blocks {
         let mut m = [0u32; 16];
         for (i, word) in m.iter_mut().enumerate() {
             *word = u32::from_le_bytes([
@@ -2038,6 +2047,42 @@ mod tests {
         assert!(parse_login_state(r#"{"user": "x"}"#).is_err());
         assert!(parse_login_state("not json").is_err());
         assert!(parse_login_state(r#"{"auth": {"refreshToken": "only"}}"#).is_err());
+    }
+
+    /// The hand-rolled MD5 must match the real algorithm on published vectors.
+    ///
+    /// Credential ids (`wb-<6 hex>`) are a hash of the access token, so a wrong
+    /// digest silently renames every imported account and splits its history in
+    /// the stats DB. The implementation is bespoke (RFC 1321, no crypto
+    /// dependency), and there was no vector test at all — changing the block
+    /// loop to `as_chunks` would otherwise be unverifiable.
+    #[test]
+    fn md5_matches_published_vectors() {
+        let hex =
+            |data: &[u8]| -> String { md5_hex(data).iter().map(|b| format!("{b:02x}")).collect() };
+        // RFC 1321 A.5 test suite.
+        assert_eq!(hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(hex(b"a"), "0cc175b9c0f1b6a831c399e269772661");
+        assert_eq!(hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(hex(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
+        assert_eq!(
+            hex(b"abcdefghijklmnopqrstuvwxyz"),
+            "c3fcd3d76192e4007dfb496cca67e13b"
+        );
+        assert_eq!(
+            hex(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
+            "d174ab98d277d9f5a5611c2c9f419d9f"
+        );
+        assert_eq!(
+            hex(
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
+            ),
+            "57edf4a22be3c955ac49da2e2107b67a"
+        );
+        // Multi-block inputs, so the loop (not just the padding path) is proven.
+        // 64 bytes is exactly one block and 200 spans several.
+        assert_eq!(hex(&[b'x'; 64]), "c1bb4f81d892b2d57947682aeb252456");
+        assert_eq!(hex(&[b'x'; 200]), "30a83621ce5422fbdfdd539777458c78");
     }
 
     #[test]
