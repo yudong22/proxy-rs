@@ -1,6 +1,6 @@
 {
   "name": "proxy-rs",
-  "version": "1.9.6",
+  "version": "1.9.7",
   "private": true,
   "description": "高性能 AI 协议代理（Anthropic Messages / OpenAI Responses & Chat → OpenAI 兼容端点），提供 Tauri 2 桌面应用与 Rust 代理核心",
   "license": "MIT",
