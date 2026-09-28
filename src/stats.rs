@@ -798,14 +798,42 @@ fn writer_loop(conn: Connection, rx: Receiver<RequestRow>) {
 
     // recv() returns Err only when every sender has been dropped, i.e. the
     // StatsDb is gone — that is the signal to exit.
+    //
+    // Each batch is unwrapped individually. This is the only consumer of the
+    // queue: if it panicked, every later `record_request_log` would fail
+    // forever while the proxy kept serving requests perfectly — the 请求日志 and
+    // 用量统计 panels would silently freeze with nothing anywhere to explain
+    // why. Containing the panic keeps one bad row from ending the thread's
+    // life, and logs it instead.
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         while let Ok(next) = rx.try_recv() {
             batch.push(next);
         }
 
-        if let Err(e) = insert_batch(&conn, &mut stmt, &batch) {
-            tracing::warn!("stats writer dropped {} row(s): {}", batch.len(), e);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            insert_batch(&conn, &mut stmt, &batch)
+        }));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("stats writer dropped {} row(s): {}", batch.len(), e);
+            }
+            Err(_) => {
+                // The statement may be left in a broken state; rebuild it so
+                // the next batch starts clean instead of failing the same way.
+                tracing::error!(
+                    "stats writer panicked on {} row(s); recovering",
+                    batch.len()
+                );
+                match conn.prepare(RequestRow::insert_sql()) {
+                    Ok(fresh) => stmt = fresh,
+                    Err(e) => {
+                        tracing::error!("stats writer could not rebuild its statement: {}", e);
+                        return;
+                    }
+                }
+            }
         }
     }
 }

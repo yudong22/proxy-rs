@@ -1054,6 +1054,58 @@ async fn forward_request(
     'credential: for credential_attempt in 0..max_credential_attempts {
         let mut current_credential = active_credential.clone();
 
+        // A credential that a recent request already proved broken is skipped
+        // outright, instead of re-paying the failing round-trip (and the 3 s
+        // `not_found` wait) on every single request. Only the very first
+        // attempt consults the memory; once the request is under way the
+        // normal discovery path owns it, so a memory that turns out to be
+        // wrong just costs one ordinary retry.
+        if credential_attempt == 0 {
+            if let Some(target) =
+                remembered_failover(&pool, current_credential.as_ref(), &gui_logs, &tag).await
+            {
+                match target {
+                    FailoverTarget::Credential(id) => {
+                        if let Some(next) = pool
+                            .snapshot()
+                            .await
+                            .into_iter()
+                            .find(|c| c.id == id && c.enabled)
+                        {
+                            if let Ok(mut t) = overrides.lock() {
+                                t.set_key(next.id.clone(), "复用近期可用凭据");
+                                t.set_model(
+                                    openai_req.model.clone(),
+                                    "复用近期可用凭据(跳过失败探测)",
+                                );
+                            }
+                            active_credential = Some(next.clone());
+                            current_credential = Some(next);
+                        }
+                    }
+                    FailoverTarget::ApiKey(id) => {
+                        if let Some(key) = crate::workbuddy_auth::enabled_api_keys()
+                            .into_iter()
+                            .find(|k| k.id == id)
+                        {
+                            if let Ok(mut t) = overrides.lock() {
+                                t.set_key(key.id.clone(), "复用近期可用密钥");
+                                t.set_model(
+                                    openai_req.model.clone(),
+                                    "复用近期可用密钥(跳过失败探测)",
+                                );
+                            }
+                            tried_key_ids.insert(key.id.clone());
+                            active_credential = None;
+                            current_credential = None;
+                            current_api_key = Some(key.key.clone());
+                            current_key_id = Some(key.id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         // Proactive renewal: a token already past (or within the margin of) its
         // expiry is renewed before spending a round-trip on it. This is what
         // keeps a long-idle app working on the first request after the login
@@ -1187,7 +1239,16 @@ async fn forward_request(
                     //     switching; with a single account, failing over has nowhere
                     //     to go and would surface the 401 to the client directly.
                     if status.as_u16() == 401 && body.contains("not_found") {
-                        if attempt == 0 {
+                        // Only pay the exploratory wait while the failure is
+                        // still unknown. Once a recent request has already
+                        // proven this credential broken, re-probing it costs
+                        // the client 3 s for an answer we can predict — go
+                        // straight to the failover we know works.
+                        let already_known = current_credential
+                            .as_ref()
+                            .map(|c| failover_is_known(&c.id))
+                            .unwrap_or(false);
+                        if attempt == 0 && !already_known {
                             // First attempt: brief 3s pause, then retry without refresh.
                             gui_logs
                                 .push(
@@ -1201,7 +1262,7 @@ async fn forward_request(
                             tokio::time::sleep(Duration::from_millis(3000)).await;
                             continue; // attempt 0 → 1, no token refresh
                         }
-                        // attempt ≥ 1: two tries already failed; fall through to
+                        // Known failure (or attempt ≥ 1): fall through to
                         // is_switchable_error → account / key failover.
                     } else if status.as_u16() == 401 && !token_refresh_attempted {
                         if let Some(cred) = current_credential.as_ref() {
@@ -1280,7 +1341,13 @@ async fn forward_request(
                                             format!("failover {status} from {from}"),
                                         );
                                     }
-                                    active_credential = Some(next);
+                                    active_credential = Some(next.clone());
+                                    // Remember it: the next request must not
+                                    // pay for this discovery again.
+                                    remember_failover(
+                                        &from,
+                                        FailoverTarget::Credential(next.id.clone()),
+                                    );
                                     continue 'credential; // retry the request on the replacement
                                 }
                                 None => {
@@ -1319,6 +1386,13 @@ async fn forward_request(
                                             active_credential = None;
                                             current_api_key = Some(key.key.clone());
                                             current_key_id = Some(key.id.clone());
+                                            // The account pool was exhausted, so
+                                            // the key pool is the only thing that
+                                            // worked — remember exactly that.
+                                            remember_failover(
+                                                &from,
+                                                FailoverTarget::ApiKey(key.id.clone()),
+                                            );
                                             continue 'credential; // retry the request on the fallback API key
                                         }
                                     }
@@ -2192,6 +2266,150 @@ fn upstream_auth_headers(
     headers
 }
 
+/// How long a proven failover target is reused without re-probing the failing
+/// credential, in milliseconds (3 min).
+///
+/// Long enough that a broken upstream path (the `401 not_found` routing fault)
+/// costs one discovery per three minutes instead of one per request; short
+/// enough that a transient blip does not pin traffic away from the configured
+/// default for long.
+const FAILOVER_MEMORY_TTL_MS: i64 = 3 * 60 * 1000;
+
+/// One remembered "credential X is failing → go straight to Y" decision.
+#[derive(Debug, Clone)]
+struct FailoverMemory {
+    /// The credential/key id that failed.
+    from: String,
+    /// What to serve instead: an account-pool credential, or an API key.
+    to: FailoverTarget,
+    /// When the memory stops being consulted.
+    expires_at_ms: i64,
+}
+
+/// Where a remembered failover lands.
+#[derive(Debug, Clone)]
+enum FailoverTarget {
+    /// An account-pool credential id — fed back through `pool.pick`-style
+    /// lookup so the freshest token for that account is used.
+    Credential(String),
+    /// An API-key-pool entry id.
+    ApiKey(String),
+}
+
+/// Skip the failing credential entirely when a recent request already proved it
+/// broken and found a working replacement.
+///
+/// Without this, every single request re-discovers the same failure from
+/// scratch: it pays the upstream round-trip, the 3 s `not_found` sleep, the
+/// second round-trip, and only then fails over. In the field that showed up as
+/// *every* request costing ~5 s and two logged upstream errors before it was
+/// served — the log filled with
+/// `401 not_found … → 账号池无可用替换账号 … → ok override=k-…`
+/// repeated verbatim for request after request.
+///
+/// The memory is a hint, never the only path: it is only consulted for the
+/// first credential attempt (`attempt == 0 && credential_attempt == 0`), and
+/// only when its replacement is still present and enabled. Anything that makes
+/// it inapplicable falls through to the existing discovery path unchanged.
+async fn remembered_failover(
+    pool: &crate::session_pool::SharedCredentialPool,
+    credential: Option<&crate::workbuddy_auth::WorkBuddyCredential>,
+    gui_logs: &Arc<crate::settings::LogBuffer>,
+    tag: &str,
+) -> Option<FailoverTarget> {
+    let from = credential.map(|c| c.id.clone())?;
+    let now = crate::util::unix_millis();
+
+    let memory = {
+        let guard = failover_memory().read().ok()?;
+        match guard.as_ref() {
+            // A memory only counts while it is fresh and about this credential.
+            Some(m) if m.from == from && now < m.expires_at_ms => m.to.clone(),
+            _ => return None,
+        }
+    };
+
+    // The replacement must still exist: a deleted or disabled account must send
+    // us back through discovery rather than pinning every request to a ghost.
+    match &memory {
+        FailoverTarget::Credential(id) => {
+            let still_there = pool
+                .snapshot()
+                .await
+                .iter()
+                .any(|c| c.id == *id && c.enabled);
+            if !still_there {
+                failover_memory().write().ok().and_then(|mut g| g.take());
+                return None;
+            }
+        }
+        FailoverTarget::ApiKey(id) => {
+            let still_there = crate::workbuddy_auth::enabled_api_keys()
+                .iter()
+                .any(|k| k.id == *id);
+            if !still_there {
+                failover_memory().write().ok().and_then(|mut g| g.take());
+                return None;
+            }
+        }
+    }
+
+    gui_logs
+        .push(
+            "WARN",
+            format!(
+                "凭据 {} 近期失败，直接复用已知可用身份 {}（跳过重试探测） {}",
+                from,
+                match &memory {
+                    FailoverTarget::Credential(id) => id.clone(),
+                    FailoverTarget::ApiKey(id) => id.clone(),
+                },
+                tag
+            ),
+        )
+        .await;
+    Some(memory)
+}
+
+/// The one most recent failover decision, process-wide.
+///
+/// Deliberately global rather than per-session: the observed failures are
+/// upstream-path faults (a gateway that cannot route), which hit every session
+/// at once, so the point of remembering is that *other* sessions benefit too.
+/// A per-session map would let each new session rediscover the same broken path.
+static FAILOVER_MEMORY: std::sync::OnceLock<std::sync::RwLock<Option<FailoverMemory>>> =
+    std::sync::OnceLock::new();
+
+/// The shared memory slot, initializing it on first use.
+fn failover_memory() -> &'static std::sync::RwLock<Option<FailoverMemory>> {
+    FAILOVER_MEMORY.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Whether a recent request already proved `from` broken.
+///
+/// Used to skip the exploratory retry: once the failure is known, waiting 3 s to
+/// re-probe the same broken path is pure latency on the client's critical path.
+fn failover_is_known(from: &str) -> bool {
+    let now = crate::util::unix_millis();
+    failover_memory()
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|m| m.from == from && now < m.expires_at_ms))
+        .unwrap_or(false)
+}
+
+/// Record that `from` failed and `to` served the request instead.
+fn remember_failover(from: &str, to: FailoverTarget) {
+    let lock = failover_memory();
+    if let Ok(mut guard) = lock.write() {
+        *guard = Some(FailoverMemory {
+            from: from.to_string(),
+            to,
+            expires_at_ms: crate::util::unix_millis() + FAILOVER_MEMORY_TTL_MS,
+        });
+    }
+}
+
 /// Whether an upstream failure should relocate the session onto another
 /// credential: the plan's limit/failure classes — 429 rate limit, 402 out of
 /// credit, 403 banned/permission denied, and WorkBuddy quota business codes
@@ -2970,6 +3188,7 @@ mod tests {
         apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported,
         upstream_auth_headers, OverrideTrace, MAX_SSE_FRAME_BYTES,
     };
+    use super::{failover_is_known, failover_memory, remember_failover, FailoverTarget};
     use crate::models::{openai, responses};
     use crate::session::SessionInfo;
     use axum::response::IntoResponse;
@@ -2977,6 +3196,44 @@ mod tests {
     use futures::stream::{self, StreamExt};
     use serde_json::{json, Value};
     use std::fmt;
+
+    /// The failover memory: remembered per failing credential, scoped, and
+    /// expiring.
+    ///
+    /// One test rather than three, on purpose: the memory is a process-wide
+    /// static and `cargo test` runs tests in parallel threads, so separate
+    /// tests would race on it and fail intermittently.
+    #[test]
+    fn failover_memory_is_scoped_and_expires() {
+        // Clean slate regardless of what ran before.
+        failover_memory().write().ok().and_then(|mut g| g.take());
+
+        remember_failover("wb-bad", FailoverTarget::ApiKey("k-good".to_string()));
+        assert!(
+            failover_is_known("wb-bad"),
+            "the failing credential must be recognised"
+        );
+        // A different credential is not implicated by someone else's failure.
+        assert!(
+            !failover_is_known("wb-other"),
+            "memory must be scoped to the credential that failed"
+        );
+
+        // Wind the clock past the TTL: a transient blip must not pin traffic
+        // away from the configured default forever.
+        if let Ok(mut guard) = failover_memory().write() {
+            if let Some(m) = guard.as_mut() {
+                m.expires_at_ms = crate::util::unix_millis() - 1;
+            }
+        }
+        assert!(
+            !failover_is_known("wb-bad"),
+            "an expired memory must not be consulted"
+        );
+
+        // Leave it clean for any test that runs after.
+        failover_memory().write().ok().and_then(|mut g| g.take());
+    }
 
     /// A credential override and a model override must both survive: they used
     /// to share one `reason` field, so the second `set_*` call erased the first
@@ -3433,6 +3690,7 @@ mod tests {
             200,
             r#"{"code":11105,"message":"quota exhausted"}"#
         ));
+
         assert!(!super::is_switchable_error(500, "internal server error"));
         assert!(!super::is_switchable_error(400, "bad request"));
     }

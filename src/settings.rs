@@ -296,12 +296,29 @@ fn writer_loop_log(rx: Receiver<LogInstruction>) {
 
         if !batch.is_empty() {
             batch.push('\n');
-            write_batch(&mut file, &batch);
+            // This thread is the only consumer of the queue. If it panicked,
+            // every later `send` would fail silently forever: the in-memory
+            // buffer would keep filling so the console looks healthy, while
+            // `proxy.log` — the history the user expects after a restart —
+            // quietly stops. Contain the panic so one bad write cannot end the
+            // thread's life.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                write_batch(&mut file, &batch)
+            }))
+            .is_err()
+            {
+                eprintln!("proxy-rs: log writer panicked while writing a batch; continuing");
+            }
         }
 
         match stop {
             Some(LogInstruction::Truncate(done)) => {
-                truncate_file(&mut file);
+                // Contain the truncate, but always run the callback: `clear()`
+                // blocks on it, and skipping it would hang the caller for its
+                // full 5 s timeout on every "清空".
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    truncate_file(&mut file)
+                }));
                 done();
             }
             #[cfg(test)]

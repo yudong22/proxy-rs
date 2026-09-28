@@ -151,6 +151,41 @@ async fn get_stats(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     }))
 }
 
+/// Run a fire-and-forget task under supervision, so its death is visible.
+///
+/// The two long-lived background tasks (the proxy listener and the daily
+/// check-in scheduler) used to be spawned with their `JoinHandle` dropped on
+/// the floor. A panic inside either one therefore vanished without a trace:
+/// the scheduler's symptom was "my daily points stopped accruing" with nothing
+/// anywhere to explain it, and a listener panic was worse than silent — the
+/// service stayed flagged 🟢 running in the tray and console while the port
+/// was actually closed.
+///
+/// This awaits the handle and reports both failure modes: a panic (the join
+/// error) and an early return. Release builds are `panic = "abort"`, so a panic
+/// takes the process with it; this is what makes the *non*-panic exits — and
+/// any future non-abort build — observable.
+fn spawn_supervised<F>(ctx: Arc<AppContext>, label: &'static str, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tauri::async_runtime::spawn(async move {
+        match tauri::async_runtime::spawn(fut).await {
+            Ok(()) => {
+                ctx.logs
+                    .push("WARN", format!("后台任务 {} 已提前结束", label))
+                    .await;
+                tracing::warn!("background task {} returned early", label);
+            }
+            Err(join_err) => {
+                let msg = format!("后台任务 {} 异常终止: {}", label, join_err);
+                ctx.logs.push("ERROR", msg.clone()).await;
+                tracing::error!("{}", msg);
+            }
+        }
+    });
+}
+
 /// Start (or restart) the proxy service and note it in the log. The server task
 /// logs the real outcome once the port is bound, so a failed bind is never
 /// reported as success here.
@@ -1221,7 +1256,8 @@ fn run_proxy_server(
     server_id: u16,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    tauri::async_runtime::spawn(async move {
+    let ctx_for_watch = ctx.clone();
+    spawn_supervised(ctx_for_watch, "代理监听", async move {
         // If a newer start was requested while we were spinning up, bail out.
         if ctx.server_epoch.load(std::sync::atomic::Ordering::SeqCst) != server_id {
             return;
@@ -1475,11 +1511,15 @@ fn main() {
             // ("there is no reactor running") and, because a panic cannot
             // unwind through the Objective-C launch callback, aborted the app
             // at startup.
-            tauri::async_runtime::spawn(proxy_rs::scheduler::run_daily_checkin(
-                ctx_for_scheduler.client.clone(),
-                ctx_for_scheduler.logs.clone(),
-                tokio_util::sync::CancellationToken::new(),
-            ));
+            spawn_supervised(
+                ctx_for_scheduler.clone(),
+                "每日打卡",
+                proxy_rs::scheduler::run_daily_checkin(
+                    ctx_for_scheduler.client.clone(),
+                    ctx_for_scheduler.logs.clone(),
+                    tokio_util::sync::CancellationToken::new(),
+                ),
+            );
 
             // Build Tray Menu
             let status_i =
