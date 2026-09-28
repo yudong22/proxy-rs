@@ -64,9 +64,9 @@ Tauri 命令：`wb_credentials_list / wb_credentials_add / wb_credentials_delete
 
 ### 1.3 鉴权头注入与 token 刷新
 
-- 扩展 `apply_upstream_auth`（`src/proxy.rs`）：WorkBuddy flavor 且启用登录态时，注入完整指纹头组（`X-User-Id` / `X-Enterprise-Id` / `X-Tenant-Id` / `X-Domain` / `X-Product-Code` / `X-IDE-*` / `X-Machine-Id` + `Authorization: Bearer <accessToken>`），替代现有 `x-api-key` 双头。
+- 扩展 `apply_upstream_auth`（`src/proxy.rs`）：WorkBuddy flavor 且启用登录态时，注入完整指纹头组（`X-User-Id` / `X-Enterprise-Id` / `X-Tenant-Id` / `X-Domain` / `X-Product-Code` / `X-IDE-*` / `X-Machine-Id` + `Authorization: Bearer <accessToken>`），替代现有 `x-api-key` 双头。**登录态 token 只走 `Authorization`，不得镜像进 `x-api-key`**：网关在 `x-api-key` 存在时以其为准，登录态 token 放在那里会返回 `401 {"message":"not_found"}`，导致账号池请求全部降级到密钥池（v1.9.4 修复，回归测试见 `tests/account_pool_auth.rs`）。
 - 新增 `wb_refresh_token`：401 或 `expiresAt` 临期（< 60s）时调 `/v2/plugin/auth/token/refresh`（带 `X-Refresh-Token`），成功回写凭据文件；失败标记凭据 `last_error` 并进入冷却。
-- `credits.rs` 的额度查询同步支持登录态鉴权（当前走 `X-API-Key`）。
+- `credits.rs` 的额度查询同步支持登录态鉴权：登录态走 `Bearer` 单头（`CreditsIdentity::LoginState`），静态密钥仍走 `Bearer` + `X-API-Key`（`CreditsIdentity::ApiKey`）。
 
 ### 1.4 测试
 

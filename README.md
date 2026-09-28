@@ -24,7 +24,7 @@
 - **多上游故障转移**：`UPSTREAM_BASE_URL` 支持分号（`;`）配置多个端点。仅在遇到 `429`（限流）或 `5xx`（服务故障）时自动重试下一可用端点，业务错误快速失败。
 - **WorkBuddy 账号池（登录态）**：导入桌面端登录态即可按账号身份请求上游（完整指纹头组 + token 自动刷新），摆脱 `11128 未授权渠道` 拦截。**默认凭据优先**：默认凭据健康时所有请求都走它；仅当某个会话遇到 429/402/配额码/刷新失败时，才把**该会话**切换到备用凭据并保持粘滞（复用上游 prompt cache）；日志与请求记录可追溯每次切换（`override_key` / `override_model`）。
 - **模型重映射（Model Mapping）**：通过 `PROXY_MODEL_MAP` 自由定义请求模型到上游模型的重定向规则（例如 `claude-sonnet-4-5=deepseek-chat`）。
-- **灵活鉴权**：既支持全局静态上游密钥，也支持密钥透传模式（从请求头的 `x-api-key` 或 `authorization` 提取，适合多租户共享）。
+- **灵活鉴权**：既支持全局静态上游密钥，也支持密钥透传模式（从请求头的 `x-api-key` 或 `authorization` 提取，适合多租户共享）。**鉴权头按身份区分**：静态密钥发送 `Authorization` + `x-api-key` 双头；WorkBuddy 登录态凭据只发送 `Authorization: Bearer <accessToken>` + 指纹头组，绝不把登录 token 写入 `x-api-key`（网关在 `x-api-key` 存在时以其为准，会返回 `401 {"message":"not_found"}`）。
 - **内容清洗与安全指纹消除**：内置系统提示词敏感项剔除与请求体指纹中和能力，规避第三方服务商的安全策略误拦截（如腾讯 Copilot / WorkBuddy `11128` 拦截）。
 - **长会话大报文保护**：默认支持高达 32 MiB 请求体缓冲（`PROXY_MAX_BODY_BYTES`），彻底解决复杂长对话客户端中断与截断痛点。
 

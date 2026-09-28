@@ -2175,20 +2175,21 @@ fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
 /// Attach the upstream authentication + CLI fingerprint headers.
 ///
 /// For the WorkBuddy/CodeBuddy flavor we mirror the official client's request
-/// fingerprint: the `x-api-key`/`Authorization` pair plus the official
-/// `User-Agent`, and a small set of low-risk correlation headers the gateway
-/// expects from the genuine CLI (`X-CodeBuddy-Request`, `Accept`,
-/// `X-Requested-With`). These are cheap and were validated as passing in the
-/// troubleshooting doc's "full headers" test, so we send them proactively.
-/// Other providers keep the plain `Authorization` flow.
+/// fingerprint: the official `User-Agent`, and a small set of low-risk
+/// correlation headers the gateway expects from the genuine CLI
+/// (`X-CodeBuddy-Request`, `Accept`, `X-Requested-With`). These are cheap and
+/// were validated as passing in the troubleshooting doc's "full headers" test,
+/// so we send them proactively. Other providers keep the plain `Authorization`
+/// flow.
 ///
 /// `credential` — when the request is served by a login-state credential — is
-/// authoritative: its bearer token replaces *both* the `Authorization` and
-/// `x-api-key` values, and no static-key value survives. This must be a single
-/// header map because reqwest's `.header()` *appends* rather than replaces, so
-/// issuing a static-key `Authorization` and then a credential `Authorization`
-/// would put two conflicting values on the wire and the Tencent `stgw` gateway
-/// answers that with a bare HTML `400 Bad Request`.
+/// authoritative: its bearer token takes over `Authorization`, and any
+/// static-key `x-api-key` is dropped rather than mirrored, because the login
+/// token is not an API key (see [`upstream_auth_headers`]). This must be a
+/// single header map because reqwest's `.header()` *appends* rather than
+/// replaces, so issuing a static-key `Authorization` and then a credential
+/// `Authorization` would put two conflicting values on the wire and the Tencent
+/// `stgw` gateway answers that with a bare HTML `400 Bad Request`.
 fn apply_upstream_auth(
     mut req: reqwest::RequestBuilder,
     config: &Config,
@@ -2209,6 +2210,19 @@ fn apply_upstream_auth(
 /// *appends*: building the map here and applying it once means a credential and
 /// a static key can never both contribute an `Authorization`/`x-api-key` value,
 /// which is what produced the duplicate-header `400 Bad Request` from `stgw`.
+///
+/// The two identities carry *different* auth headers, and that asymmetry is
+/// deliberate:
+///
+///   * a **static/API key** (`None`) is an api-key credential, so it travels as
+///     `Authorization: Bearer <key>` **and** `x-api-key: <key>`;
+///   * a **login-state credential** (`Some`) is a Keycloak bearer and travels as
+///     `Authorization: Bearer <accessToken>` **only** — no `x-api-key` at all.
+///
+/// Sending an account token in `x-api-key` makes the gateway treat the api-key
+/// as authoritative and answer `401 {"message":"not_found"}` even though the
+/// bearer is perfectly valid; that is what made every account-pool request fail
+/// over to the key pool.
 fn upstream_auth_headers(
     config: &Config,
     api_key: &Option<String>,
@@ -2232,10 +2246,21 @@ fn upstream_auth_headers(
     }
 
     match credential {
-        // Login-state credential: one consistent identity. The token is the
-        // bearer *and* the api key (mirroring the proven `fetch_points` call),
-        // and the session-bound fingerprint headers are added alongside. No
-        // static-key value is ever inserted, so none can survive.
+        // Login-state credential: one consistent identity, carried by
+        // `Authorization: Bearer <accessToken>` plus the session-bound
+        // fingerprint headers. No static-key value is ever inserted, so none can
+        // survive.
+        //
+        // The access token must NOT be mirrored into `x-api-key`. The login
+        // token is a Keycloak bearer, not an API key, and the gateway routes a
+        // chat request sent with *both* headers as if the api-key were
+        // authoritative: `Bearer <token>` alone answers 200, while
+        // `Bearer <token>` + `x-api-key: <token>` answers
+        // `401 {"message":"not_found"}`. That single mirrored header is why
+        // every account-pool request failed and fell through to the API-key
+        // pool. (`credits.rs` pairing Bearer + X-API-Key is a *static gateway
+        // key*, and `billing_headers` deliberately sends no X-API-Key for a
+        // login state for exactly this reason.)
         Some(cred) => {
             let token = cred.bearer();
             headers.insert(
@@ -2251,11 +2276,10 @@ fn upstream_auth_headers(
                     headers.insert(header_name, header_value);
                 }
             }
-            // Set x-api-key last so it always matches the token.
-            headers.insert(
-                HeaderName::from_static("x-api-key"),
-                HeaderValue::from_str(token).unwrap_or_else(|_| HeaderValue::from_static("")),
-            );
+            // Defensive: some WorkBuddy presets may have seeded an x-api-key
+            // from the static-key path before this branch. A credential request
+            // must never carry one.
+            headers.remove("x-api-key");
         }
         // Static key path (unchanged behaviour): Authorization always, plus the
         // WorkBuddy `x-api-key` mirror.
@@ -3210,6 +3234,7 @@ fn json_request<T: serde::Serialize>(value: &T) -> Request {
 
 #[cfg(test)]
 mod tests {
+    use super::apply_upstream_auth;
     use super::create_sse_stream;
     use super::json_request;
     use super::{
@@ -3224,6 +3249,7 @@ mod tests {
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use futures::stream::{self, StreamExt};
+    use reqwest::Client;
     use serde_json::{json, Value};
     use std::fmt;
 
@@ -3345,6 +3371,13 @@ mod tests {
     /// reqwest's `.header()` appends, so a naive implementation emits two
     /// `Authorization` values and Tencent's `stgw` gateway answers a bare HTML
     /// 400. Regression for the "都是 400 / Bad Request" report.
+    ///
+    /// The credential path must also NOT mirror its token into `x-api-key`: a
+    /// login token is not an API key, and the gateway answers
+    /// `401 {"message":"not_found"}` when one is sent — which is what silently
+    /// pushed every account-pool request onto the key pool. Verified against the
+    /// live upstream (2026-09-28): `Bearer <token>` → 200,
+    /// `Bearer <token>` + `x-api-key: <token>` → 401 not_found.
     #[test]
     fn credential_auth_replaces_the_static_key_on_every_shared_header() {
         let config = workbuddy_config();
@@ -3353,7 +3386,7 @@ mod tests {
 
         let headers = upstream_auth_headers(&config, &key, Some(&cred));
 
-        // Exactly one value per auth header, and it is the credential's.
+        // Exactly one Authorization, and it is the credential's bearer.
         assert_eq!(
             headers.get_all("authorization").iter().count(),
             1,
@@ -3363,8 +3396,12 @@ mod tests {
             headers.get("authorization").unwrap(),
             "Bearer credential-token"
         );
-        assert_eq!(headers.get_all("x-api-key").iter().count(), 1);
-        assert_eq!(headers.get("x-api-key").unwrap(), "credential-token");
+        // The account token must not be mirrored as an api key.
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "a login-state credential must not set x-api-key; got {:?}",
+            headers.get("x-api-key")
+        );
         // No trace of the static key anywhere.
         assert!(
             !headers
@@ -3386,6 +3423,72 @@ mod tests {
 
         let headers = upstream_auth_headers(&config, &key, None);
 
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer static-key");
+        assert_eq!(headers.get("x-api-key").unwrap(), "static-key");
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(headers.get_all("x-api-key").iter().count(), 1);
+    }
+
+    /// The same contract, asserted on the *wired* request rather than the
+    /// intermediate map.
+    ///
+    /// `apply_upstream_auth` is what the send path actually calls, and a helper
+    /// that builds the right map means nothing if the caller adds a header of
+    /// its own afterwards. Building the real `reqwest::Request` catches that:
+    /// the account path must put the token in `Authorization` only, the static
+    /// path must keep both headers, and neither may ever carry two values for
+    /// one name (reqwest `.header()` appends — the `stgw` 400 regression).
+    #[test]
+    fn wired_upstream_request_never_leaks_a_mirrored_account_token() {
+        let config = workbuddy_config();
+        let client = Client::new();
+        let key = Some("static-key".to_string());
+        let cred = test_credential();
+        let body = openai::OpenAIRequest {
+            model: "glm-5.3-flash".to_string(),
+            messages: vec![],
+            ..Default::default()
+        };
+
+        let account_req = apply_upstream_auth(
+            client
+                .post("https://upstream.invalid/v2/chat/completions")
+                .json(&body),
+            &config,
+            &key,
+            Some(&cred),
+        )
+        .build()
+        .expect("account request builds");
+
+        let headers = account_req.headers();
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer credential-token",
+            "the account bearer must travel in Authorization"
+        );
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "the account token must not be mirrored into x-api-key, got {:?}",
+            headers.get("x-api-key")
+        );
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(headers.get_all("x-api-key").iter().count(), 0);
+        // The fingerprint still rides along.
+        assert_eq!(headers.get("x-user-id").unwrap(), "uid-1");
+
+        let key_req = apply_upstream_auth(
+            client
+                .post("https://upstream.invalid/v2/chat/completions")
+                .json(&body),
+            &config,
+            &key,
+            None,
+        )
+        .build()
+        .expect("static-key request builds");
+
+        let headers = key_req.headers();
         assert_eq!(headers.get("authorization").unwrap(), "Bearer static-key");
         assert_eq!(headers.get("x-api-key").unwrap(), "static-key");
         assert_eq!(headers.get_all("authorization").iter().count(), 1);

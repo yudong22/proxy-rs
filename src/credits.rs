@@ -482,11 +482,31 @@ fn soonest_expiry(segments: &[CreditSegment]) -> Option<f64> {
         .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
 }
 
+/// Which identity the `GET /v1/credits` request authenticates with.
+///
+/// The two are not interchangeable, and sending the wrong pairing is a 401: the
+/// billing gateway reads `X-API-Key` as authoritative when it is present, so a
+/// Keycloak login token placed there answers `401 {"message":"not_found"}` even
+/// though the same token as a bare bearer works. Verified against the live
+/// endpoint (2026-09-28):
+///
+///   * login token, `Bearer` only                            → 200 `code 0`
+///   * login token, `Bearer` + `X-API-Key`                   → 401 not_found
+///   * static key, `Bearer` + `X-API-Key`                    → 200 `code 0`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditsIdentity {
+    /// A static gateway API key: `Authorization` **and** `X-API-Key`.
+    ApiKey,
+    /// A WorkBuddy login-state access token: `Authorization` **only**.
+    LoginState,
+}
+
 /// Fetch and normalize the gateway wallet balance.
 pub async fn fetch_credits(
     config: &Config,
     client: &reqwest::Client,
     api_key: &Option<String>,
+    identity: CreditsIdentity,
 ) -> ProxyResult<CreditsResponse> {
     let endpoint = credits_endpoint_for(config).ok_or_else(|| {
         ProxyError::Config(
@@ -504,8 +524,11 @@ pub async fn fetch_credits(
         .post(&endpoint)
         .timeout(Duration::from_secs(30))
         .header("Authorization", format!("Bearer {}", key))
-        .header("X-API-Key", &key)
         .header("Accept", "application/json");
+    // A login token must not appear as an api key; see `CreditsIdentity`.
+    if identity == CreditsIdentity::ApiKey {
+        req = req.header("X-API-Key", &key);
+    }
     if is_workbuddy {
         req = req
             .header("Content-Type", "application/json")
@@ -677,15 +700,20 @@ pub async fn credits_handler(
     // balance is queried with the default credential's access token — the
     // account whose quota the requests actually burn. Falls back to the static
     // key path when the pool is off.
-    let api_key = if config.credential_pool_enabled && pool.is_enabled().await {
-        pool.pick("")
-            .await
-            .map(|c| c.access_token)
-            .or_else(|| config.api_key.clone())
+    //
+    // The identity travels with the value: a login token authenticates as a bare
+    // bearer, while a static gateway key needs the `Bearer` + `X-API-Key` pair.
+    // Sending a login token in `X-API-Key` is a 401, which used to surface as the
+    // 剩余积分 card showing "—" whenever the account pool was on.
+    let (api_key, identity) = if config.credential_pool_enabled && pool.is_enabled().await {
+        match pool.pick("").await {
+            Some(cred) => (Some(cred.access_token), CreditsIdentity::LoginState),
+            None => (config.api_key.clone(), CreditsIdentity::ApiKey),
+        }
     } else {
-        config.api_key.clone()
+        (config.api_key.clone(), CreditsIdentity::ApiKey)
     };
-    let result = fetch_credits(&config, &client, &api_key).await;
+    let result = fetch_credits(&config, &client, &api_key, identity).await;
 
     match result {
         Ok(resp) => {
@@ -770,7 +798,13 @@ mod tests {
             ..Default::default()
         };
         let client = reqwest::Client::new();
-        let result = fetch_credits(&config, &client, &Some("token".to_string())).await;
+        let result = fetch_credits(
+            &config,
+            &client,
+            &Some("token".to_string()),
+            CreditsIdentity::ApiKey,
+        )
+        .await;
         assert!(matches!(result, Err(ProxyError::Config(_))));
     }
 
@@ -782,7 +816,7 @@ mod tests {
             ..Default::default()
         };
         let client = reqwest::Client::new();
-        let result = fetch_credits(&config, &client, &None).await;
+        let result = fetch_credits(&config, &client, &None, CreditsIdentity::ApiKey).await;
         assert!(matches!(result, Err(ProxyError::Config(_))));
     }
 }
