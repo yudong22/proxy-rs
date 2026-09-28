@@ -8,7 +8,7 @@
 import { $, setText, setClass, setHidden, html, raw } from '../core/dom.js';
 import { invoke } from '../core/ipc.js';
 import { appState } from '../core/state.js';
-import { formatNumber, formatUptime } from '../lib/format.js';
+import { formatNumber, formatPoints } from '../lib/format.js';
 import { toast } from '../components/toast.js';
 
 /**
@@ -54,10 +54,12 @@ export function renderOverview() {
 
   root.innerHTML = html`
     <div class="metrics-grid">
-      ${raw(metric('metric-status', '服务状态', { cardId: 'card-status' }))}
-      ${raw(metric('metric-port', '监听端口'))}
-      ${raw(metric('metric-uptime', '运行时间'))}
-      ${raw(metric('metric-provider', '已配置厂商'))}
+      ${raw(metric('metric-provider', '配置厂商'))}
+      ${raw(metric('metric-points', '剩余积分'))}
+      ${raw(metric('metric-account', '当前账号'))}
+      ${raw(metric('metric-overrides', '今日 override 次数', {
+        cardId: 'stat-card-overrides', clickable: true, title: '点击查看请求日志',
+      }))}
     </div>
 
     <div class="metrics-grid">
@@ -113,15 +115,14 @@ export async function refreshStatus() {
     toggle.className = 'btn btn-small' + (appState.running ? '' : ' btn-primary');
   }
 
-  // Status card
-  const card = $('#card-status');
-  if (card) {
-    card.className = 'metric-card ' + (appState.running ? 'running' : 'stopped');
-  }
-  setText('metric-status', appState.running ? '正常运行' : '已停止');
-  setText('metric-port', appState.port);
-  setText('metric-uptime', formatUptime(status.uptime_secs || 0));
+  // The identity in force right now: 配置厂商 / 剩余积分 / 当前账号.
+  const identity = status.current_identity || {};
+  // 配置厂商: the backend reports the provider id, as before. An identity
+  // label describes *who* is serving, this describes *where* — and only the
+  // latter is known unconditionally (it survives a stopped pool).
   setText('metric-provider', status.provider || '-');
+  setText('metric-points', formatPoints(identity.points));
+  setText('metric-account', identity.label || '-');
 
   // Endpoint reference
   setText('endpoint-messages', `http://127.0.0.1:${appState.port}/v1/messages`);
@@ -160,6 +161,7 @@ export async function refreshStats() {
   setText('stat-tokens-cache-read', formatNumber(s.tokens_cache_read));
   setText('stat-tokens-cache-write', formatNumber(s.tokens_cache_write));
   setText('stat-tokens-output', formatNumber(s.tokens_output));
+  setText('metric-overrides', formatNumber(s.overrides_total));
 }
 
 /** Wire the interactions that belong to this view. Called once, from main.js. */
@@ -189,6 +191,12 @@ export function initOverview() {
     const open = detail.hasAttribute('hidden');
     setHidden(detail, !open);
     card.classList.toggle('active', open);
+  });
+
+  // The 今日 override 次数 card jumps to the request log, where each override's
+  // reason is spelled out in the override column.
+  $('#stat-card-overrides')?.addEventListener('click', () => {
+    window.switchTab('logs');
   });
 
   // Copy-to-clipboard buttons on the endpoint rows.

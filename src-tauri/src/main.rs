@@ -124,7 +124,41 @@ async fn get_status(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
         // user's next login at a development binary. The console disables the
         // switch on this flag.
         "is_dev": cfg!(debug_assertions),
+        // The overview header's 配置厂商 / 当前账号 / 剩余积分 cards.
+        "current_identity": current_identity_summary(),
     }))
+}
+
+/// The identity currently serving requests, for the overview header.
+///
+/// Mirrors the resolution the request path applies
+/// ([`proxy_rs::workbuddy_auth::effective_default_identity`]) and attaches a
+/// human-readable label plus the last-known remaining points. `points` is
+/// `null` when it has never been queried — distinct from a real 0 balance.
+///
+/// An account's label is preferred; a key's label next; the static-key path and
+/// an explicitly empty pool fall back to a fixed description, because there is
+/// no account to name in either case.
+fn current_identity_summary() -> Value {
+    let id = proxy_rs::workbuddy_auth::effective_default_identity();
+
+    // (label, points) for the named identity, or a fallback when the id is the
+    // static-key path / the "no pool" sentinel and there is no account to name.
+    let (label, points) = match id.as_str() {
+        id if id.starts_with("wb-") => proxy_rs::workbuddy_auth::load_credentials()
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| (c.label, c.points))
+            .unwrap_or_else(|| ("未知账号".to_string(), None)),
+        id if id.starts_with("k-") => proxy_rs::workbuddy_auth::load_api_keys()
+            .into_iter()
+            .find(|k| k.id == id)
+            .map(|k| (k.label, k.points))
+            .unwrap_or_else(|| ("未知密钥".to_string(), None)),
+        _ => ("静态 API Key".to_string(), None),
+    };
+
+    json!({ "id": id, "label": label, "points": points })
 }
 
 #[tauri::command]
@@ -148,6 +182,7 @@ async fn get_stats(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
         "tokens_cache_write": today.tokens_cache_write,
         "tokens_output": today.tokens_output,
         "cache_hit_pct": today.cache_hit_pct(),
+        "overrides_total": today.overrides_total,
     }))
 }
 

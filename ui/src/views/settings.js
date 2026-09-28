@@ -17,6 +17,7 @@ import { appState } from '../core/state.js';
 import { refreshStatus } from './overview.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { toast } from '../components/toast.js';
+import { formatPoints } from '../lib/format.js';
 
 
 /**
@@ -573,15 +574,6 @@ const WB_STATE_LABELS = {
   expired: ['已过期', 'wb-state-expired'],
   disabled: ['已禁用', 'wb-state-disabled'],
 };
-
-/** Format a point balance for display; `null` means "not queried yet". */
-function formatPoints(points) {
-  if (points === null || points === undefined) return '—';
-  const n = Number(points);
-  if (!Number.isFinite(n)) return '—';
-  // Integral balances read better without a decimal tail.
-  return Number.isInteger(n) ? String(n) : n.toFixed(2);
-}
 
 /** Repaint the credential list from the backend. */
 async function renderIdentityPool() {

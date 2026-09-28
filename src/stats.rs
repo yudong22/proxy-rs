@@ -213,6 +213,10 @@ pub struct DayStats {
     pub tokens_cache_read: i64,
     pub tokens_cache_write: i64,
     pub tokens_output: i64,
+    /// Requests whose credential/model was changed by an exception override
+    /// (failover, degraded retry, token refresh). Empty `override_key` rows do
+    /// not count: a request served exactly as configured is not an override.
+    pub overrides_total: i64,
 }
 
 impl DayStats {
@@ -754,7 +758,8 @@ impl StatsDb {
                 COALESCE(SUM(input_tokens), 0),
                 COALESCE(SUM(cache_read_tokens), 0),
                 COALESCE(SUM(cache_write_tokens), 0),
-                COALESCE(SUM(output_tokens), 0)
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(CASE WHEN override_key != '' THEN 1 ELSE 0 END), 0)
              FROM request_logs WHERE date = ?1",
             params![date],
             |row| {
@@ -767,6 +772,7 @@ impl StatsDb {
                     tokens_cache_read: row.get(4)?,
                     tokens_cache_write: row.get(5)?,
                     tokens_output: row.get(6)?,
+                    overrides_total: row.get(7)?,
                 })
             },
         );
@@ -950,6 +956,40 @@ mod tests {
         assert_eq!(today.cache_hit_pct(), 90); // 900/(100+900)*100
         assert_eq!(today.tokens_total(), 1050);
         assert!(!today.date.is_empty());
+    }
+
+    /// Only rows whose `override_key` is actually set count as overrides.
+    ///
+    /// A request served exactly as configured must not inflate the count: the
+    /// overview's 今日 override 次数 card is read as "how often did the proxy
+    /// have to deviate today", and counting clean requests would make that
+    /// number meaningless.
+    #[test]
+    fn override_count_only_counts_rows_with_an_override_key() {
+        let db = StatsDb::in_memory().unwrap();
+        let tokens = TokenRecord::default();
+
+        let mut overridden = outcome("m", "/v1/messages", &tokens, 200, None, true);
+        overridden.override_key = "k-3ba06c";
+        overridden.override_model = "hy4-preview";
+        overridden.override_reason = "401 from wb-5735d0 (降级密钥池)";
+        db.record_request_log(overridden).unwrap();
+
+        db.record_request_log(outcome("m", "/v1/messages", &tokens, 200, None, true))
+            .unwrap();
+
+        // A failed request can still be an override — the failover did happen,
+        // the request just did not succeed afterwards.
+        let mut failed_override = outcome("m", "/v1/messages", &tokens, 502, Some("boom"), true);
+        failed_override.override_key = "wb-a85801";
+        db.record_request_log(failed_override).unwrap();
+
+        let today = db.query_today().unwrap();
+        assert_eq!(today.requests_total, 3);
+        assert_eq!(today.overrides_total, 2, "clean rows must not count");
+
+        db.clear_request_logs().unwrap();
+        assert_eq!(db.query_today().unwrap().overrides_total, 0);
     }
 
     #[test]

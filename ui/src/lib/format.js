@@ -70,3 +70,17 @@ export function shortSessionId(sessionId, client) {
   if (client && prefix === client) return short;
   return `${prefix}:${short}`;
 }
+
+/**
+ * Format a remaining-points balance.
+ *
+ * `null`/`undefined` means the balance has never been queried, which must read
+ * differently from a genuine 0 — hence the em dash rather than "0".
+ */
+export function formatPoints(points) {
+  if (points === null || points === undefined) return '—';
+  const n = Number(points);
+  if (!Number.isFinite(n)) return '—';
+  // Integral balances read better without a decimal tail.
+  return Number.isInteger(n) ? String(n) : n.toFixed(2);
+}
