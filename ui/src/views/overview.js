@@ -14,6 +14,7 @@ import {
   formatTps,
   formatLongDuration,
   formatSeconds,
+  shortSessionId,
 } from '../lib/format.js';
 import { toast } from '../components/toast.js';
 
@@ -97,34 +98,14 @@ export function renderOverview() {
       </dl>
     </div>
 
-    <!-- Expanded by the 输出速度 card. Values are session aggregates over the
-         recent-turns window; the comparison table below shows the last few
-         conversations. A cell with no measurement shows "—" rather than a
-         plausible-looking guess. -->
+    <!-- Expanded by the 输出速度 card: one transposed table, metrics as rows and
+         the three most recent conversations as columns, so the same measure can
+         be read across sessions at a glance. A cell with no measurement shows
+         "—" rather than a plausible-looking guess. -->
     <div class="section stat-detail" id="speed-detail" hidden>
-      <dl class="kv">
-        <dt>当前会话</dt><dd><code id="speed-session" class="speed-session-id">—</code></dd>
-        <dt>模型用时（累计）</dt><dd><code id="speed-model-time">—</code></dd>
-        <dt>工具调用用时（累计）</dt><dd><code id="speed-tool-time">—</code></dd>
-        <dt>首 token 平均（TTFT）</dt><dd><code id="speed-ttft">—</code></dd>
-        <dt>输出 tokens（累计）</dt><dd><code id="speed-tokens">—</code></dd>
-        <dt>输出速度（TPS）</dt><dd><code id="speed-tps">—</code></dd>
-      </dl>
-
-      <div class="speed-sessions-title">最近会话对比</div>
-      <div class="speed-sessions-wrap">
-        <table class="speed-sessions">
-          <thead>
-            <tr>
-              <th class="col-session">会话</th>
-              <th>模型用时</th>
-              <th>TTFT</th>
-              <th>TPS</th>
-            </tr>
-          </thead>
-          <tbody id="speed-sessions-body"></tbody>
-        </table>
-      </div>
+      <table class="speed-sessions">
+        <tbody id="speed-sessions-body"></tbody>
+      </table>
     </div>
 
     <div class="section">
@@ -247,61 +228,120 @@ export async function refreshSessionMetrics() {
       : '暂无可测量的生成记录';
   }
 
-  // The session's identity is its id from the request log, not the model name:
-  // several models can serve one conversation (a fallback switch changes it),
-  // but the id is what ties these turns together.
-  setText('speed-session', m.session_id || '—');
-  // 模型用时 is summed generation time over the window, not one request's
-  // duration — the latter also contains the client's read tail.
-  setText('speed-model-time', m.model_ms > 0 ? formatLongDuration(m.model_ms) : '—');
-  setText(
-    'speed-tool-time',
-    m.tool_wait_ms === null || m.tool_wait_ms === undefined
-      ? '—'
-      : `${formatSeconds(m.tool_wait_ms)}${m.tool_waits > 1 ? `（${m.tool_waits} 次）` : ''}`,
-  );
-  setText(
-    'speed-ttft',
-    m.avg_ttft_ms === null || m.avg_ttft_ms === undefined
-      ? '—'
-      : formatSeconds(m.avg_ttft_ms),
-  );
-  setText('speed-tps', formatTps(m.speed_tps));
-  setText(
-    'speed-tokens',
-    m.output_tokens > 0 ? formatNumber(m.output_tokens) : '—',
-  );
-
-  renderRecentSessions(m.recent, m.session_id);
+  renderSpeedTable(m);
 }
 
 /**
- * Render the recent-sessions comparison table.
+ * The label for one session column header.
  *
- * The first column is the session id, widened in CSS so a long id stays on one
- * line rather than wrapping into a second row height.
+ * The request table always abbreviates a session id to its first segment, but
+ * that is wrong here: a Claude/Codex id is a 43-char UUID and needs shortening,
+ * while `dsh:0.1.6-alpha.2` is already short — abbreviating it to `dsh:0.1.6`
+ * would drop the version that distinguishes one DSH build's conversations from
+ * another. So only genuinely long ids are shortened, and always keeping the
+ * client prefix so the dialect stays visible.
  */
-function renderRecentSessions(recent, currentId) {
+function sessionColumnLabel(sessionId) {
+  if (!sessionId) return '—';
+  const MAX = 22;
+  if (sessionId.length <= MAX) return sessionId;
+  return shortSessionId(sessionId);
+}
+
+/**
+ * Render the 输出速度 drill-down as one transposed table.
+ *
+ * Layout: metrics are **rows**, the three most recent conversations are
+ * **columns**, so the same measure reads straight across sessions. The header
+ * row names the sessions; the current session's column is highlighted.
+ *
+ * A cell with no measurement is "—", never a fabricated number — a session that
+ * predates timing, or whose replies were plain non-streamed JSON, genuinely has
+ * no speed to report.
+ */
+function renderSpeedTable(m) {
   const body = $('#speed-sessions-body');
   if (!body) return;
-  const rows = Array.isArray(recent) ? recent : [];
-  if (rows.length === 0) {
-    body.innerHTML = '<tr><td colspan="4" class="speed-empty">暂无会话</td></tr>';
+
+  const sessions = (Array.isArray(m.recent) ? m.recent : []).slice(0, 3);
+  if (sessions.length === 0) {
+    body.innerHTML = '<tr><td class="speed-empty">暂无会话</td></tr>';
     return;
   }
-  body.innerHTML = rows
+
+  // Metric rows, in display order. Each returns display text for one session;
+  // `—` is reserved for "not measured" so a real 0 stays tellable apart.
+  const rows = [
+    {
+      label: '模型用时',
+      value: s => (s.model_ms > 0 ? formatLongDuration(s.model_ms) : '—'),
+    },
+    {
+      label: '工具调用用时',
+      value: s =>
+        s.tool_wait_ms === null || s.tool_wait_ms === undefined
+          ? '—'
+          : `${formatSeconds(s.tool_wait_ms)}${s.tool_waits > 1 ? `（${s.tool_waits} 次）` : ''}`,
+    },
+    {
+      label: '首 token 平均（TTFT）',
+      value: s =>
+        s.avg_ttft_ms === null || s.avg_ttft_ms === undefined
+          ? '—'
+          : formatSeconds(s.avg_ttft_ms),
+    },
+    {
+      label: '输出 tokens',
+      value: s => (s.output_tokens > 0 ? formatNumber(s.output_tokens) : '—'),
+    },
+    {
+      label: '输出速度（TPS）',
+      value: s => formatTps(s.speed_tps),
+    },
+  ];
+
+  // Header row: the conversations. The full id stays in `title`; the label is
+  // abbreviated only when it is actually long (a 43-char `claude:<uuid>`), so a
+  // short id like `dsh:0.1.6-alpha.2` is shown whole rather than cut down to a
+  // version prefix two sessions could share.
+  const head = sessions
     .map(s => {
-      const isCurrent = s.session_id && s.session_id === currentId;
+      const isCurrent = Boolean(s.session_id) && s.session_id === m.session_id;
       return html`
-        <tr${raw(isCurrent ? ' class="is-current"' : '')}>
-          <td class="col-session"><span class="mono" title="${s.session_id || ''}">${s.session_id || '—'}</span></td>
-          <td>${s.model_ms > 0 ? formatLongDuration(s.model_ms) : '—'}</td>
-          <td>${s.avg_ttft_ms === null || s.avg_ttft_ms === undefined ? '—' : formatSeconds(s.avg_ttft_ms)}</td>
-          <td>${formatTps(s.speed_tps)}</td>
-        </tr>
+        <th class="col-session-cell${raw(isCurrent ? ' is-current' : '')}" title="${s.session_id || ''}">${sessionColumnLabel(s.session_id)}</th>
       `;
     })
     .join('');
+
+  // Metric rows. Each cell is built by `html`, so every interpolated value
+  // (model names, formatted text) is escaped before being joined as raw markup.
+  // The current session's cells carry `is-current` so the whole column can be
+  // highlighted, not just its header.
+  const metricRows = rows
+    .map(
+      r => html`
+        <tr>
+          <th class="col-metric">${r.label}</th>
+          ${raw(
+            sessions
+              .map(s => {
+                const isCurrent = Boolean(s.session_id) && s.session_id === m.session_id;
+                return html`<td class="${raw(isCurrent ? 'is-current' : '')}">${r.value(s)}</td>`;
+              })
+              .join(''),
+          )}
+        </tr>
+      `,
+    )
+    .join('');
+
+  body.innerHTML = html`
+    <tr>
+      <th class="col-metric">会话</th>
+      ${raw(head)}
+    </tr>
+    ${raw(metricRows)}
+  `;
 }
 
 /** Wire the interactions that belong to this view. Called once, from main.js. */

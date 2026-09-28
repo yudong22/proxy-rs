@@ -42,77 +42,79 @@
   white-space: nowrap;
 }
 
-/* ── Recent-session comparison (输出速度 drill-down) ───────────── */
+/* ── Session speed table (输出速度 drill-down) ────────────────── */
 
-.speed-sessions-title {
-  margin: 14px 0 6px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.speed-sessions-wrap {
-  overflow-x: auto;
-}
-
+/* One transposed table: metrics are rows, the recent conversations are columns,
+   so a single measure reads straight across sessions. */
 .speed-sessions {
   width: 100%;
   border-collapse: collapse;
-  /* Auto layout, unlike the request table's fixed layout: this table has only
-     four columns and must let the id column take the width it needs. */
+  /* Auto layout rather than the request table's fixed layout: the columns are
+     session ids of very different lengths, and each should take the width it
+     needs. The panel is inside `.section`, so it already has its own frame. */
   table-layout: auto;
   font-size: 12px;
 }
 
-.speed-sessions th {
-  padding: 6px 10px;
-  text-align: left;
-  font-weight: 600;
-  color: var(--muted);
-  border-bottom: 1px solid var(--border);
-  white-space: nowrap;
-}
-
+.speed-sessions th,
 .speed-sessions td {
-  padding: 6px 10px;
+  padding: 7px 10px;
   border-bottom: 1px solid var(--border);
-  font-variant-numeric: tabular-nums;
+  text-align: left;
 }
 
+.speed-sessions tbody tr:last-child th,
 .speed-sessions tbody tr:last-child td {
   border-bottom: none;
 }
 
-.speed-sessions tbody tr.is-current {
-  background: var(--surface2);
+/* The metric-label column: fixed at 220px so the metric names line up whatever
+   the session ids are, and never wrap (`首 token 平均（TTFT）` is the longest). */
+.speed-sessions th.col-metric {
+  width: 220px;
+  min-width: 220px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  vertical-align: top;
 }
 
-/* The 会话 column: wide and non-wrapping so a long id (`dsh:0.1.6-alpha.2`)
-   stays on one line instead of wrapping and doubling the row height. The id
-   itself is allowed to overflow into its own scroll region rather than being
-   clipped, since it is the row's identity. */
-.speed-sessions th.col-session,
-.speed-sessions td.col-session {
-  min-width: 200px;
+.speed-sessions td {
+  font-variant-numeric: tabular-nums;
+  vertical-align: top;
+}
+
+/* The session header cells. Ids are abbreviated to one segment, so they stay on
+   a single line; the full id is in the cell's `title`. */
+.speed-sessions th.col-session-cell {
+  color: var(--muted);
+  font-weight: 600;
   white-space: nowrap;
 }
 
-.speed-sessions td.col-session .mono {
-  display: inline-block;
-  max-width: 320px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  vertical-align: bottom;
+/* The conversation the card above describes. Marked by a tinted column so it is
+   findable without reading every header. */
+.speed-sessions th.col-session-cell.is-current,
+.speed-sessions td.is-current {
+  color: var(--accent);
+  background: var(--surface2);
+}
+
+.speed-sessions td.is-current {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Metric cells never wrap: each holds one short figure, and allowing a wrap
+   would make the rows jump in height as values change. */
+.speed-sessions tr > td {
+  white-space: nowrap;
 }
 
 .speed-sessions .speed-empty {
   color: var(--muted);
   text-align: center;
-  padding: 10px;
-}
-
-/* The 当前会话 value in the key/value list above the table. */
-.speed-session-id {
-  word-break: break-all;
+  padding: 12px;
 }
 
 .metric-card.running .metric-value { color: var(--success); }

@@ -196,8 +196,11 @@ const RECENT_SESSIONS: usize = 3;
 /// a per-turn figure swings too much to read, so the card shows the session's
 /// time-weighted rate instead — summed tokens over summed generation time.
 ///
-/// `recent` carries the same aggregate for the last [`RECENT_SESSIONS`]
-/// conversations so the panel can compare them side by side.
+/// The payload is `session_metrics_json(latest)` plus a `recent` array holding
+/// the same shape for the last [`RECENT_SESSIONS`] conversations. The drill-down
+/// is a transposed table whose columns are those sessions, so the top-level
+/// fields and the array entries must agree — building both from one mapper is
+/// what guarantees that.
 ///
 /// `speed_tps` is `null` unless at least one turn in the window was actually
 /// measurable — an unmeasured turn (a plain non-streamed reply, or a request
@@ -216,26 +219,15 @@ async fn get_session_metrics(ctx: State<'_, Arc<AppContext>>) -> Result<Value, S
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
 
-    Ok(json!({
-        "session_id": m.session_id,
-        // The model of the latest turn is context, not the session's identity;
-        // the panel's 当前会话 row shows the id.
-        "model": m.model,
-        "last_at": m.last_at,
-        // How many turns the aggregate covers, and how many were measurable.
-        "turns": m.turns,
-        "measured_turns": m.measured_turns,
-        // Σ output tokens and Σ generation time, and the rate over them.
-        "output_tokens": m.output_tokens,
-        "model_ms": m.model_ms,
-        "speed_tps": m.tps(),
-        // Mean TTFT over the measured turns.
-        "avg_ttft_ms": m.avg_ttft_ms(),
-        // Total tool time attributed inside the window.
-        "tool_wait_ms": m.tool_wait_ms(),
-        "tool_waits": m.tool_waits,
-        "recent": recent.iter().map(session_metrics_json).collect::<Vec<_>>(),
-    }))
+    // One shape for both: the current session is just the first entry of the
+    // same mapping, so a field added here cannot go missing from `recent`
+    // (which is how the two would silently drift apart).
+    let mut payload = session_metrics_json(&m);
+    let entries: Vec<Value> = recent.iter().map(session_metrics_json).collect();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("recent".to_string(), Value::Array(entries));
+    }
+    Ok(payload)
 }
 
 /// Shape one session aggregate for the GUI.
