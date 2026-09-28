@@ -1296,12 +1296,60 @@ pub async fn fetch_account(
     Ok(account)
 }
 
+/// The headers the billing resource endpoint requires for an account query.
+///
+/// Mirrors `wb_accounts.py::headers(purpose="billing")` in
+/// workbuddy2api-hub, which is the reference that proves this endpoint answers
+/// a login-state token: the billing gateway does **not** accept the bare
+/// `Bearer`+`X-API-Key` pairing a chat request uses — it wants the account's
+/// own identity headers (`X-User-Id`, `X-Domain`, `X-Enterprise-Id`…) present,
+/// or it answers 401 and the GUI shows "—" for a balance that exists.
+///
+/// `upstream_headers` supplies those identity headers from the same source the
+/// chat path uses, so both share one account fingerprint.
+fn billing_headers(cred: &WorkBuddyCredential) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        (
+            "Accept".to_string(),
+            "application/json, text/plain, */*".to_string(),
+        ),
+        ("X-Requested-With".to_string(), "XMLHttpRequest".to_string()),
+        ("Origin".to_string(), WORKBUDDY_BILLING_HOST.to_string()),
+        (
+            "Referer".to_string(),
+            format!("{}/", WORKBUDDY_BILLING_HOST),
+        ),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", cred.access_token),
+        ),
+        ("X-CodeBuddy-Request".to_string(), "1".to_string()),
+        ("Accept-Language".to_string(), "zh-CN".to_string()),
+    ];
+
+    // Per-account fingerprint, identical to the chat path's: X-User-Id,
+    // X-Machine-Id, X-Domain and the enterprise/tenant pair. The billing
+    // gateway answers 401 without them even though the token itself is valid —
+    // verified against the live endpoint (401 bare → 200 with headers).
+    for (name, value) in upstream_headers(cred) {
+        headers.push((name, value));
+    }
+
+    // A header the endpoint accepts in place of a tenant id.
+    if cred.account.enterprise_id.is_empty() {
+        headers.push(("X-No-Enterprise-Id".to_string(), "1".to_string()));
+    }
+
+    headers
+}
+
 /// Query the remaining points (积分) for one WorkBuddy credential.
 ///
 /// Hits the same billing resource endpoint `credits.rs` uses, but authorised
-/// with the credential's own access token, so each account reports its own
-/// balance. Returns `None` when the upstream cannot answer — the UI shows "—"
-/// rather than a misleading zero.
+/// with the credential's own access token and its account fingerprint, so each
+/// account reports its own balance. Returns `None` when the upstream cannot
+/// answer — the UI shows "—" rather than a misleading zero.
 pub async fn fetch_points(client: &reqwest::Client, cred: &WorkBuddyCredential) -> Option<f64> {
     if cred.access_token.is_empty() {
         return None;
@@ -1311,19 +1359,20 @@ pub async fn fetch_points(client: &reqwest::Client, cred: &WorkBuddyCredential) 
         WORKBUDDY_BILLING_HOST,
         crate::credits::WORKBUDDY_RESOURCE_PATH
     );
-    let resp = client
+
+    let mut req = client
         .post(&url)
-        .timeout(std::time::Duration::from_secs(20))
-        .header("Authorization", format!("Bearer {}", cred.access_token))
-        .header("X-API-Key", &cred.access_token)
-        .header("Content-Type", "application/json")
-        .header("X-Client-Platform", "web")
-        .header("Origin", WORKBUDDY_BILLING_HOST)
-        .header("Referer", format!("{}/profile/plans-usage", WORKBUDDY_BILLING_HOST))
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-        )
+        .timeout(std::time::Duration::from_secs(20));
+    for (name, value) in billing_headers(cred) {
+        if let (Ok(n), Ok(v)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            req = req.header(n, v);
+        }
+    }
+
+    let resp = req
         .json(&serde_json::json!({
             "PageNumber": 1,
             "PageSize": 100,
@@ -1335,6 +1384,11 @@ pub async fn fetch_points(client: &reqwest::Client, cred: &WorkBuddyCredential) 
         .ok()?;
 
     if !resp.status().is_success() {
+        tracing::warn!(
+            "points query for {} returned {}: balance shown as unknown",
+            cred.id,
+            resp.status()
+        );
         return None;
     }
     let body = resp.text().await.ok()?;
@@ -1343,6 +1397,11 @@ pub async fn fetch_points(client: &reqwest::Client, cred: &WorkBuddyCredential) 
     // A business error is not a balance; reporting 0 would read as exhausted.
     if let Some(code) = value.get("code").and_then(|c| c.as_i64()) {
         if code != 0 {
+            tracing::warn!(
+                "points query for {} returned business code {}: balance shown as unknown",
+                cred.id,
+                code
+            );
             return None;
         }
     }
@@ -1857,6 +1916,76 @@ mod tests {
         assert_eq!(tail, "en 文", "tail must be the last 4 characters");
         // 4 chars + separator + 4 chars.
         assert_eq!(masked.chars().count(), 12, "got: {masked}");
+    }
+
+    /// The billing resource endpoint requires the account's own identity
+    /// headers. Verified against the live endpoint (2026-09-28): the bare
+    /// `Bearer`+`X-API-Key` pairing a chat request uses answers
+    /// `401 {"message":"not_found"}`, while the same token with
+    /// `X-User-Id`/`X-Machine-Id`/`X-Domain` present answers 200 with the real
+    /// balance. Losing one of these headers is how the 剩余积分 card came to
+    /// show "—" for a balance that exists.
+    #[test]
+    fn billing_headers_carry_the_account_fingerprint() {
+        let cred = WorkBuddyCredential {
+            id: "wb-abc123".to_string(),
+            access_token: "token-1".to_string(),
+            machine_id: "machine-9".to_string(),
+            domain: "www.codebuddy.cn".to_string(),
+            account: WorkBuddyAccount {
+                uid: "uid-77".to_string(),
+                enterprise_id: "ent-5".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut headers = billing_headers(&cred);
+        headers.sort();
+
+        let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
+        let value = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+
+        // The identity fingerprint the gateway checks.
+        assert_eq!(value("X-User-Id"), "uid-77");
+        assert_eq!(value("X-Machine-Id"), "machine-9");
+        assert_eq!(value("X-Domain"), "www.codebuddy.cn");
+        assert_eq!(value("X-Enterprise-Id"), "ent-5");
+        assert_eq!(value("X-Tenant-Id"), "ent-5");
+        // The token must travel as the bearer, and the billing-specific flags
+        // must be present.
+        assert_eq!(value("Authorization"), "Bearer token-1");
+        assert!(has("X-CodeBuddy-Request"));
+        // An enterprise id present means the no-enterprise fallback is absent.
+        assert!(!has("X-No-Enterprise-Id"));
+        // The chat path's X-API-Key pairing has no place here: the credential's
+        // token is not an API key.
+        assert!(!has("X-API-Key"));
+    }
+
+    /// Without a tenant id the fallback header is sent instead.
+    #[test]
+    fn billing_headers_fall_back_when_no_enterprise_id() {
+        let cred = WorkBuddyCredential {
+            access_token: "t".to_string(),
+            ..Default::default()
+        };
+        let headers = billing_headers(&cred);
+        assert!(
+            headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("X-No-Enterprise-Id")),
+            "no enterprise id must trigger the fallback header"
+        );
+        assert!(!headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("X-Enterprise-Id")),);
     }
 
     /// Short and empty secrets stay fully masked rather than panicking on an
