@@ -186,6 +186,79 @@ async fn get_stats(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     }))
 }
 
+/// How many recent conversations the speed panel compares.
+const RECENT_SESSIONS: usize = 3;
+
+/// Speed metrics for the most recently active conversation.
+///
+/// Backs the overview's 输出速度 card and its drill-down. Scoped to one session
+/// and **aggregated over its recent turns** (see `StatsDb::query_session_metrics`):
+/// a per-turn figure swings too much to read, so the card shows the session's
+/// time-weighted rate instead — summed tokens over summed generation time.
+///
+/// `recent` carries the same aggregate for the last [`RECENT_SESSIONS`]
+/// conversations so the panel can compare them side by side.
+///
+/// `speed_tps` is `null` unless at least one turn in the window was actually
+/// measurable — an unmeasured turn (a plain non-streamed reply, or a request
+/// served before this feature existed) must render as `—`, not as a fabricated
+/// number.
+#[tauri::command]
+async fn get_session_metrics(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    let stats = ctx.stats.clone();
+    // Blocking SQLite work off the async runtime, same as `get_stats`.
+    let (m, recent) = tauri::async_runtime::spawn_blocking(move || {
+        let latest = stats.query_latest_session_metrics()?;
+        let recent = stats.query_recent_session_metrics(RECENT_SESSIONS)?;
+        Ok::<_, anyhow::Error>((latest, recent))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "session_id": m.session_id,
+        // The model of the latest turn is context, not the session's identity;
+        // the panel's 当前会话 row shows the id.
+        "model": m.model,
+        "last_at": m.last_at,
+        // How many turns the aggregate covers, and how many were measurable.
+        "turns": m.turns,
+        "measured_turns": m.measured_turns,
+        // Σ output tokens and Σ generation time, and the rate over them.
+        "output_tokens": m.output_tokens,
+        "model_ms": m.model_ms,
+        "speed_tps": m.tps(),
+        // Mean TTFT over the measured turns.
+        "avg_ttft_ms": m.avg_ttft_ms(),
+        // Total tool time attributed inside the window.
+        "tool_wait_ms": m.tool_wait_ms(),
+        "tool_waits": m.tool_waits,
+        "recent": recent.iter().map(session_metrics_json).collect::<Vec<_>>(),
+    }))
+}
+
+/// Shape one session aggregate for the GUI.
+///
+/// Shared with the `recent` list so the current row and the comparison rows are
+/// built by the same code — a second hand-rolled mapping is how the two would
+/// drift apart.
+fn session_metrics_json(m: &proxy_rs::stats::SessionMetrics) -> Value {
+    json!({
+        "session_id": m.session_id,
+        "model": m.model,
+        "last_at": m.last_at,
+        "turns": m.turns,
+        "measured_turns": m.measured_turns,
+        "output_tokens": m.output_tokens,
+        "model_ms": m.model_ms,
+        "speed_tps": m.tps(),
+        "avg_ttft_ms": m.avg_ttft_ms(),
+        "tool_wait_ms": m.tool_wait_ms(),
+        "tool_waits": m.tool_waits,
+    })
+}
+
 /// Run a fire-and-forget task under supervision, so its death is visible.
 ///
 /// The two long-lived background tasks (the proxy listener and the daily
@@ -1635,6 +1708,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_stats,
+            get_session_metrics,
             start_service,
             stop_service,
             get_logs,

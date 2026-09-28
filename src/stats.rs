@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -21,6 +21,46 @@ pub struct TokenRecord {
     pub output: i64,
 }
 
+/// Upstream-side timings for one request, all relative to the moment the
+/// winning upstream attempt was sent.
+///
+/// These are what make TTFT / TPS / tool-wait measurable. Everything defaults
+/// to zero, which means "not observable on this path" — a plain non-streamed
+/// JSON response never exposes a first-token instant, so its TTFT stays 0 and
+/// the UI renders `—` rather than a fabricated number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpstreamTiming {
+    /// Milliseconds from sending the upstream request to the first output
+    /// delta (first content token, or the first tool-call delta on a turn that
+    /// opens with a tool call). 0 when it could not be observed.
+    pub ttft_ms: i64,
+    /// Milliseconds from sending the upstream request to the *last* output
+    /// delta: the model's own generation span.
+    ///
+    /// Deliberately not the request duration. A streaming generator is pulled
+    /// by the client, so the request also contains however long the client sat
+    /// on the final chunk; measuring to the last delta is what keeps this a
+    /// property of the model rather than of the client.
+    pub model_ms: i64,
+    /// Whether the turn ended by asking for a tool call.
+    ///
+    /// The proxy never runs tools — the client does, and reports back in a
+    /// later request on the same session. This flag is what lets the session
+    /// query attribute the *gap* between those two requests to tool execution.
+    pub ended_with_tool_call: bool,
+}
+
+impl UpstreamTiming {
+    /// Tokens per second over the model's own generation span, or `None` when
+    /// either half is missing (no tokens, or no observable span).
+    pub fn tps(&self, output_tokens: i64) -> Option<f64> {
+        if output_tokens <= 0 || self.model_ms <= 0 {
+            return None;
+        }
+        Some(output_tokens as f64 * 1000.0 / self.model_ms as f64)
+    }
+}
+
 /// Everything captured about one completed request for the stats DB.
 #[derive(Debug, Clone)]
 pub struct RequestOutcome<'a> {
@@ -30,6 +70,8 @@ pub struct RequestOutcome<'a> {
     pub route: &'a str,
     pub tokens: &'a TokenRecord,
     pub duration_ms: i64,
+    /// Upstream TTFT / model span / tool-terminated flag (see [`UpstreamTiming`]).
+    pub timing: UpstreamTiming,
     pub streamed: bool,
     /// HTTP status returned to the client.
     pub status: u16,
@@ -65,6 +107,9 @@ impl RequestOutcome<'_> {
             cache_read_tokens: self.tokens.cache_read,
             cache_write_tokens: self.tokens.cache_write,
             duration_ms: self.duration_ms,
+            ttft_ms: self.timing.ttft_ms,
+            model_ms: self.timing.model_ms,
+            ended_with_tool_call: self.timing.ended_with_tool_call,
             streamed: self.streamed,
             status: self.status,
             error: self.error.map(|e| e.to_string()),
@@ -89,6 +134,12 @@ struct RequestRow {
     cache_read_tokens: i64,
     cache_write_tokens: i64,
     duration_ms: i64,
+    /// Milliseconds to first output delta (0 = not observable on this path).
+    ttft_ms: i64,
+    /// Milliseconds from send to last output delta (0 = not observable).
+    model_ms: i64,
+    /// Whether the turn finished by requesting a tool call.
+    ended_with_tool_call: bool,
     streamed: bool,
     status: u16,
     error: Option<String>,
@@ -104,9 +155,10 @@ impl RequestRow {
         "INSERT INTO request_logs (
             date, created_at, model, route,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-            duration_ms, streamed, status, error, session_id, client,
+            duration_ms, ttft_ms, model_ms, ended_with_tool_call,
+            streamed, status, error, session_id, client,
             override_key, override_model, override_reason
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
     }
 
     fn bind_to(&self, stmt: &mut rusqlite::Statement<'_>) -> rusqlite::Result<()> {
@@ -120,6 +172,9 @@ impl RequestRow {
             self.cache_read_tokens,
             self.cache_write_tokens,
             self.duration_ms,
+            self.ttft_ms,
+            self.model_ms,
+            if self.ended_with_tool_call { 1 } else { 0 },
             if self.streamed { 1 } else { 0 },
             self.status as i64,
             self.error,
@@ -145,6 +200,14 @@ pub struct RequestLogItem {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub duration_ms: i64,
+    /// Milliseconds from upstream send to the first output delta; 0 when the
+    /// path could not observe one (a plain non-streamed JSON response).
+    pub ttft_ms: i64,
+    /// Milliseconds from upstream send to the last output delta: the model's own
+    /// generation span, excluding how long the client then sat on the stream.
+    pub model_ms: i64,
+    /// Whether the turn finished by requesting a tool call.
+    pub ended_with_tool_call: bool,
     pub streamed: bool,
     pub status: u16,
     pub error: Option<String>,
@@ -199,8 +262,232 @@ pub struct RequestLogsResult {
     pub sessions: Vec<RequestLogSession>,
 }
 
-/// Aggregated statistics for a single calendar day.
+/// One completed upstream turn within a session, as the speed card needs it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTurn {
+    pub id: i64,
+    pub created_at: String,
+    pub model: String,
+    pub output_tokens: i64,
+    /// End-to-end request duration (includes the client's read tail).
+    pub duration_ms: i64,
+    pub ttft_ms: i64,
+    /// The model's own generation span (send → last output delta).
+    pub model_ms: i64,
+    pub ended_with_tool_call: bool,
+}
+
+impl SessionTurn {
+    /// Whether this turn contributed a real generation span.
+    ///
+    /// An unmeasured row (a plain non-streamed reply, or one served before
+    /// timing existed) has `model_ms == 0` and must not be counted as a zero-
+    /// length generation — that would drag the session's speed to zero.
+    pub fn is_measured(&self) -> bool {
+        self.model_ms > 0
+    }
+
+    /// Output speed over the model's generation span. `None` when unmeasurable.
+    pub fn tps(&self) -> Option<f64> {
+        if self.output_tokens <= 0 || self.model_ms <= 0 {
+            return None;
+        }
+        Some(self.output_tokens as f64 * 1000.0 / self.model_ms as f64)
+    }
+}
+
+/// Hard cap on how many recent turns one session aggregate folds in.
 ///
+/// The aggregate is a cumulative rate, so it is deliberately windowed rather
+/// than unbounded: an all-time figure would stop responding to the session
+/// getting faster or slower, while a single-turn figure jitters wildly. 3000
+/// turns is far beyond any real conversation's useful memory while keeping the
+/// query's work bounded.
+pub const SESSION_METRICS_MAX_TURNS: i64 = 3000;
+
+/// Session-level speed metrics, backing the overview's 输出速度 card.
+///
+/// **Aggregated over the session's recent turns, not the latest one.** A single
+/// turn's speed swings by an order of magnitude (a short reply spends most of
+/// its span in the first-token gap), so the card used to change on every poll.
+/// Aggregating fixes that the correct way for a *rate*: sum the output tokens and
+/// sum the generation time, then divide once.
+///
+/// ```text
+///   tps = Σ output_tokens / Σ model_ms
+/// ```
+///
+/// That is a time-weighted mean. Averaging the per-turn `tok/s` values instead
+/// would be wrong: it would let a 3-token reply and a 3000-token reply count
+/// equally.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionMetrics {
+    pub session_id: String,
+    /// Turns folded in (≤ [`SESSION_METRICS_MAX_TURNS`]).
+    pub turns: i64,
+    /// How many of those carried a real generation span.
+    pub measured_turns: i64,
+    /// Model of the most recent turn, for the panel.
+    pub model: Option<String>,
+    /// When the most recent turn finished.
+    pub last_at: Option<String>,
+    /// Σ output tokens, over measured turns only.
+    pub output_tokens: i64,
+    /// Σ model generation span (ms), over measured turns only.
+    pub model_ms: i64,
+    /// Σ measured TTFTs (ms) and how many were measured, for the average.
+    pub ttft_sum_ms: i64,
+    pub ttft_samples: i64,
+    /// Σ tool wait (ms) attributed within this window, and how many gaps.
+    pub tool_wait_ms: i64,
+    pub tool_waits: i64,
+}
+
+impl SessionMetrics {
+    /// Session output speed: total tokens over total generation time.
+    /// `None` when nothing in the window was measurable.
+    pub fn tps(&self) -> Option<f64> {
+        if self.output_tokens <= 0 || self.model_ms <= 0 {
+            return None;
+        }
+        Some(self.output_tokens as f64 * 1000.0 / self.model_ms as f64)
+    }
+
+    /// Mean TTFT across the measured turns, or `None` when none was measured.
+    pub fn avg_ttft_ms(&self) -> Option<i64> {
+        if self.ttft_samples <= 0 {
+            return None;
+        }
+        Some(self.ttft_sum_ms / self.ttft_samples)
+    }
+
+    /// Total tool time attributed in the window, or `None` when no tool gap was
+    /// observable (so the panel shows "—" rather than a bare 0).
+    pub fn tool_wait_ms(&self) -> Option<i64> {
+        if self.tool_waits <= 0 {
+            return None;
+        }
+        Some(self.tool_wait_ms)
+    }
+}
+
+/// Fold a session's turns (oldest first) into one aggregate.
+///
+/// Pure and separate from the query so the weighting rules are unit-testable
+/// without a database.
+///
+/// Tool time is accumulated only where a tool-requesting turn is immediately
+/// followed by another turn in the same session — see [`tool_wait_ms`] for why
+/// the arithmetic subtracts the follower's own duration, and why an implausible
+/// or negative gap counts as no measurement rather than as zero.
+fn fold_session_turns(session_id: &str, turns: &[SessionTurn]) -> SessionMetrics {
+    let mut metrics = SessionMetrics {
+        session_id: session_id.to_string(),
+        turns: turns.len() as i64,
+        ..Default::default()
+    };
+
+    let mut previous: Option<&SessionTurn> = None;
+    for turn in turns {
+        if turn.is_measured() {
+            metrics.measured_turns += 1;
+            metrics.output_tokens += turn.output_tokens;
+            metrics.model_ms += turn.model_ms;
+        }
+        if turn.ttft_ms > 0 {
+            metrics.ttft_samples += 1;
+            metrics.ttft_sum_ms += turn.ttft_ms;
+        }
+        if let Some(prev) = previous {
+            if prev.ended_with_tool_call {
+                if let Some(gap) =
+                    tool_wait_ms(&prev.created_at, &turn.created_at, turn.duration_ms)
+                {
+                    metrics.tool_wait_ms += gap;
+                    metrics.tool_waits += 1;
+                }
+            }
+        }
+        previous = Some(turn);
+    }
+
+    if let Some(last) = turns.last() {
+        metrics.model = Some(last.model.clone());
+        metrics.last_at = Some(last.created_at.clone());
+    }
+
+    metrics
+}
+
+/// Milliseconds the client spent running tools, derived from the gap between a
+/// tool-requesting turn and its successor.
+///
+/// Both `created_at` values are stamped when the row is *written* — i.e. at the
+/// **end** of each request, not its start (verified against the running app: a
+/// request that took 1.3 s was stamped as it completed). So the raw difference
+/// between the two stamps is *not* the tool wait; it also contains the current
+/// turn's own duration. Subtracting that duration backs out the moment this turn
+/// began, which is what puts the gap on the client:
+///
+/// ```text
+///   tool wait = (cur_end - prev_end) - cur_duration
+///             = cur_start - prev_end
+/// ```
+///
+/// Timestamps are stored at second granularity, so the result is accurate to
+/// about a second — fine for a tool that takes seconds to minutes, and the UI
+/// shows one decimal.
+///
+/// Returns `None` when either timestamp is unparseable or the result is negative
+/// or implausibly large: a session resumed hours later must not present as hours
+/// of tool execution, which would be a worse lie than showing nothing.
+fn tool_wait_ms(prev_at: &str, cur_at: &str, cur_duration_ms: i64) -> Option<i64> {
+    /// Above this, a "tool call" is really a paused/resumed conversation.
+    const MAX_PLAUSIBLE_TOOL_WAIT_MS: i64 = 10 * 60 * 1000;
+
+    let prev_end = parse_local_datetime_secs(prev_at)?;
+    let cur_end = parse_local_datetime_secs(cur_at)?;
+    let wait = (cur_end - prev_end) * 1000 - cur_duration_ms.max(0);
+    if !(0..=MAX_PLAUSIBLE_TOOL_WAIT_MS).contains(&wait) {
+        return None;
+    }
+    Some(wait)
+}
+
+/// Parse the stats DB's local `YYYY-MM-DD HH:MM:SS` stamp into epoch seconds.
+///
+/// Deliberately hand-rolled: the column is written by this module in one fixed
+/// local-time format, and pulling in a date-time crate (or re-deriving the UTC
+/// offset, which can have changed between the two rows across a DST boundary)
+/// would add a dependency for one subtraction. Two timestamps in the same local
+/// format differ by the same amount as the instants they denote.
+fn parse_local_datetime_secs(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let year: i64 = value.get(0..4)?.parse().ok()?;
+    let month: i64 = value.get(5..7)?.parse().ok()?;
+    let day: i64 = value.get(8..10)?.parse().ok()?;
+    let hour: i64 = value.get(11..13)?.parse().ok()?;
+    let min: i64 = value.get(14..16)?.parse().ok()?;
+    let sec: i64 = value.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Days since the Unix epoch, proleptic Gregorian — enough for the 1970+ and
+    // 2100- ranges this table can hold.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86_400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Aggregated statistics for a single calendar day.
 /// Derived on demand from `request_logs` — there is no separate daily table, so
 /// the counters can never drift out of sync with the rows they summarize.
 #[derive(Debug, Clone, Default)]
@@ -439,6 +726,9 @@ impl StatsDb {
                 cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
                 cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
                 duration_ms         INTEGER NOT NULL DEFAULT 0,
+                ttft_ms             INTEGER NOT NULL DEFAULT 0,
+                model_ms            INTEGER NOT NULL DEFAULT 0,
+                ended_with_tool_call INTEGER NOT NULL DEFAULT 0,
                 streamed            INTEGER NOT NULL DEFAULT 0,
                 status              INTEGER NOT NULL DEFAULT 0,
                 error               TEXT,
@@ -511,6 +801,26 @@ impl StatsDb {
               WHERE date IS NULL OR date = ''",
             [],
         )?;
+
+        // Upstream timings arrived with the overview's output-speed card. The
+        // loop above only handles TEXT columns, so these get their own numeric
+        // pass; old rows keep 0, which the UI renders as "unknown" rather than
+        // inventing a speed for requests we never measured.
+        for column in ["ttft_ms", "model_ms", "ended_with_tool_call"] {
+            let exists = conn
+                .prepare("PRAGMA table_info(request_logs)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .flatten()
+                .any(|col| col == column);
+            if !exists {
+                conn.execute(
+                    &format!(
+                        "ALTER TABLE request_logs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    ),
+                    [],
+                )?;
+            }
+        }
 
         // daily_stats is now derived from request_logs on demand.
         conn.execute_batch("DROP TABLE IF EXISTS daily_stats;")?;
@@ -673,7 +983,8 @@ impl StatsDb {
         let query_sql = format!(
             "SELECT id, created_at, model, route,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    duration_ms, streamed, status, error, session_id, client,
+                    duration_ms, ttft_ms, model_ms, ended_with_tool_call,
+                    streamed, status, error, session_id, client,
                     override_key, override_model, override_reason
              FROM request_logs
              {}
@@ -690,8 +1001,9 @@ impl StatsDb {
 
         let mut stmt = conn.prepare(&query_sql)?;
         let items_iter = stmt.query_map(rusqlite::params_from_iter(query_params), |row| {
-            let streamed_int: i64 = row.get(9)?;
-            let status_int: i64 = row.get(10)?;
+            let streamed_int: i64 = row.get(12)?;
+            let status_int: i64 = row.get(13)?;
+            let tool_int: i64 = row.get(11)?;
             Ok(RequestLogItem {
                 id: row.get(0)?,
                 created_at: row.get(1)?,
@@ -702,14 +1014,17 @@ impl StatsDb {
                 cache_read_tokens: row.get(6)?,
                 cache_write_tokens: row.get(7)?,
                 duration_ms: row.get(8)?,
+                ttft_ms: row.get(9)?,
+                model_ms: row.get(10)?,
+                ended_with_tool_call: tool_int != 0,
                 streamed: streamed_int != 0,
                 status: status_int as u16,
-                error: row.get(11)?,
-                session_id: row.get(12)?,
-                client: row.get(13)?,
-                override_key: row.get(14)?,
-                override_model: row.get(15)?,
-                override_reason: row.get(16)?,
+                error: row.get(14)?,
+                session_id: row.get(15)?,
+                client: row.get(16)?,
+                override_key: row.get(17)?,
+                override_model: row.get(18)?,
+                override_reason: row.get(19)?,
             })
         })?;
 
@@ -735,6 +1050,134 @@ impl StatsDb {
         let handle = self.read_conn();
         handle.get().execute("DELETE FROM request_logs", [])?;
         Ok(())
+    }
+
+    /// The conversation the overview's speed card should describe: the one whose
+    /// newest request is the most recent in the database.
+    ///
+    /// A session with no id (unidentified client) is not a conversation, so it
+    /// never wins here — the card would otherwise describe an anonymous request
+    /// that cannot be followed up.
+    pub fn latest_session_id(&self) -> Result<Option<String>> {
+        let handle = self.read_conn();
+        let id = handle
+            .get()
+            .query_row(
+                "SELECT session_id FROM request_logs
+                  WHERE session_id != ''
+                  ORDER BY id DESC
+                  LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    /// Metrics for the most recently active conversation.
+    ///
+    /// Convenience wrapper over [`Self::latest_session_id`] +
+    /// [`Self::query_session_metrics`] so the GUI makes one round-trip.
+    pub fn query_latest_session_metrics(&self) -> Result<SessionMetrics> {
+        match self.latest_session_id()? {
+            Some(id) => self.query_session_metrics(&id),
+            None => Ok(SessionMetrics::default()),
+        }
+    }
+
+    /// Per-session aggregates for the `limit` most recently active conversations,
+    /// newest first — the overview's speed panel compares them side by side.
+    ///
+    /// Each row is folded exactly like [`Self::query_session_metrics`] (same
+    /// window cap, same weighting), so a session's figure does not change
+    /// depending on which query produced it.
+    ///
+    /// Only identified sessions appear: an empty `session_id` is not a
+    /// conversation and cannot be compared with one.
+    pub fn query_recent_session_metrics(&self, limit: usize) -> Result<Vec<SessionMetrics>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // One handle for the whole method. Calling `query_session_metrics` per id
+        // would acquire a *second* handle inside the first — an in-memory
+        // database shares a single `Mutex<Connection>`, so that self-deadlocks
+        // (and it is the GUI's fallback database when the real file cannot be
+        // opened, so this is not a test-only hazard).
+        let handle = self.read_conn();
+        let conn = handle.get();
+
+        let mut stmt = conn.prepare(
+            "SELECT session_id FROM request_logs
+              WHERE session_id != ''
+              GROUP BY session_id
+              ORDER BY MAX(id) DESC
+              LIMIT ?1",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(Self::fold_session_on(conn, &id)?);
+        }
+        Ok(out)
+    }
+
+    /// Session-level speed metrics for the overview's 输出速度 card.
+    ///
+    /// Folds the session's most recent [`SESSION_METRICS_MAX_TURNS`] turns into
+    /// one time-weighted aggregate (see [`SessionMetrics`]) so the figure is
+    /// stable instead of changing with every turn.
+    ///
+    /// The window is taken **newest-first** by `id` and then reversed, so the cap
+    /// always keeps the *recent* turns — the conversation's live behaviour —
+    /// rather than the oldest ones.
+    ///
+    /// Tool time is summed across the window: the proxy never executes tools (the
+    /// client does, then reports back in a later request), so the gap between a
+    /// tool-requesting turn and its successor is the only observable tool time.
+    pub fn query_session_metrics(&self, session_id: &str) -> Result<SessionMetrics> {
+        if session_id.is_empty() {
+            return Ok(SessionMetrics::default());
+        }
+        let handle = self.read_conn();
+        Self::fold_session_on(handle.get(), session_id)
+    }
+
+    /// Read one session's window from `conn` and fold it.
+    ///
+    /// Takes the connection rather than acquiring its own so callers can reuse a
+    /// single handle for many sessions (see `query_recent_session_metrics`).
+    fn fold_session_on(conn: &Connection, session_id: &str) -> Result<SessionMetrics> {
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at, model, output_tokens, duration_ms,
+                    ttft_ms, model_ms, ended_with_tool_call
+               FROM request_logs
+              WHERE session_id = ?1
+              ORDER BY id DESC
+              LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, SESSION_METRICS_MAX_TURNS], |row| {
+            let tool_int: i64 = row.get(7)?;
+            Ok(SessionTurn {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                model: row.get(2)?,
+                output_tokens: row.get(3)?,
+                duration_ms: row.get(4)?,
+                ttft_ms: row.get(5)?,
+                model_ms: row.get(6)?,
+                ended_with_tool_call: tool_int != 0,
+            })
+        })?;
+
+        // Newest-first from SQL (so LIMIT keeps the recent end); the fold reads
+        // chronologically, which is what makes "previous turn" meaningful.
+        let mut turns: Vec<SessionTurn> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        turns.reverse();
+
+        Ok(fold_session_turns(session_id, &turns))
     }
 
     /// Return statistics for today (local date). Returns a zeroed `DayStats`
@@ -904,6 +1347,7 @@ mod tests {
             route,
             tokens,
             duration_ms: 1250,
+            timing: UpstreamTiming::default(),
             streamed,
             status,
             error,
@@ -913,6 +1357,592 @@ mod tests {
             override_model: "",
             override_reason: "",
         }
+    }
+
+    /// The tool wait is measured on the client, not swallowed by this turn's own
+    /// duration.
+    ///
+    /// Both stamps are row-*write* times (end of each turn), so the raw gap also
+    /// contains the current turn's duration and must be backed out. Getting this
+    /// wrong inflates every tool wait by the length of the following request.
+    #[test]
+    fn tool_wait_excludes_the_current_turns_own_duration() {
+        // Prev turn ended at 10:00:00. This turn ended at 10:00:20 having taken
+        // 5 s, so it began at 10:00:15 → the client spent 15 s running the tool.
+        let wait = tool_wait_ms("2026-09-28 10:00:00", "2026-09-28 10:00:20", 5_000);
+        assert_eq!(wait, Some(15_000), "20s gap minus this turn's own 5s");
+
+        // Same stamps, a turn that took the whole 20 s: the client did not wait.
+        assert_eq!(
+            tool_wait_ms("2026-09-28 10:00:00", "2026-09-28 10:00:20", 20_000),
+            Some(0)
+        );
+
+        // A gap shorter than the turn itself is a clock/estimation artifact, not
+        // a negative tool wait: report nothing rather than a nonsense value.
+        assert_eq!(
+            tool_wait_ms("2026-09-28 10:00:00", "2026-09-28 10:00:01", 30_000),
+            None
+        );
+
+        // Resumed much later: not tool execution.
+        assert_eq!(
+            tool_wait_ms("2026-09-28 10:00:00", "2026-09-28 12:00:00", 1_000),
+            None
+        );
+
+        // Unparseable stamps yield nothing instead of a fabricated number.
+        assert_eq!(tool_wait_ms("nonsense", "2026-09-28 10:00:20", 0), None);
+        assert_eq!(tool_wait_ms("2026-09-28 10:00:00", "", 0), None);
+
+        // Timestamps are whole seconds, so a sub-second turn inside the same
+        // second backs out to a real (small) wait rather than a negative one.
+        assert_eq!(
+            tool_wait_ms("2026-09-28 10:00:00", "2026-09-28 10:00:02", 1_500),
+            Some(500)
+        );
+        // ...and a turn that fills its own second lands on exactly zero.
+        assert_eq!(
+            tool_wait_ms("2026-09-28 10:00:00", "2026-09-28 10:00:02", 2_000),
+            Some(0)
+        );
+    }
+
+    /// The timestamps in the DB are local wall-clock, and a plain subtraction of
+    /// two of them is the elapsed time between them regardless of the UTC offset.
+    #[test]
+    fn local_datetime_parsing_is_monotonic_across_a_day_boundary() {
+        let a = parse_local_datetime_secs("2026-09-28 23:59:59").unwrap();
+        let b = parse_local_datetime_secs("2026-09-29 00:00:01").unwrap();
+        assert_eq!(b - a, 2, "crossing midnight adds two seconds");
+
+        // A leap day parses, so the day-count arithmetic is not off by one.
+        let feb28 = parse_local_datetime_secs("2028-02-28 00:00:00").unwrap();
+        let mar1 = parse_local_datetime_secs("2028-03-01 00:00:00").unwrap();
+        assert_eq!(mar1 - feb28, 2 * 86_400, "2028 is a leap year");
+    }
+
+    #[test]
+    fn upstream_timings_round_trip_and_yield_tps() {
+        let db = StatsDb::in_memory().unwrap();
+        let tokens = TokenRecord {
+            output: 600,
+            ..Default::default()
+        };
+        let mut o = outcome("hy3", "/v1/messages", &tokens, 200, None, true);
+        o.duration_ms = 9_000;
+        o.timing = UpstreamTiming {
+            ttft_ms: 320,
+            model_ms: 3_000,
+            ended_with_tool_call: true,
+        };
+        let _ = db.record_request_log(o);
+
+        let res = db
+            .query_request_logs(&RequestLogFilter {
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        let item = &res.items[0];
+        assert_eq!(item.ttft_ms, 320);
+        assert_eq!(item.model_ms, 3_000);
+        assert!(item.ended_with_tool_call);
+
+        // 600 tokens over the 3 s model span, NOT over the 9 s request.
+        let tps = UpstreamTiming {
+            ttft_ms: item.ttft_ms,
+            model_ms: item.model_ms,
+            ended_with_tool_call: item.ended_with_tool_call,
+        }
+        .tps(item.output_tokens)
+        .expect("measurable");
+        assert!((tps - 200.0).abs() < 0.001, "got {tps}");
+
+        // An unmeasured span yields no speed rather than a fabricated zero.
+        assert_eq!(
+            UpstreamTiming {
+                ttft_ms: 0,
+                model_ms: 0,
+                ended_with_tool_call: false,
+            }
+            .tps(600),
+            None
+        );
+        assert_eq!(
+            UpstreamTiming {
+                ttft_ms: 0,
+                model_ms: 1_000,
+                ended_with_tool_call: false,
+            }
+            .tps(0),
+            None,
+            "no output tokens means no speed"
+        );
+    }
+
+    /// An older database gains the numeric timing columns instead of failing to
+    /// open — and old rows read back as 0 ("unknown"), never as a real speed.
+    #[test]
+    fn migration_adds_the_timing_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE request_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                model TEXT NOT NULL,
+                route TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 60,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                streamed INTEGER NOT NULL DEFAULT 0,
+                status INTEGER NOT NULL DEFAULT 0,
+                error TEXT
+             );
+             INSERT INTO request_logs (created_at, model, route, output_tokens, status)
+             VALUES ('2026-09-22 10:00:00', 'hy3', '/v1/messages', 60, 200);",
+        )
+        .unwrap();
+
+        StatsDb::init_schema(&conn).unwrap();
+
+        let db = StatsDb::from_conn(conn);
+        let item = db
+            .query_request_logs(&RequestLogFilter::default())
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .expect("the legacy row survives the migration");
+        assert_eq!(item.ttft_ms, 0, "legacy row has no measurable TTFT");
+        assert_eq!(item.model_ms, 0, "legacy row has no measurable span");
+        assert!(!item.ended_with_tool_call);
+    }
+
+    /// The session aggregate sums tokens and time, and attributes tool time
+    /// across the window.
+    ///
+    /// This is the property that makes the card stable: two turns at very
+    /// different speeds must combine into one time-weighted rate, not the
+    /// latest turn's (jittery) figure.
+    #[test]
+    fn session_metrics_aggregate_tokens_over_time() {
+        let db = StatsDb::in_memory().unwrap();
+
+        // Turn 1: 500 tokens over 1 s (fast), ends 10:00:00, asks for a tool.
+        insert_turn(
+            &db,
+            "claude:s1",
+            "2026-09-28 10:00:00",
+            3_000,
+            200,
+            1_000,
+            500,
+            true,
+        );
+        // Turn 2: 100 tokens over 3 s (slow), ends 10:00:20 having taken 5 s.
+        insert_turn(
+            &db,
+            "claude:s1",
+            "2026-09-28 10:00:20",
+            5_000,
+            400,
+            3_000,
+            100,
+            false,
+        );
+
+        let m = db.query_session_metrics("claude:s1").unwrap();
+        assert_eq!(m.turns, 2);
+        assert_eq!(m.measured_turns, 2);
+        assert_eq!(m.output_tokens, 600, "tokens sum");
+        assert_eq!(m.model_ms, 4_000, "generation time sums");
+
+        // Time-weighted: 600 / 4 s = 150 tok/s. Averaging the two per-turn rates
+        // would give (500 + 33.3)/2 ≈ 267 — wrong, because it would let a
+        // 100-token reply count as much as a 500-token one.
+        let tps = m.tps().expect("measurable");
+        assert!((tps - 150.0).abs() < 0.001, "600 tokens / 4s, got {tps}");
+
+        // Mean TTFT across both measured turns: (200 + 400) / 2.
+        assert_eq!(m.avg_ttft_ms(), Some(300));
+
+        // Turn 1 asked for a tool; the gap to turn 2's start is 20 s minus
+        // turn 2's own 5 s = 15 s.
+        assert_eq!(m.tool_wait_ms(), Some(15_000));
+        assert_eq!(m.tool_waits, 1);
+
+        // The panel's context fields describe the newest turn.
+        assert_eq!(m.model.as_deref(), Some("hy3"));
+        assert_eq!(m.last_at.as_deref(), Some("2026-09-28 10:00:20"));
+
+        // An unknown session yields an empty result rather than an error.
+        let empty = db.query_session_metrics("nobody").unwrap();
+        assert_eq!(empty.turns, 0);
+        assert_eq!(empty.tps(), None);
+        assert_eq!(empty.avg_ttft_ms(), None);
+        assert_eq!(empty.tool_wait_ms(), None);
+        assert_eq!(db.query_session_metrics("").unwrap().turns, 0);
+    }
+
+    /// Unmeasured turns do not drag the aggregate down.
+    ///
+    /// A legacy row or a plain non-streamed reply has `model_ms == 0`. Counting
+    /// it would add zero time *and* whatever tokens it reports, wildly inflating
+    /// the rate; it must be excluded from both sums while still being counted as
+    /// a turn.
+    #[test]
+    fn session_metrics_exclude_unmeasured_turns_from_the_rate() {
+        let db = StatsDb::in_memory().unwrap();
+
+        // Measured: 400 tokens over 2 s.
+        insert_turn(
+            &db,
+            "claude:s4",
+            "2026-09-28 11:00:00",
+            2_500,
+            100,
+            2_000,
+            400,
+            false,
+        );
+        // Unmeasured: no span at all, but a large token count that must not count.
+        insert_turn(
+            &db,
+            "claude:s4",
+            "2026-09-28 11:00:10",
+            500,
+            0,
+            0,
+            9_999,
+            false,
+        );
+
+        let m = db.query_session_metrics("claude:s4").unwrap();
+        assert_eq!(m.turns, 2, "both rows are turns");
+        assert_eq!(m.measured_turns, 1, "only one carried a span");
+        assert_eq!(
+            m.output_tokens, 400,
+            "the unmeasured row's tokens are excluded"
+        );
+        assert_eq!(m.model_ms, 2_000);
+        let tps = m.tps().expect("measurable");
+        assert!((tps - 200.0).abs() < 0.001, "400 / 2s, got {tps}");
+        // Its zero TTFT is not a sample either.
+        assert_eq!(m.avg_ttft_ms(), Some(100));
+    }
+
+    /// A window with nothing measurable reports no speed at all, so the UI shows
+    /// "—" instead of a fabricated number.
+    #[test]
+    fn session_metrics_report_nothing_when_unmeasured() {
+        let db = StatsDb::in_memory().unwrap();
+        insert_turn(
+            &db,
+            "claude:s5",
+            "2026-09-28 12:00:00",
+            1_000,
+            0,
+            0,
+            50,
+            false,
+        );
+
+        let m = db.query_session_metrics("claude:s5").unwrap();
+        assert_eq!(m.turns, 1);
+        assert_eq!(m.measured_turns, 0);
+        assert_eq!(m.tps(), None);
+        assert_eq!(m.avg_ttft_ms(), None);
+        assert_eq!(m.tool_wait_ms(), None);
+        // ...but the panel can still name the conversation.
+        assert_eq!(m.model.as_deref(), Some("hy3"));
+    }
+
+    /// The window keeps the *recent* turns when a session exceeds the cap.
+    ///
+    /// `LIMIT` runs newest-first, so getting the order wrong would aggregate the
+    /// oldest turns of a long conversation instead of its current behaviour.
+    #[test]
+    fn session_metrics_window_keeps_the_recent_turns() {
+        let db = StatsDb::in_memory().unwrap();
+
+        // One ancient turn that must fall out of the window...
+        insert_turn(
+            &db,
+            "claude:s6",
+            "2026-09-28 09:00:00",
+            1_000,
+            50,
+            1_000,
+            1_000_000,
+            false,
+        );
+        // ...then enough recent turns to exceed the cap.
+        let extra = 5;
+        for i in 0..(SESSION_METRICS_MAX_TURNS + extra) {
+            let secs = i % 60;
+            let mins = (i / 60) % 60;
+            let created = format!("2026-09-28 13:{mins:02}:{secs:02}");
+            insert_turn(&db, "claude:s6", &created, 2_000, 100, 1_000, 10, false);
+        }
+
+        let m = db.query_session_metrics("claude:s6").unwrap();
+        assert_eq!(m.turns, SESSION_METRICS_MAX_TURNS, "window is capped");
+        // The huge ancient row would dominate the sum if it were included.
+        assert_eq!(
+            m.output_tokens,
+            10 * SESSION_METRICS_MAX_TURNS,
+            "only the recent turns are summed"
+        );
+        assert_eq!(m.model_ms, 1_000 * SESSION_METRICS_MAX_TURNS);
+        let tps = m.tps().expect("measurable");
+        assert!((tps - 10.0).abs() < 0.001, "10 tokens per 1s, got {tps}");
+    }
+
+    /// The recent-sessions list returns the most recently *active* conversations,
+    /// newest first, and excludes unidentified requests.
+    ///
+    /// Ordering is by each session's latest activity, not by any single row's id:
+    /// a long-running conversation must outrank one that merely started later.
+    #[test]
+    fn recent_sessions_are_ordered_by_latest_activity() {
+        let db = StatsDb::in_memory().unwrap();
+
+        // "old" starts first and keeps receiving turns, so its last row is the
+        // newest overall — it must come first.
+        insert_turn(
+            &db,
+            "claude:old",
+            "2026-09-28 10:00:00",
+            1_000,
+            100,
+            1_000,
+            10,
+            false,
+        );
+        insert_turn(
+            &db,
+            "claude:mid",
+            "2026-09-28 10:00:05",
+            1_000,
+            100,
+            1_000,
+            10,
+            false,
+        );
+        insert_turn(
+            &db,
+            "claude:old",
+            "2026-09-28 10:00:10",
+            1_000,
+            100,
+            1_000,
+            10,
+            false,
+        );
+
+        // An unidentified request must never appear: it is not a conversation.
+        let no_tokens = TokenRecord::default();
+        let mut anon = outcome("hy3", "/v1/messages", &no_tokens, 200, None, true);
+        anon.session_id = "";
+        let _ = db.record_request_log(anon);
+
+        let recent = db.query_recent_session_metrics(3).unwrap();
+        let ids: Vec<&str> = recent.iter().map(|m| m.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["claude:old", "claude:mid"],
+            "newest activity first"
+        );
+
+        // `turns` counts only that session's rows.
+        assert_eq!(recent[0].turns, 2, "old has two turns");
+        assert_eq!(recent[1].turns, 1);
+
+        // The limit is honoured, and 0 asks for nothing.
+        let only_one = db.query_recent_session_metrics(1).unwrap();
+        assert_eq!(only_one.len(), 1);
+        assert_eq!(only_one[0].session_id, "claude:old");
+        assert!(db.query_recent_session_metrics(0).unwrap().is_empty());
+
+        // A database with no identified sessions yields an empty list, not an
+        // error or a nameless row.
+        let empty = StatsDb::in_memory().unwrap();
+        assert!(empty.query_recent_session_metrics(3).unwrap().is_empty());
+    }
+
+    /// A session in the `recent` list reports exactly the same aggregate as the
+    /// dedicated query — the panel compares them side by side, so a divergence
+    /// would make the highlighted row disagree with the list.
+    #[test]
+    fn recent_sessions_agree_with_the_single_session_query() {
+        let db = StatsDb::in_memory().unwrap();
+        insert_turn(
+            &db,
+            "claude:a",
+            "2026-09-28 10:00:00",
+            2_000,
+            100,
+            1_000,
+            400,
+            true,
+        );
+        insert_turn(
+            &db,
+            "claude:a",
+            "2026-09-28 10:00:20",
+            3_000,
+            300,
+            2_000,
+            200,
+            false,
+        );
+
+        let single = db.query_session_metrics("claude:a").unwrap();
+        let listed = db.query_recent_session_metrics(5).unwrap();
+        let found = listed
+            .iter()
+            .find(|m| m.session_id == "claude:a")
+            .expect("session is listed");
+
+        // Aggregate fields must match; the fold reads the same window either way.
+        assert_eq!(found.turns, single.turns);
+        assert_eq!(found.measured_turns, single.measured_turns);
+        assert_eq!(found.output_tokens, single.output_tokens);
+        assert_eq!(found.model_ms, single.model_ms);
+        assert_eq!(found.ttft_sum_ms, single.ttft_sum_ms);
+        assert_eq!(found.ttft_samples, single.ttft_samples);
+        assert_eq!(found.tool_wait_ms, single.tool_wait_ms);
+        assert_eq!(found.tool_waits, single.tool_waits);
+        assert_eq!(found.tps(), single.tps());
+        assert_eq!(found.avg_ttft_ms(), single.avg_ttft_ms());
+        assert_eq!(found.model, single.model);
+        assert_eq!(found.last_at, single.last_at);
+    }
+
+    /// A turn not preceded by a tool request contributes no tool time —
+    /// otherwise every ordinary turn would claim the previous turn's spacing.
+    #[test]
+    fn session_metrics_ignore_a_non_tool_predecessor() {
+        let db = StatsDb::in_memory().unwrap();
+        insert_turn(
+            &db,
+            "claude:s2",
+            "2026-09-28 10:00:00",
+            1_000,
+            100,
+            500,
+            100,
+            false,
+        );
+        insert_turn(
+            &db,
+            "claude:s2",
+            "2026-09-28 10:00:30",
+            1_000,
+            100,
+            500,
+            100,
+            false,
+        );
+
+        let m = db.query_session_metrics("claude:s2").unwrap();
+        assert_eq!(m.turns, 2);
+        assert_eq!(
+            m.tool_wait_ms(),
+            None,
+            "a text-only predecessor is not a tool wait"
+        );
+        assert_eq!(m.tool_waits, 0);
+    }
+
+    /// Tool time accumulates across several tool round-trips in one window.
+    #[test]
+    fn session_metrics_sum_tool_time_across_turns() {
+        let db = StatsDb::in_memory().unwrap();
+
+        // Each pair: a tool-requesting turn, then its successor 10 s later that
+        // itself took 2 s → a 8 s tool wait each time.
+        insert_turn(
+            &db,
+            "claude:s7",
+            "2026-09-28 10:00:00",
+            2_000,
+            100,
+            500,
+            10,
+            true,
+        );
+        insert_turn(
+            &db,
+            "claude:s7",
+            "2026-09-28 10:00:10",
+            2_000,
+            100,
+            500,
+            10,
+            false,
+        );
+        insert_turn(
+            &db,
+            "claude:s7",
+            "2026-09-28 10:00:20",
+            2_000,
+            100,
+            500,
+            10,
+            true,
+        );
+        insert_turn(
+            &db,
+            "claude:s7",
+            "2026-09-28 10:00:30",
+            2_000,
+            100,
+            500,
+            10,
+            false,
+        );
+
+        let m = db.query_session_metrics("claude:s7").unwrap();
+        assert_eq!(m.tool_waits, 2, "two tool round-trips");
+        assert_eq!(m.tool_wait_ms(), Some(16_000), "two 8s waits summed");
+    }
+
+    /// Insert one row with an explicit `created_at`, so timing arithmetic can be
+    /// tested without depending on the wall clock.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_turn(
+        db: &StatsDb,
+        session: &str,
+        created_at: &str,
+        duration_ms: i64,
+        ttft_ms: i64,
+        model_ms: i64,
+        output_tokens: i64,
+        tool: bool,
+    ) {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "INSERT INTO request_logs (
+                date, created_at, model, route, output_tokens, duration_ms,
+                ttft_ms, model_ms, ended_with_tool_call, streamed, status,
+                session_id, client
+             ) VALUES (?1, ?2, 'hy3', '/v1/messages', ?3, ?4, ?5, ?6, ?7, 1, 200, ?8, 'claude')",
+            params![
+                &created_at[..10],
+                created_at,
+                output_tokens,
+                duration_ms,
+                ttft_ms,
+                model_ms,
+                if tool { 1 } else { 0 },
+                session
+            ],
+        )
+        .expect("insert test turn");
     }
 
     #[test]

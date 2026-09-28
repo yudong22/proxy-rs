@@ -4,7 +4,7 @@ use crate::metrics;
 use crate::models::{anthropic, openai, responses};
 use crate::service;
 use crate::session::{self, ClientKind, SessionInfo};
-use crate::stats::{RequestOutcome, StatsDb, TokenRecord};
+use crate::stats::{RequestOutcome, StatsDb, TokenRecord, UpstreamTiming};
 use crate::translate::{pipeline, responses as responses_pipeline, stream};
 use crate::util::{self, format_headers, truncate};
 use axum::{
@@ -637,6 +637,8 @@ async fn reject_request(
             route,
             tokens: &TokenRecord::default(),
             duration_ms,
+            // Rejected before any upstream attempt: nothing was ever sent.
+            timing: UpstreamTiming::default(),
             streamed: false,
             status,
             error: Some(&message),
@@ -774,6 +776,9 @@ async fn finalize_request(
                     route,
                     tokens: &failed_tokens,
                     duration_ms,
+                    // A failure may have come from any attempt; the successful
+                    // writers own the real timings, so this stays unknown.
+                    timing: UpstreamTiming::default(),
                     streamed: is_streaming,
                     status,
                     error: Some(&message),
@@ -1606,6 +1611,7 @@ async fn forward_request(
                         client_model,
                         route,
                         start,
+                        upstream_start,
                         gui_logs,
                         stats,
                         session,
@@ -1614,12 +1620,17 @@ async fn forward_request(
                     )
                 } else {
                     // The client wants one JSON body. If the request was upgraded
-                    // to a stream upstream, aggregate it first; otherwise parse the
-                    // response directly.
-                    let resp = if upstream_streaming {
-                        collect_stream_into_response(response).await?
+                    // to a stream upstream, aggregate it first — that path sees
+                    // every chunk, so it is also the one that can report TTFT and
+                    // the model's generation span. A plain JSON response exposes
+                    // neither, so its timings stay at zero ("unknown").
+                    let (resp, timing) = if upstream_streaming {
+                        collect_stream_into_response(response, upstream_start).await?
                     } else {
-                        response.json::<openai::OpenAIResponse>().await?
+                        (
+                            response.json::<openai::OpenAIResponse>().await?,
+                            UpstreamTiming::default(),
+                        )
                     };
                     non_streaming_response(
                         resp,
@@ -1628,6 +1639,7 @@ async fn forward_request(
                         client_model,
                         route,
                         start,
+                        timing,
                         &config,
                         stats,
                         &session,
@@ -1661,12 +1673,16 @@ async fn forward_request(
 /// tool calls and usage are read.
 async fn collect_stream_into_response(
     response: reqwest::Response,
-) -> ProxyResult<openai::OpenAIResponse> {
+    upstream_start: Instant,
+) -> ProxyResult<(openai::OpenAIResponse, UpstreamTiming)> {
     use futures::StreamExt;
 
     let mut accumulated = Aggregate::default();
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
+    // The same clock the streaming path uses, so a client that asked for JSON
+    // still gets real TTFT/TPS numbers when the upstream served a stream.
+    let mut timing = TimingTracker::default();
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(ProxyError::Http)?;
@@ -1692,13 +1708,14 @@ async fn collect_stream_into_response(
                     continue;
                 }
                 if let Ok(chunk_obj) = serde_json::from_str::<openai::StreamChunk>(data) {
+                    timing.observe(upstream_start, &chunk_obj);
                     accumulated.absorb(&chunk_obj);
                 }
             }
         }
     }
 
-    Ok(accumulated.into_response())
+    Ok((accumulated.into_response(), timing.finish()))
 }
 
 /// Running merge of stream chunks into one response.
@@ -1838,6 +1855,9 @@ async fn non_streaming_response(
     client_model: String,
     route: &'static str,
     start: Instant,
+    // Upstream TTFT / model span / tool-turn facts. All zero when the response
+    // was a plain JSON body, which exposes no timing at all.
+    timing: UpstreamTiming,
     config: &Config,
     stats: Arc<StatsDb>,
     session: &SessionInfo,
@@ -1871,6 +1891,7 @@ async fn non_streaming_response(
             route,
             tokens: &tokens,
             duration_ms,
+            timing,
             streamed: false,
             status: 200,
             error: None,
@@ -1942,6 +1963,10 @@ fn streaming_response(
     client_model: String,
     route: &'static str,
     start: Instant,
+    // When the winning upstream attempt was *sent*. Timings are measured from
+    // here, not from `start`, so credential selection, retries and body
+    // translation are not misattributed to the model.
+    upstream_start: Instant,
     gui_logs: Arc<crate::settings::LogBuffer>,
     stats: Arc<StatsDb>,
     session: SessionInfo,
@@ -1955,6 +1980,7 @@ fn streaming_response(
         client_model,
         route,
         start,
+        upstream_start,
         gui_logs,
         stats,
         session,
@@ -2539,6 +2565,10 @@ async fn retry_as_stream(
     // Always a streamed response here, so no total timeout: it would kill any
     // stream outliving it. The shared client's idle read_timeout covers stalls
     // — see forward_request for the rationale.
+    //
+    // Timed from this send: the first attempt was rejected outright (11101), so
+    // its round-trip is not the model's latency.
+    let retry_start = Instant::now();
     let response = apply_upstream_auth(builder, config, api_key, credential)
         .send()
         .await
@@ -2556,7 +2586,7 @@ async fn retry_as_stream(
         )));
     }
 
-    let resp = collect_stream_into_response(response).await?;
+    let (resp, timing) = collect_stream_into_response(response, retry_start).await?;
     gui_logs
         .push(
             "INFO",
@@ -2573,6 +2603,7 @@ async fn retry_as_stream(
         client_model.to_string(),
         route,
         start,
+        timing,
         config,
         stats.clone(),
         session,
@@ -2776,10 +2807,15 @@ struct StreamLedger {
     model: String,
     route: &'static str,
     start: Instant,
+    /// When the winning upstream attempt was sent — the anchor for TTFT and the
+    /// model's generation span.
+    upstream_start: Instant,
     stats: Arc<StatsDb>,
     /// Session identity for the row this ledger writes on drop.
     session: SessionInfo,
     tokens: TokenRecord,
+    /// TTFT / model span / tool-turn facts, folded from parsed chunks.
+    timing: TimingTracker,
     /// Set when the upstream stream failed; turns the row's status into a 500.
     error: Option<String>,
     /// Exception-override fields for the row (see [`OverrideTrace`]).
@@ -2793,6 +2829,7 @@ impl StreamLedger {
         model: String,
         route: &'static str,
         start: Instant,
+        upstream_start: Instant,
         stats: Arc<StatsDb>,
         session: SessionInfo,
         overrides: &Arc<std::sync::Mutex<OverrideTrace>>,
@@ -2807,14 +2844,21 @@ impl StreamLedger {
             model,
             route,
             start,
+            upstream_start,
             stats,
             session,
             tokens: TokenRecord::default(),
+            timing: TimingTracker::default(),
             error: None,
             override_key,
             override_model,
             override_reason,
         }
+    }
+
+    /// Fold one parsed upstream chunk into the timing state.
+    fn observe_chunk(&mut self, chunk: &openai::StreamChunk) {
+        self.timing.observe(self.upstream_start, chunk);
     }
 }
 
@@ -2828,6 +2872,7 @@ impl Drop for StreamLedger {
                 route: self.route,
                 tokens: &self.tokens,
                 duration_ms: self.start.elapsed().as_millis() as i64,
+                timing: self.timing.finish(),
                 streamed: true,
                 status,
                 error: self.error.as_deref(),
@@ -2841,8 +2886,83 @@ impl Drop for StreamLedger {
     }
 }
 
-/// Cap on how much of an unterminated SSE frame the reassembly buffer keeps.
+/// Accumulates TTFT / model-span / tool-turn facts from parsed upstream chunks.
 ///
+/// Shared by the two paths that can actually see the upstream's chunks: the
+/// streaming SSE framer and the stream-aggregating non-streaming path. Keeping
+/// one implementation is what stops the two from disagreeing about what "first
+/// token" means.
+#[derive(Default)]
+struct TimingTracker {
+    /// Milliseconds to the first output delta. `None` = never observed.
+    ttft_ms: Option<i64>,
+    /// Milliseconds to the most recent output delta: the model's generation span.
+    last_delta_ms: Option<i64>,
+    /// The last non-empty `finish_reason` seen.
+    finish_reason: Option<String>,
+}
+
+impl TimingTracker {
+    /// Fold one parsed upstream chunk into the timing state.
+    ///
+    /// "Output" means a content delta **or** a tool-call delta: a turn that
+    /// opens with a tool call has produced its first output token just as much
+    /// as one that opens with text, and excluding it would report a tool-only
+    /// turn as having no TTFT at all.
+    ///
+    /// Reasoning deltas are deliberately excluded from TTFT. The Anthropic
+    /// translator never surfaces upstream reasoning to the client (see
+    /// `translate::stream`), so counting it would report a first token the user
+    /// did not receive.
+    fn observe(&mut self, upstream_start: Instant, chunk: &openai::StreamChunk) {
+        let Some(choice) = chunk.choices.first() else {
+            return;
+        };
+
+        let has_text = choice
+            .delta
+            .content
+            .as_deref()
+            .is_some_and(|c| !c.is_empty());
+        let has_tool = choice
+            .delta
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+
+        if has_text || has_tool {
+            let elapsed = upstream_start.elapsed().as_millis() as i64;
+            if self.ttft_ms.is_none() {
+                self.ttft_ms = Some(elapsed);
+            }
+            // Monotonic: a later frame must never shrink the span.
+            self.last_delta_ms = Some(match self.last_delta_ms {
+                Some(prev) => prev.max(elapsed),
+                None => elapsed,
+            });
+        }
+
+        if let Some(reason) = choice.finish_reason.as_ref() {
+            if !reason.is_empty() {
+                self.finish_reason = Some(reason.clone());
+            }
+        }
+    }
+
+    /// Freeze into the row's timing columns.
+    fn finish(&self) -> UpstreamTiming {
+        UpstreamTiming {
+            ttft_ms: self.ttft_ms.unwrap_or(0),
+            model_ms: self.last_delta_ms.unwrap_or(0),
+            ended_with_tool_call: matches!(
+                self.finish_reason.as_deref(),
+                Some("tool_calls") | Some("function_call")
+            ),
+        }
+    }
+}
+
+/// Cap on how much of an unterminated SSE frame the reassembly buffer keeps.
 /// A well-formed event is one `data:` line, so this is generous; it exists only
 /// so an upstream that never emits a frame separator cannot grow the buffer for
 /// the whole life of a stream (see `create_flavor_sse_stream`).
@@ -2862,6 +2982,8 @@ fn create_flavor_sse_stream(
     client_model: String,
     route: &'static str,
     start: Instant,
+    // When the upstream request was sent; anchors TTFT and the model span.
+    upstream_start: Instant,
     gui_logs: Arc<crate::settings::LogBuffer>,
     stats: Arc<StatsDb>,
     session: SessionInfo,
@@ -2887,6 +3009,7 @@ fn create_flavor_sse_stream(
             client_model.clone(),
             route,
             start,
+            upstream_start,
             stats.clone(),
             session,
             &overrides,
@@ -3021,6 +3144,13 @@ fn create_flavor_sse_stream(
                                     if let Some(ref usage) = chunk_obj.usage {
                                         capture_usage!(usage.clone());
                                     }
+
+                                    // Upstream timings, measured from the send.
+                                    // Every parsed chunk that carries output is
+                                    // an opportunity to advance the model's span;
+                                    // the first one also fixes TTFT. `max` keeps
+                                    // this monotonic across interleaved frames.
+                                    ledger.observe_chunk(&chunk_obj);
 
                                     match flavor {
                                         ApiFlavor::Anthropic => {
@@ -3189,6 +3319,7 @@ fn create_sse_stream(
         fallback_model,
         "/v1/messages",
         Instant::now(),
+        Instant::now(),
         gui_logs,
         stats,
         SessionInfo::unknown(),
@@ -3211,6 +3342,7 @@ fn create_responses_sse_stream(
         ApiFlavor::Responses,
         fallback_model,
         "/v1/responses",
+        Instant::now(),
         Instant::now(),
         gui_logs,
         stats,
@@ -3237,6 +3369,7 @@ mod tests {
     use super::apply_upstream_auth;
     use super::create_sse_stream;
     use super::json_request;
+    use super::TimingTracker;
     use super::{
         apply_degraded_prompt, is_content_blocked, is_non_stream_unsupported,
         upstream_auth_headers, OverrideTrace, MAX_SSE_FRAME_BYTES,
@@ -3246,12 +3379,14 @@ mod tests {
     };
     use crate::models::{openai, responses};
     use crate::session::SessionInfo;
+    use crate::stats::UpstreamTiming;
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use futures::stream::{self, StreamExt};
     use reqwest::Client;
     use serde_json::{json, Value};
     use std::fmt;
+    use std::time::Instant;
 
     /// The failover memory: remembered per failing credential, scoped, and
     /// expiring.
@@ -3509,6 +3644,96 @@ mod tests {
 
         assert_eq!(headers.get("authorization").unwrap(), "Bearer provider-key");
         assert!(headers.get("x-api-key").is_none());
+    }
+
+    /// TTFT is the first *output* delta — text or tool call — and the model span
+    /// is the last one. Reasoning deltas and metadata-only frames must not count,
+    /// or a turn would report a first token the client never received.
+    #[test]
+    fn timing_tracker_measures_first_output_and_last_delta() {
+        let mut tracker = TimingTracker::default();
+        let start = Instant::now();
+
+        // A role-only preamble is not output.
+        tracker.observe(start, &chunk_with(json!({"delta": {"role": "assistant"}})));
+        assert_eq!(tracker.ttft_ms, None, "a role frame is not a first token");
+
+        // Nor is a reasoning-only delta: the Anthropic translator never surfaces
+        // upstream reasoning, so counting it would lie about TTFT.
+        tracker.observe(
+            start,
+            &chunk_with(json!({"delta": {"reasoning_content": "thinking…"}})),
+        );
+        assert_eq!(
+            tracker.ttft_ms, None,
+            "reasoning is not client-visible output"
+        );
+
+        // First real content fixes TTFT.
+        tracker.observe(start, &chunk_with(json!({"delta": {"content": "hi"}})));
+        let ttft = tracker.ttft_ms.expect("first content sets TTFT");
+        assert!(ttft >= 0);
+
+        // A later non-empty delta extends the span but must not move TTFT.
+        tracker.observe(start, &chunk_with(json!({"delta": {"content": " there"}})));
+        assert_eq!(tracker.ttft_ms, Some(ttft), "TTFT is fixed by the first");
+
+        let timing = tracker.finish();
+        assert_eq!(timing.ttft_ms, ttft);
+        assert!(timing.model_ms >= timing.ttft_ms);
+        assert!(!timing.ended_with_tool_call);
+    }
+
+    /// A turn that opens with a tool call still has a first output token, and
+    /// `finish_reason: tool_calls` marks it as a tool turn.
+    #[test]
+    fn timing_tracker_treats_a_tool_call_as_output() {
+        let mut tracker = TimingTracker::default();
+        let start = Instant::now();
+
+        tracker.observe(
+            start,
+            &chunk_with(json!({
+                "delta": {"tool_calls": [{"index": 0, "id": "call_1",
+                          "function": {"name": "read_file", "arguments": "{}"}}]}
+            })),
+        );
+        assert!(
+            tracker.ttft_ms.is_some(),
+            "a tool-only turn still produces a first token"
+        );
+
+        tracker.observe(
+            start,
+            &chunk_with(json!({"delta": {}, "finish_reason": "tool_calls"})),
+        );
+        assert!(tracker.finish().ended_with_tool_call, "tool_calls finish");
+    }
+
+    /// An unobserved stream reports zeros, which the UI renders as "unknown"
+    /// rather than as a fabricated speed.
+    #[test]
+    fn timing_tracker_reports_zero_when_nothing_was_observed() {
+        let tracker = TimingTracker::default();
+        let timing = tracker.finish();
+        assert_eq!(timing.ttft_ms, 0);
+        assert_eq!(timing.model_ms, 0);
+        assert!(!timing.ended_with_tool_call);
+        assert_eq!(timing.tps(1000), None, "no span means no speed");
+    }
+
+    /// Build a `StreamChunk` from a partial choice body (`delta`/`finish_reason`).
+    fn chunk_with(choice: Value) -> openai::StreamChunk {
+        let mut choice = choice;
+        if choice.get("index").is_none() {
+            choice["index"] = json!(0);
+        }
+        serde_json::from_value(json!({
+            "id": "cmb-1",
+            "model": "glm",
+            "choices": [choice]
+        }))
+        .expect("test chunk parses")
     }
 
     #[test]
@@ -5063,6 +5288,11 @@ mod tests {
     /// Feeds SSE text through `collect_stream_into_response` by serving it
     /// from a real HTTP socket, so the bytes arrive as a genuine response body.
     async fn aggregate(sse: &str) -> openai::OpenAIResponse {
+        aggregate_timed(sse).await.0
+    }
+
+    /// As [`aggregate`], but also exposing the observed upstream timings.
+    async fn aggregate_timed(sse: &str) -> (openai::OpenAIResponse, UpstreamTiming) {
         let body = sse.to_string();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5084,7 +5314,9 @@ mod tests {
         });
 
         let resp = reqwest::get(format!("http://{}/", addr)).await.unwrap();
-        super::collect_stream_into_response(resp).await.unwrap()
+        super::collect_stream_into_response(resp, Instant::now())
+            .await
+            .unwrap()
     }
 
     fn text_chunk(content: &str, finish: Option<&str>) -> String {

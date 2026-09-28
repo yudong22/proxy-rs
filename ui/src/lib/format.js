@@ -84,3 +84,55 @@ export function formatPoints(points) {
   // Integral balances read better without a decimal tail.
   return Number.isInteger(n) ? String(n) : n.toFixed(2);
 }
+
+/**
+ * Output speed, `xx.x tok/s`.
+ *
+ * A missing measurement is "—", never "0": an unmeasured request (a plain
+ * non-streamed reply, or one served before timing existed) must not read as a
+ * stalled model.
+ */
+export function formatTps(tps) {
+  if (tps === null || tps === undefined) return '—';
+  const n = Number(tps);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  // Above 100 tok/s the decimal is noise; below it, it is the useful digit.
+  return n >= 100 ? `${Math.round(n)} tok/s` : `${n.toFixed(1)} tok/s`;
+}
+
+/**
+ * Long-form duration for the speed drill-down: `x分 xx秒` / `x.x秒`.
+ *
+ * Distinct from `formatDuration` (tuned for the dense request table): these are
+ * read one at a time in a detail panel, so the minutes form is spelled out
+ * rather than shown as a large second count.
+ */
+export function formatLongDuration(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n < 1000) return `${Math.round(n)}毫秒`;
+  const secs = n / 1000;
+  // Compare the *rounded* value: 59.97 s would otherwise print "60.0秒", which
+  // is both ugly and wrong in spirit (it is a minute).
+  if (secs.toFixed(1) !== '60.0' && secs < 60) return `${secs.toFixed(1)}秒`;
+  const mins = Math.floor(secs / 60);
+  const rest = Math.round(secs - mins * 60);
+  // A rounded 60 here would print "1分 60秒".
+  if (rest === 60) return `${mins + 1}分 00秒`;
+  return `${mins}分 ${String(rest).padStart(2, '0')}秒`;
+}
+
+/**
+ * Seconds with one decimal, for the TTFT / tool-wait rows: `x.x秒`.
+ *
+ * Integer milliseconds below a second keep more information, so they are shown
+ * as milliseconds instead of "0.0秒".
+ */
+export function formatSeconds(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n < 1000) return `${Math.round(n)}毫秒`;
+  return `${(n / 1000).toFixed(1)}秒`;
+}

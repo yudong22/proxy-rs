@@ -8,7 +8,13 @@
 import { $, setText, setClass, setHidden, html, raw } from '../core/dom.js';
 import { invoke } from '../core/ipc.js';
 import { appState } from '../core/state.js';
-import { formatNumber, formatPoints } from '../lib/format.js';
+import {
+  formatNumber,
+  formatPoints,
+  formatTps,
+  formatLongDuration,
+  formatSeconds,
+} from '../lib/format.js';
 import { toast } from '../components/toast.js';
 
 /**
@@ -16,15 +22,18 @@ import { toast } from '../components/toast.js';
  *
  * @param {string} id       Element the value is written into.
  * @param {string} label
- * @param {{cardId?: string, clickable?: boolean, title?: string}} [opts]
+ * @param {{cardId?: string, clickable?: boolean, title?: string, sub?: string}} [opts]
  *        `cardId` is only needed when something targets the card itself (the
- *        cache card, which expands the detail panel below it).
+ *        cards that expand a detail panel below).
+ *        `sub` renders a secondary element (an id for the sub-line) so a card
+ *        can carry a second, smaller line under its value.
  */
-function metric(id, label, { cardId = '', clickable = false, title = '' } = {}) {
+function metric(id, label, { cardId = '', clickable = false, title = '', sub = '' } = {}) {
   return html`
     <div class="metric-card${clickable ? ' clickable' : ''}"${raw(cardId ? ` id="${cardId}"` : '')}${raw(title ? ` title="${title}"` : '')}>
       <div class="metric-label">${label}${raw(clickable ? ' <span class="stat-caret"></span>' : '')}</div>
       <div class="metric-value" id="${id}">-</div>
+      ${raw(sub ? `<div class="metric-sub" id="${sub}"></div>` : '')}
     </div>
   `;
 }
@@ -57,8 +66,11 @@ export function renderOverview() {
       ${raw(metric('metric-provider', '配置厂商'))}
       ${raw(metric('metric-points', '剩余积分', {
         cardId: 'stat-card-points', clickable: true, title: '点击刷新剩余积分',
+        sub: 'metric-points-account',
       }))}
-      ${raw(metric('metric-account', '当前账号'))}
+      ${raw(metric('metric-speed', '输出速度', {
+        cardId: 'stat-card-speed', clickable: true, title: '点击查看本次生成详情',
+      }))}
       ${raw(metric('metric-overrides', '今日 override 次数', {
         cardId: 'stat-card-overrides', clickable: true, title: '点击查看请求日志',
       }))}
@@ -83,6 +95,36 @@ export function renderOverview() {
         <dt>缓存写入</dt><dd><code id="stat-tokens-cache-write">0</code></dd>
         <dt>输出</dt><dd><code id="stat-tokens-output">0</code></dd>
       </dl>
+    </div>
+
+    <!-- Expanded by the 输出速度 card. Values are session aggregates over the
+         recent-turns window; the comparison table below shows the last few
+         conversations. A cell with no measurement shows "—" rather than a
+         plausible-looking guess. -->
+    <div class="section stat-detail" id="speed-detail" hidden>
+      <dl class="kv">
+        <dt>当前会话</dt><dd><code id="speed-session" class="speed-session-id">—</code></dd>
+        <dt>模型用时（累计）</dt><dd><code id="speed-model-time">—</code></dd>
+        <dt>工具调用用时（累计）</dt><dd><code id="speed-tool-time">—</code></dd>
+        <dt>首 token 平均（TTFT）</dt><dd><code id="speed-ttft">—</code></dd>
+        <dt>输出 tokens（累计）</dt><dd><code id="speed-tokens">—</code></dd>
+        <dt>输出速度（TPS）</dt><dd><code id="speed-tps">—</code></dd>
+      </dl>
+
+      <div class="speed-sessions-title">最近会话对比</div>
+      <div class="speed-sessions-wrap">
+        <table class="speed-sessions">
+          <thead>
+            <tr>
+              <th class="col-session">会话</th>
+              <th>模型用时</th>
+              <th>TTFT</th>
+              <th>TPS</th>
+            </tr>
+          </thead>
+          <tbody id="speed-sessions-body"></tbody>
+        </table>
+      </div>
     </div>
 
     <div class="section">
@@ -117,7 +159,7 @@ export async function refreshStatus() {
     toggle.className = 'btn btn-small' + (appState.running ? '' : ' btn-primary');
   }
 
-  // The identity in force right now: 配置厂商 / 剩余积分 / 当前账号.
+  // The identity in force right now: 配置厂商 / 剩余积分 (+账号) / 输出速度.
   const identity = status.current_identity || {};
   appState.currentIdentity = identity;
   // 配置厂商: the backend reports the provider id, as before. An identity
@@ -125,7 +167,9 @@ export async function refreshStatus() {
   // latter is known unconditionally (it survives a stopped pool).
   setText('metric-provider', status.provider || '-');
   setText('metric-points', formatPoints(identity.points));
-  setText('metric-account', identity.label || '-');
+  // The account name is shown as the 剩余积分 card's sub-line: the balance
+  // belongs to that account, so reading them together is what the number means.
+  setText('metric-points-account', identity.label || '—');
 
   // Endpoint reference
   setText('endpoint-messages', `http://127.0.0.1:${appState.port}/v1/messages`);
@@ -167,6 +211,99 @@ export async function refreshStats() {
   setText('metric-overrides', formatNumber(s.overrides_total));
 }
 
+/**
+ * Paint the 输出速度 card and its drill-down from the current session's metrics.
+ *
+ * The values are session-level aggregates, not the latest turn: `speed_tps` is
+ * summed tokens over summed generation time, TTFT is the mean across measured
+ * turns, and the tool figure is the total attributed inside the window.
+ *
+ * Every field is rendered even when unmeasured — a missing number shows as "—"
+ * so the panel never implies a measurement that was not taken.
+ */
+export async function refreshSessionMetrics() {
+  let m;
+  try {
+    m = await invoke('get_session_metrics');
+  } catch (err) {
+    console.error('refreshSessionMetrics error:', err);
+    return;
+  }
+  if (!m) return;
+  appState.sessionMetrics = m;
+
+  setText('metric-speed', formatTps(m.speed_tps));
+  // The card's tooltip carries the context the small value cannot: which model,
+  // how many turns, and how many tokens the rate was measured over.
+  const card = $('#stat-card-speed');
+  if (card) {
+    const parts = [];
+    if (m.model) parts.push(m.model);
+    const turns = Number(m.measured_turns) || 0;
+    if (turns > 0) parts.push(`平均 ${turns} 轮`);
+    if (m.output_tokens > 0) parts.push(`共 ${formatNumber(m.output_tokens)} tokens`);
+    card.title = parts.length
+      ? `${parts.join(' · ')} — 点击查看会话生成详情`
+      : '暂无可测量的生成记录';
+  }
+
+  // The session's identity is its id from the request log, not the model name:
+  // several models can serve one conversation (a fallback switch changes it),
+  // but the id is what ties these turns together.
+  setText('speed-session', m.session_id || '—');
+  // 模型用时 is summed generation time over the window, not one request's
+  // duration — the latter also contains the client's read tail.
+  setText('speed-model-time', m.model_ms > 0 ? formatLongDuration(m.model_ms) : '—');
+  setText(
+    'speed-tool-time',
+    m.tool_wait_ms === null || m.tool_wait_ms === undefined
+      ? '—'
+      : `${formatSeconds(m.tool_wait_ms)}${m.tool_waits > 1 ? `（${m.tool_waits} 次）` : ''}`,
+  );
+  setText(
+    'speed-ttft',
+    m.avg_ttft_ms === null || m.avg_ttft_ms === undefined
+      ? '—'
+      : formatSeconds(m.avg_ttft_ms),
+  );
+  setText('speed-tps', formatTps(m.speed_tps));
+  setText(
+    'speed-tokens',
+    m.output_tokens > 0 ? formatNumber(m.output_tokens) : '—',
+  );
+
+  renderRecentSessions(m.recent, m.session_id);
+}
+
+/**
+ * Render the recent-sessions comparison table.
+ *
+ * The first column is the session id, widened in CSS so a long id stays on one
+ * line rather than wrapping into a second row height.
+ */
+function renderRecentSessions(recent, currentId) {
+  const body = $('#speed-sessions-body');
+  if (!body) return;
+  const rows = Array.isArray(recent) ? recent : [];
+  if (rows.length === 0) {
+    body.innerHTML = '<tr><td colspan="4" class="speed-empty">暂无会话</td></tr>';
+    return;
+  }
+  body.innerHTML = rows
+    .map(s => {
+      const isCurrent = s.session_id && s.session_id === currentId;
+      return html`
+        <tr${raw(isCurrent ? ' class="is-current"' : '')}>
+          <td class="col-session"><span class="mono" title="${s.session_id || ''}">${s.session_id || '—'}</span></td>
+          <td>${s.model_ms > 0 ? formatLongDuration(s.model_ms) : '—'}</td>
+          <td>${s.avg_ttft_ms === null || s.avg_ttft_ms === undefined ? '—' : formatSeconds(s.avg_ttft_ms)}</td>
+          <td>${formatTps(s.speed_tps)}</td>
+        </tr>
+      `;
+    })
+    .join('');
+}
+
 /** Wire the interactions that belong to this view. Called once, from main.js. */
 export function initOverview() {
   // Start / stop the service. `start_service` rejects when the port could not
@@ -194,6 +331,19 @@ export function initOverview() {
     const open = detail.hasAttribute('hidden');
     setHidden(detail, !open);
     card.classList.toggle('active', open);
+  });
+
+  // The 输出速度 card expands the per-turn generation detail. It re-reads on
+  // open so the panel describes the turn that just finished rather than
+  // whichever one was current at the last 10 s poll.
+  $('#stat-card-speed')?.addEventListener('click', async () => {
+    const card = $('#stat-card-speed');
+    const detail = $('#speed-detail');
+    if (!card || !detail) return;
+    const open = detail.hasAttribute('hidden');
+    setHidden(detail, !open);
+    card.classList.toggle('active', open);
+    if (open) await refreshSessionMetrics();
   });
 
   // The 今日 override 次数 card jumps to the request log, where each override's

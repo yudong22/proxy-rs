@@ -17,7 +17,13 @@ import { listen } from './core/ipc.js';
 import { appState } from './core/state.js';
 import { initModal } from './components/modal.js';
 import { initConfirm } from './components/confirm.js';
-import { initOverview, refreshStatus, refreshStats, renderOverview } from './views/overview.js';
+import {
+  initOverview,
+  refreshStatus,
+  refreshStats,
+  refreshSessionMetrics,
+  renderOverview,
+} from './views/overview.js';
 import { renderTabs, setActiveTab } from './views/tabs.js';
 import {
   initLogs,
@@ -92,6 +98,10 @@ listen('service-state', () => {
 // 10s is slow enough to be invisible in CPU terms and keeps 请求总数 /
 // Token 总量 moving while a long session runs.
 setInterval(refreshStats, 10000);
+// The 输出速度 card reads the latest *turn*, which changes as soon as a request
+// finishes — so it polls alongside the stats rather than only on service-state
+// events (those fire for start/stop, not for a completed conversation turn).
+setInterval(refreshSessionMetrics, 10000);
 
 // ── Log polling ────────────────────────────────────────────────
 // Only while the logs tab is actually showing: an idle tab does no work.
@@ -127,6 +137,7 @@ for (const btn of $$('.tab')) {
 
 refreshStatus();
 refreshStats();
+refreshSessionMetrics();
 loadSettings();
 
 // Activate the default tab and put the logs view into its default mode. Both
