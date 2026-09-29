@@ -90,23 +90,8 @@ export function renderOverview() {
     <div class="metrics-grid">
       ${raw(metric('stat-requests', '请求总数'))}
       ${raw(metric('stat-tokens-total', 'Token 总量'))}
-      ${raw(metric('stat-cache-pct', '缓存命中率', {
-        cardId: 'stat-card-cache', clickable: true, expandable: true,
-        title: '点击查看缓存明细',
-      }))}
+      ${raw(metric('stat-cache-pct', '缓存命中率'))}
       ${raw(metric('stat-requests-failed', '失败请求'))}
-    </div>
-
-    <!-- Expanded by the 缓存命中率 card above; the hidden attribute is the
-         initial state and the global [hidden] rule in base.css keeps it out of
-         layout even after the section's own display is set. -->
-    <div class="section stat-detail" id="stat-detail" hidden>
-      <dl class="kv">
-        <dt>输入 (未缓存)</dt><dd><code id="stat-tokens-input">0</code></dd>
-        <dt>缓存读取</dt><dd><code id="stat-tokens-cache-read">0</code></dd>
-        <dt>缓存写入</dt><dd><code id="stat-tokens-cache-write">0</code></dd>
-        <dt>输出</dt><dd><code id="stat-tokens-output">0</code></dd>
-      </dl>
     </div>
 
     <!-- Expanded by the 输出速度 card: one transposed table, metrics as rows and
@@ -196,10 +181,6 @@ export async function refreshStats() {
   setText('stat-tokens-total', formatNumber(s.tokens_total));
   setText('stat-cache-pct', `${s.cache_hit_pct || 0}%`);
   setText('stat-requests-failed', formatNumber(s.requests_failed));
-  setText('stat-tokens-input', formatNumber(s.tokens_input));
-  setText('stat-tokens-cache-read', formatNumber(s.tokens_cache_read));
-  setText('stat-tokens-cache-write', formatNumber(s.tokens_cache_write));
-  setText('stat-tokens-output', formatNumber(s.tokens_output));
   setText('metric-overrides', formatNumber(s.overrides_total));
 }
 
@@ -392,16 +373,6 @@ export function initOverview() {
     } finally {
       toggle.disabled = false;
     }
-  });
-
-  // The 缓存命中率 card expands the token breakdown below it.
-  $('#stat-card-cache')?.addEventListener('click', () => {
-    const card = $('#stat-card-cache');
-    const detail = $('#stat-detail');
-    if (!card || !detail) return;
-    const open = detail.hasAttribute('hidden');
-    setHidden(detail, !open);
-    card.classList.toggle('active', open);
   });
 
   // The 输出速度 card expands the per-turn generation detail. It re-reads on

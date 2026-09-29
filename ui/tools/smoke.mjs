@@ -130,6 +130,8 @@ const EXPECTED = {
   // The DSH group renders its live state on load, from get_dsh_config.
   dshButtonPresent: true,
   dshStatus: '当前 4 个模型 · http://127.0.0.1:3457/v1 · 凭据已就绪',
+  // 缓存命中率 shows a value only — no expand affordance, no detail section.
+  cacheCard: { present: true, clickable: false, expandable: false, hasCaret: false, detailExists: false },
 };
 
 const server = http.createServer((req, res) => {
@@ -233,6 +235,20 @@ try {
           providerOptions: document.querySelector('#setting-provider')?.options.length,
           speedRows: document.querySelectorAll('#speed-sessions-body tr').length,
         },
+        // The overview's second card row. 缓存命中率 is deliberately inert: it
+        // reports a value and has no drill-down, so it must carry neither the
+        // affordance classes nor a hidden detail section.
+        cacheCard: (() => {
+          const all = [...document.querySelectorAll('.metrics-grid .metric-card')];
+          const card = all.find((c) => c.textContent.includes('缓存命中率'));
+          return {
+            present: Boolean(card),
+            clickable: card?.classList.contains('clickable') || false,
+            expandable: card?.classList.contains('expandable') || false,
+            hasCaret: Boolean(card?.querySelector('.stat-caret')),
+            detailExists: Boolean(document.querySelector('#stat-detail')),
+          };
+        })(),
         // The 输出速度 drill-down: metric row label -> that row's value cell for
         // the current session. Asserted by name rather than by row count so
         // adding a metric does not look like a regression, and a missing one
@@ -275,6 +291,7 @@ try {
   check('dsh status', b.dshStatus, EXPECTED.dshStatus);
   check('speed drill-down metrics', b.speedMetrics, EXPECTED.speedMetrics);
   check('speed drill-down session columns', b.speedHeaderLabels, EXPECTED.speedHeaderLabels);
+  check('缓存命中率 card is not expandable', b.cacheCard, EXPECTED.cacheCard);
 
   // Cross-module integration 1: palette's dynamic import of the settings view.
   await send('Runtime.evaluate', { expression: 'window.__CALLS__.length = 0;' });
