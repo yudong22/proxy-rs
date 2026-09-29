@@ -43,10 +43,15 @@ ui/
 
 ### 硬性规则
 
-1. **颜色只能来自令牌。** 写 `var(--accent)`，不要写 `#0071e3`。唯一的例外是 per-client / per-provider 的**品牌色**（如 `.client-codex`、`.wb-type-key`），它们本就是品牌标识，已在注释中标注。需要新的语义色时，先在 `tokens.css` 里同时定义浅色与深色两个值。
-2. **不要新增 CSS 文件。** 需要新样式时，放进上表对应职责的文件。确实需要新增一类时，必须同时更新 `index.html` 的 `<link>` 与本表的顺序，`check-ui.mjs` 会拦截未登记的样式表。
-3. **选择器用类，不用元素 / id。** 元素选择器（`input { … }`）会渗到所有视图，这是历史上 UI 差异的主要来源；`.form-group input` 这类**作用域限定**才是允许的写法。
-4. **同一外观只有一处定义。** 卡片边框/圆角/阴影一律复用 `.section` / `.form-section` / `.logs-panel` 的模式，不要为某个视图另写一套"看起来差不多"的卡片。新增前先 `grep` 是否已有可复用类。
+1. **颜色只能来自令牌。** 写 `var(--accent)`，不要写 `#0071e3`。唯一的例外有两处，且都必须在注释里写明理由：per-client **品牌色**（`.client-codex` / `.client-claude` / `.client-dsh`）与二维码白底（扫码必须白底深码）。需要新的语义色或分类色时，先在 `tokens.css` 里**同时**定义浅色与深色两个值——只定义浅色会让该元素在深色模式下保持浅色值，这正是本目录历史上颜色不一致的主要来源。
+2. **小字号文字用 `-ink`，不要用填充色。** `--success` / `--warning` / `--error` / `--accent` / `--identity-*` 是**填充色**，用作 10–11px 文字时对比度只有 2.3–4.1:1（低于 WCAG AA 的 4.5:1）。凡是"小字压在自身浅色 tint 上"的场景（状态 pill、分类 pill、`.btn-active`），文字一律取对应的 `--*-ink`——浅色模式下它们是加深值，深色模式下是提亮值。新增语义色时请一并提供 ink 变体。
+2. **不要写 `var(--x, fallback)`。** 令牌已全部定义，fallback 是死代码，而且会把调色板复制到第二处、与令牌悄悄分叉。`check-ui` 之后新增的校验会拦截未定义的 `var()`。
+3. **不要在 JS 里写内联样式或颜色。** `style="color:var(--success)"` 之类会绕过层叠并在 JS 里重复调色板；改为在 CSS 里加类（如 `.hint.ok` / `.wb-tone-err`），用 `className` 切换。`ui/src` 中不应再出现 `style="`。
+4. **不要新增 CSS 文件。** 需要新样式时，放进上表对应职责的文件。确实需要新增一类时，必须同时更新 `index.html` 的 `<link>` 与本表的顺序，`check-ui.mjs` 会拦截未登记的样式表。
+5. **选择器用类，不用元素 / id。** 元素选择器（`input { … }`）会渗到所有视图，这是历史上 UI 差异的主要来源；`.form-group input` 这类**作用域限定**才是允许的写法。
+6. **同一外观只有一处定义。** 卡片边框/圆角/阴影一律复用 `.section` / `.form-section` / `.logs-panel` 的模式，不要为某个视图另写一套"看起来差不多"的卡片。新增前先 `grep` 是否已有可复用类。
+7. **按钮尺寸由层级决定，不由内容决定。** `.btn` 固定 34px、`.btn-small` 固定 29px，且用 `inline-flex` 居中——否则以 emoji 开头的标签（emoji 行盒更高）会比同行按钮高出 2–3px。新增按钮只用既有层级 + 色调组合（`.btn` / `.btn-primary` / `.btn-danger`），不要新开尺寸。
+8. **选中态统一用背景表达，不用彩色描边。** 参照 `.metric-card.expandable.active` 与身份池的 `.wb-credential-row--default`：都是 `background: var(--surface2)`。蓝色描边会让一个元素看起来像"另一类对象"，并与行内的 accent 色调 pill 抢视觉。
 
 ## 二、JS 约定
 
@@ -55,7 +60,7 @@ ui/
 3. **`appState` 只放跨模块共享的值。** 视图内部状态（选中项、定时器、已加载标记）留在该模块的闭包里。加字段前先确认真的有第二个模块要读。
 4. **IPC 只走 `core/ipc.js`。** 不要在视图里直接访问 `window.__TAURI__`；`invoke` 在浏览器里会降级为日志 no-op，这正是 `ui/tools/smoke.mjs` 能脱离 Tauri 跑完整启动流程的原因。
 5. **打破循环依赖用注入，不用反向 import。** 已有两例：`palette.js` 接收 `switchTab`，`settings/oauth-qr.js` 接收 `repaint`。反向 import 会让模块初始化顺序变成隐式契约。
-6. **`settings/` 的内部划分**：`form.js` 只搭骨架，`fields.js` 是纯标记构建器，`badges.js` 管「已修改」基线，`load.js` / `save.js` 读写后端，`credential-pool.js` / `oauth-qr.js` / `checkin.js` 管身份池，`index.js` 是唯一对外接口。外部（`main.js` / `palette.js`）只从 `settings/index.js` 导入。
+6. **`settings/` 的内部划分**：`form.js` 只搭骨架，`fields.js` 是纯标记构建器，`badges.js` 管「已修改」基线，`load.js` / `save.js` 读写后端，`credential-pool.js` / `oauth-qr.js` / `checkin.js` 管身份池，`dsh.js` 管 DSH 一键写入，`index.js` 是唯一对外接口。外部（`main.js` / `palette.js`）只从 `settings/index.js` 导入。
 
 ## 三、`id` 的命名与使用
 

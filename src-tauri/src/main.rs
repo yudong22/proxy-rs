@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use proxy_rs::{
-    claude_config, codex_config, launch_agent, metrics, providers, router, service,
+    claude_config, codex_config, dsh_config, launch_agent, metrics, providers, router, service,
     settings::{self, GuiSettings, LogBuffer, DEFAULT_PORT},
     stats::RequestLogFilter,
     Config, StatsDb,
@@ -1243,6 +1243,126 @@ async fn apply_codex_config(ctx: State<'_, Arc<AppContext>>) -> Result<Value, St
         "note": "重启 Codex 后模型选择器生效",
     }))
 }
+
+/// Report the DSH provider wiring so the UI can show the current state.
+#[tauri::command]
+async fn get_dsh_config() -> Result<Value, String> {
+    let settings_path = match dsh_config::settings_path() {
+        Some(p) => p,
+        None => {
+            return Ok(json!({
+                "supported": false,
+                "reason": "DSH_HOME / HOME is not set",
+            }))
+        }
+    };
+
+    let credentials_path = dsh_config::credentials_path();
+
+    if !settings_path.exists() {
+        return Ok(json!({
+            "supported": true,
+            "settings_path": settings_path.display().to_string(),
+            "settings_exists": false,
+            "provider_exists": false,
+            "model_count": 0,
+            "base_url": null,
+            "credential_present": false,
+        }));
+    }
+
+    let settings_text = std::fs::read_to_string(&settings_path).map_err(|e| e.to_string())?;
+    let credentials_text = credentials_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let state = dsh_config::read_state(&settings_text, credentials_text.as_deref());
+
+    Ok(json!({
+        "supported": true,
+        "settings_path": settings_path.display().to_string(),
+        "settings_exists": true,
+        "provider_exists": state.provider_exists,
+        "model_count": state.model_ids.len(),
+        "base_url": state.base_url,
+        "credential_present": state.credential_present,
+    }))
+}
+
+/// Write this proxy into DSH's `settings.yaml` as the `proxy-rs` provider.
+///
+/// Only that provider's `baseURL` and `models` are touched; the rest of the
+/// document (other providers, the default model, UI preferences, plugin
+/// namespaces) is left byte-for-byte intact. See `dsh_config` for why the write
+/// is textual rather than a YAML round-trip.
+#[tauri::command]
+async fn apply_dsh_config(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    let settings_path = dsh_config::settings_path()
+        .ok_or_else(|| "DSH_HOME / HOME 未设置，无法定位 DSH 配置".to_string())?;
+    let credentials_path = dsh_config::credentials_path()
+        .ok_or_else(|| "DSH_HOME / HOME 未设置，无法定位 DSH 凭据文件".to_string())?;
+
+    let (preset, api_key) = {
+        let settings = ctx.settings.read().await;
+        (settings.models_preset(), settings.api_key.clone())
+    };
+
+    if api_key.is_empty() {
+        return Err("尚未配置 API Key，无法拉取模型列表".to_string());
+    }
+
+    let models = providers::fetch_models(&ctx.client, &preset, &api_key)
+        .await
+        .map_err(|e| format!("从上游 {} 拉取模型失败，未改动 DSH 配置: {}", preset.id, e))?;
+
+    if models.is_empty() {
+        return Err(format!(
+            "上游 {} 未返回任何模型，未改动 DSH 配置",
+            preset.id
+        ));
+    }
+
+    // Prefer the port actually bound, but fall back to the configured one: a
+    // stopped service reports port 0, and writing `http://127.0.0.1:0` would
+    // point DSH at nothing. The configured port is where the service will bind
+    // when it next starts.
+    let bound = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst);
+    let port = if bound != 0 {
+        bound
+    } else {
+        ctx.settings.read().await.port
+    };
+    let base_url = format!("http://127.0.0.1:{}/v1", port);
+
+    let dsh_models: Vec<dsh_config::DshModel> =
+        models.iter().map(dsh_config::to_dsh_model).collect();
+
+    let (settings_path, credentials_path, credential_added) =
+        dsh_config::apply(&settings_path, &credentials_path, &base_url, &dsh_models)
+            .map_err(|e| format!("写入 DSH 配置失败: {}", e))?;
+
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "已写入 DSH 配置（{} 个模型，{}）: {}",
+                dsh_models.len(),
+                base_url,
+                settings_path.display()
+            ),
+        )
+        .await;
+
+    Ok(json!({
+        "ok": true,
+        "models": dsh_models.len(),
+        "base_url": base_url,
+        "settings_path": settings_path.display().to_string(),
+        "credentials_path": credentials_path.display().to_string(),
+        "credential_added": credential_added,
+        "note": "DSH 会在下次请求时读取新配置，无需重启",
+    }))
+}
+
 #[tauri::command]
 async fn test_upstream(
     body: TestUpstreamBody,
@@ -1732,6 +1852,8 @@ fn main() {
             apply_claude_config,
             get_codex_config,
             apply_codex_config,
+            get_dsh_config,
+            apply_dsh_config,
             test_upstream,
             open_logs_dir,
             wb_credentials_list,

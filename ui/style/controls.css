@@ -2,14 +2,29 @@
 
 /* ── Buttons ──────────────────────────────────────────────────── */
 
+/* Every button tier states its height explicitly.
+ *
+ * A button whose box is sized from its content is sized from its *label*, and
+ * an emoji's line box is taller than a run of text: `📱 扫码添加账号` rendered
+ * 30px against the 28px of `保存定时`, so two buttons on one toolbar disagreed
+ * about their height. Pinning the height per tier and centring the label takes
+ * the glyph out of the layout decision, and keeps every button in a row equal.
+ *
+ * The tones stay a two-level system — neutral (`.btn`) and accent
+ * (`.btn-primary`) — with `.btn-danger` as the neutral's destructive variant. */
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 34px;
+  padding: 0 14px;
   background: var(--surface2);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 7px 14px;
   cursor: pointer;
   font-size: 12px;
+  line-height: 1;
   font-family: inherit;
   transition: all .15s;
 }
@@ -26,10 +41,12 @@
 
 .btn-primary:hover {
   background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
 .btn-small {
-  padding: 5px 10px;
+  height: 29px;
+  padding: 0 10px;
   font-size: 11px;
 }
 
@@ -43,16 +60,20 @@
   border-color: var(--error);
 }
 
-/* Three-dot quick-actions menu button (opens the ⌘K palette). */
+/* Three-dot quick-actions menu button (opens the ⌘K palette). Keeps its own
+   compact height: it sits in the window chrome beside a normal button, and
+   inheriting the tier height would make the header jump. */
 .btn-palette {
+  height: 23px;
+  padding: 0 9px;
   color: var(--muted);
   font-size: 15px;
-  line-height: 1;
-  padding: 3px 9px;
 }
 
+/* Narrower horizontal padding only — the vertical box comes from the tier it
+   is combined with, so it can no longer collapse to an 18px-tall stub. */
 .btn-show-hide {
-  padding: 0 10px;
+  padding: 0 8px;
 }
 
 .btn:disabled {
@@ -97,6 +118,13 @@
   color: var(--muted);
   margin-top: 4px;
 }
+
+/* A hint that reports an outcome, mirroring `.save-status.ok/.err`.
+   These exist so a status line can be coloured by class instead of an inline
+   `style="color:var(--success)"`: the inline form duplicated the palette in JS
+   and carried its own drifting fallback values. */
+.hint.ok { color: var(--success); }
+.hint.err { color: var(--error); }
 
 /* ── Toggle Switch ────────────────────────────────────────────── */
 

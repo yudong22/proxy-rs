@@ -2,6 +2,7 @@ pub mod claude_config;
 pub mod codex_config;
 pub mod config;
 pub mod credits;
+pub mod dsh_config;
 pub mod error;
 pub mod launch_agent;
 pub mod metrics;

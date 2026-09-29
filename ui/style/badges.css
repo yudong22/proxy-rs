@@ -13,19 +13,19 @@
 
 .status-pill.status-2xx {
   background: var(--success-tint);
-  color: var(--success);
+  color: var(--success-ink);
   border: 1px solid var(--success-tint-border);
 }
 
 .status-pill.status-4xx {
   background: var(--warning-tint);
-  color: var(--warning);
+  color: var(--warning-ink);
   border: 1px solid var(--warning-tint-border);
 }
 
 .status-pill.status-5xx {
   background: var(--error-tint);
-  color: var(--error);
+  color: var(--error-ink);
   border: 1px solid var(--error-tint-border);
 }
 
@@ -44,11 +44,14 @@
 /* Override pill: marks a request that an exception override (failover session
    switch, degraded retry, …) rerouted onto a different credential/model. Warm
    amber so an overridden row stands out from the green/neutral pills next to
-   it without reading as an error. */
+   it without reading as an error.
+   Uses the semantic tokens rather than their literal values: the previous
+   hardcoded equivalents were the semantic colours spelled out again, so they
+   kept light-mode values under a dark theme. */
 .override-pill {
-  background: var(--warning-tint, rgba(214, 158, 46, 0.12));
-  color: var(--warning, #a8790a);
-  border: 1px solid var(--warning-tint-border, rgba(214, 158, 46, 0.35));
+  background: var(--warning-tint);
+  color: var(--warning-ink);
+  border: 1px solid var(--warning-tint-border);
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -58,16 +61,18 @@
   gap: 3px;
 }
 
+/* The outcome of the override, not the fact of it: green when the reroute
+   rescued the request, red when it failed anyway. */
 .override-pill.override-ok {
-  background: rgba(40, 167, 69, 0.12);
-  color: #28a745;
-  border-color: rgba(40, 167, 69, 0.35);
+  background: var(--success-tint);
+  color: var(--success-ink);
+  border-color: var(--success-tint-border);
 }
 
 .override-pill.override-failed {
-  background: rgba(220, 53, 69, 0.10);
-  color: #dc3545;
-  border-color: rgba(220, 53, 69, 0.30);
+  background: var(--error-tint);
+  color: var(--error-ink);
+  border-color: var(--error-tint-border);
 }
 
 .cell-override-none {

@@ -298,6 +298,9 @@ src/                       # 代理核心库 crate: proxy_rs（纯 Rust，无 GU
   settings.rs              # Layer 3：持久化配置读写与环形日志缓冲
   stats.rs                 # Layer 3：SQLite 每日用量统计持久层
   credits.rs               # Layer 3：余额查询适配层
+  claude_config.rs         # Layer 3：写入 ~/.claude/settings.json 的模型槽位
+  codex_config.rs          # Layer 3：生成 Codex 模型目录并接入 ~/.codex/config.toml
+  dsh_config.rs            # Layer 3：把本代理写入 ~/.dsh/settings.yaml（文本级最小改动）
   workbuddy_auth.rs        # Layer 3：WorkBuddy 登录态凭据存储、指纹头、token 刷新
   session_pool.rs          # Layer 3：凭据池（默认优先 + 4xx 切换粘滞）
   providers.rs             # Layer 3：预置厂商模板与动态模型发现

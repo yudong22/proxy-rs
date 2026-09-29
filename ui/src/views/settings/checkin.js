@@ -29,16 +29,16 @@ export async function triggerBatchCheckin() {
       if (d.status === 'success') {
         badge = '<span class="badge-pill wb-state-pill wb-state-ok">打卡成功</span>';
       } else if (d.status === 'already_checked_in') {
-        badge = '<span class="badge-pill wb-state-pill" style="background:rgba(59,130,246,0.15);color:#3b82f6;">今日已打卡</span>';
+        badge = '<span class="badge-pill wb-state-pill wb-state-pending">今日已打卡</span>';
       } else {
         badge = '<span class="badge-pill wb-state-pill wb-state-expired">失败</span>';
       }
 
       return html`
         <tr>
-          <td style="font-weight:600;">${d.label} <span class="mono" style="color:var(--muted);font-size:11px;">(${d.id})</span></td>
+          <td class="wb-checkin-account">${d.label} <span class="mono wb-checkin-id">(${d.id})</span></td>
           <td>${raw(badge)}</td>
-          <td style="font-size:12px;">${d.message}</td>
+          <td class="wb-checkin-detail">${d.message}</td>
         </tr>
       `;
     }).join('');
@@ -53,15 +53,15 @@ export async function triggerBatchCheckin() {
               <span class="wb-stat-label">总账号数</span>
             </div>
             <div class="wb-stat-card">
-              <span class="wb-stat-val" style="color:var(--success, #2e8b45);">${report.success}</span>
+              <span class="wb-stat-val wb-tone-ok">${report.success}</span>
               <span class="wb-stat-label">本次领取</span>
             </div>
             <div class="wb-stat-card">
-              <span class="wb-stat-val" style="color:#3b82f6;">${report.already_checked_in}</span>
+              <span class="wb-stat-val wb-tone-pending">${report.already_checked_in}</span>
               <span class="wb-stat-label">今日已打卡</span>
             </div>
             <div class="wb-stat-card">
-              <span class="wb-stat-val" style="color:var(--error, #e53e3e);">${report.failed}</span>
+              <span class="wb-stat-val wb-tone-err">${report.failed}</span>
               <span class="wb-stat-label">失败</span>
             </div>
           </div>

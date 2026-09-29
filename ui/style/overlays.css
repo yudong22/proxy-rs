@@ -210,6 +210,17 @@
   background: var(--surface2);
 }
 
+/* The "no matches" row. Keeps the row's shape but drops the affordances: it is
+   a message, not an action, so it must not take the hover or the pointer. */
+.palette-item--empty {
+  color: var(--muted);
+  cursor: default;
+}
+
+.palette-item--empty:hover {
+  background: transparent;
+}
+
 .palette-item kbd {
   font-family: var(--mono);
   font-size: 10px;

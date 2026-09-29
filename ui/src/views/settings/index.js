@@ -19,6 +19,7 @@ import {
 } from './save.js';
 import { refreshSectionBadges } from './badges.js';
 import { initCredentialPool } from './credential-pool.js';
+import { applyDshConfig, loadDshConfig } from './dsh.js';
 
 export { renderSettings, loadSettings, testUpstream, refreshSectionBadges };
 
@@ -28,6 +29,7 @@ export function initSettings() {
   $('#btn-fetch-models')?.addEventListener('click', fetchModels);
   $('#btn-apply-claude-config')?.addEventListener('click', applyClaudeConfig);
   $('#btn-apply-codex-config')?.addEventListener('click', applyCodexConfig);
+  $('#btn-apply-dsh-config')?.addEventListener('click', applyDshConfig);
   $('#btn-test-upstream-settings')?.addEventListener('click', () => {
     testUpstream($('#settings-test-result'));
   });
@@ -40,4 +42,5 @@ export function initSettings() {
 
   initCredentialPool();
   loadCodexConfig();
+  loadDshConfig();
 }

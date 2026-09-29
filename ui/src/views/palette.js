@@ -77,7 +77,7 @@ function render() {
   const filtered = matches();
 
   if (filtered.length === 0) {
-    list.innerHTML = '<div class="palette-item" style="color: var(--muted);">未找到匹配项</div>';
+    list.innerHTML = '<div class="palette-item palette-item--empty">未找到匹配项</div>';
     return;
   }
 

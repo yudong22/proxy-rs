@@ -52,7 +52,7 @@ export function showRequestModal(id) {
     : '';
 
   const tokenInputLabel = (isErr && inputTokens > 0)
-    ? html`输入 Tokens <span style="font-size:10px;color:var(--muted);font-weight:normal;">(估算值)</span>`
+    ? html`输入 Tokens <span class="detail-estimated">(估算值)</span>`
     : '输入 Tokens';
 
   openModal('请求详情', html`

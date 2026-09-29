@@ -70,7 +70,7 @@ export async function fetchModels() {
       container.innerHTML = '<span class="hint">未找到可用模型或当前提供商不支持模型列表查询</span>';
     }
   } catch (err) {
-    container.innerHTML = html`<span class="hint" style="color: var(--error);">拉取失败: ${err}</span>`;
+    container.innerHTML = html`<span class="hint err">拉取失败: ${err}</span>`;
   }
 }
 
@@ -86,12 +86,12 @@ export async function applyClaudeConfig() {
       haiku: $('#setting-claude-haiku').value.trim() || undefined,
     };
     await invoke('apply_claude_config', { body });
-    status.style.color = 'var(--success)';
+    status.className = 'hint ok';
     status.textContent = '✓ 写入 ~/.claude/settings.json 成功';
     setTimeout(() => { status.textContent = ''; }, 3000);
     await loadClaudeConfig();
   } catch (err) {
-    status.style.color = 'var(--error)';
+    status.className = 'hint err';
     status.textContent = '✗ 写入失败: ' + err;
   }
 }
@@ -99,14 +99,14 @@ export async function applyClaudeConfig() {
 /** Write the real model list into the Codex catalog file. */
 export async function applyCodexConfig() {
   const status = $('#codex-config-status');
-  status.style.color = '';
+  status.className = 'hint';
   status.textContent = '正在拉取模型并写入...';
   try {
     const res = await invoke('apply_codex_config');
-    status.style.color = 'var(--success)';
+    status.className = 'hint ok';
     status.textContent = `✓ 已写入 ${res.models} 个模型到 ${res.catalog_path}，重启 Codex 后生效`;
   } catch (err) {
-    status.style.color = 'var(--error)';
+    status.className = 'hint err';
     status.textContent = '✗ ' + err;
   }
 }

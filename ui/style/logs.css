@@ -392,6 +392,15 @@
   word-break: break-all;
 }
 
+/* Marks the input-token figure on a failed request as an estimate rather than a
+   counted value. Sits inside `.detail-val`, so it resets that cell's mono/weight
+   and reads as an aside. */
+.detail-estimated {
+  font-size: 10px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
 .error-block {
   margin-top: 8px;
   padding: 10px;

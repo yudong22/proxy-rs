@@ -81,6 +81,23 @@ export function renderSettings() {
     </div>
   `);
 
+  // DSH reads its model list straight from the provider profile, so — like
+  // Codex — the registry has to be written out rather than discovered. Only
+  // the `proxy-rs` provider's address and models are touched; the rest of
+  // settings.yaml (other providers, default model, UI preferences) is kept.
+  const dsh = section('dsh', 'DSH 一键写入 (~/.dsh/settings.yaml)', html`
+    <p class="hint">
+      将本代理写入 DSH 的 <code>llm-pi-ai.providers.proxy-rs</code>，并把当前服务商的
+      <b>全部可用模型</b>同步过去。<b>只更新该 provider 的地址与模型列表</b>，
+      <code>settings.yaml</code> 中的其他内容（其他 provider、默认模型、界面偏好）原样保留。
+      写入前会自动备份原文件。
+    </p>
+    <div class="actions-row">
+      <button type="button" class="btn btn-small btn-primary" id="btn-apply-dsh-config">写入 DSH 配置</button>
+      <span class="hint" id="dsh-config-status"></span>
+    </div>
+  `);
+
   const network = section('network', '网络与自启', html`
     <div class="form-row">
       ${raw(input('setting-port', '本地端口', '3456', { type: 'number', group: 'half', attrs: ' min="1024" max="65535"' }))}
@@ -163,6 +180,7 @@ export function renderSettings() {
       ${raw(provider)}
       ${raw(claude)}
       ${raw(codex)}
+      ${raw(dsh)}
       ${raw(network)}
       ${raw(advanced)}
       <div class="settings-save-bar">

@@ -1,6 +1,6 @@
 [package]
 name = "proxy-rs-gui"
-version = "1.9.7"
+version = "1.9.8"
 edition = "2021"
 description = "Proxy RS Desktop GUI"
 

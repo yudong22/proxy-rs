@@ -81,7 +81,7 @@ export async function startQrCodeLogin() {
         if (poll.status === 'success') {
           clearOAuthPolling();
           if (statusEl) {
-            statusEl.innerHTML = html`<span style="color:var(--success, #2e8b45);font-weight:600;">✅ 扫码成功！账号已自动加入账号池</span>`;
+            statusEl.innerHTML = html`<span class="wb-qr-status-ok">✅ 扫码成功！账号已自动加入账号池</span>`;
           }
           toast(`WorkBuddy 账号「${poll.credential?.label || '新账号'}」已加入账号池！`, 'ok');
           await refreshPool();
@@ -89,21 +89,21 @@ export async function startQrCodeLogin() {
         } else if (poll.status === 'failed') {
           clearOAuthPolling();
           if (statusEl) {
-            statusEl.innerHTML = html`<span style="color:var(--error, #e53e3e);">❌ 授权失败: ${poll.error}</span>`;
+            statusEl.innerHTML = html`<span class="wb-qr-status-err">❌ 授权失败: ${poll.error}</span>`;
           }
         }
       } catch (err) {
         clearOAuthPolling();
         const statusEl = $('#wb-qr-poll-status');
         if (statusEl) {
-          statusEl.innerHTML = html`<span style="color:var(--error, #e53e3e);">轮询异常: ${err}</span>`;
+          statusEl.innerHTML = html`<span class="wb-qr-status-err">轮询异常: ${err}</span>`;
         }
       }
     }, 2000);
   } catch (err) {
     const qrTarget = $('#wb-qr-target');
     if (qrTarget) {
-      qrTarget.innerHTML = html`<div style="color:var(--error, #e53e3e);padding:20px;">生成授权二维码失败: ${err}</div>`;
+      qrTarget.innerHTML = html`<div class="wb-qr-error">生成授权二维码失败: ${err}</div>`;
     }
   }
 }

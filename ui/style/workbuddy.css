@@ -17,7 +17,7 @@
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: var(--surface, rgba(255, 255, 255, 0.02));
+  background: var(--surface);
 }
 
 .wb-credential-main {
@@ -48,24 +48,42 @@
   padding: 1px 6px;
 }
 
+/* State pills reuse the semantic tints rather than repeating the palette.
+ *
+ * These were hardcoded `rgba()`/hex, which meant they kept their light-mode
+ * colours under `prefers-color-scheme: dark` — on a dark surface the ok/cooldown
+ * pills washed out and the expired pill lost its red. The tokens carry a value
+ * per theme, so the pill follows the theme for free. */
 .wb-state-pill.wb-state-ok {
-  background: rgba(52, 199, 89, 0.14);
-  color: #2e8b45;
+  background: var(--success-tint);
+  color: var(--success-ink);
+  border: 1px solid var(--success-tint-border);
 }
 
 .wb-state-pill.wb-state-cooldown {
-  background: rgba(214, 158, 46, 0.14);
-  color: #a8790a;
+  background: var(--warning-tint);
+  color: var(--warning-ink);
+  border: 1px solid var(--warning-tint-border);
 }
 
 .wb-state-pill.wb-state-expired {
-  background: rgba(255, 59, 48, 0.12);
-  color: #c0392b;
+  background: var(--error-tint);
+  color: var(--error-ink);
+  border: 1px solid var(--error-tint-border);
 }
 
 .wb-state-pill.wb-state-disabled {
   background: var(--neutral-tint);
   color: var(--muted);
+  border: 1px solid var(--neutral-tint-border);
+}
+
+/* Already done today: not a failure, so it takes the accent tone rather than
+   the error red the "失败" pill uses. */
+.wb-state-pill.wb-state-pending {
+  background: var(--accent-tint);
+  color: var(--accent-ink);
+  border: 1px solid var(--accent-tint-border);
 }
 
 .wb-sticky-note {
@@ -87,7 +105,7 @@
 
 .wb-manual-section {
   padding: 12px;
-  background: var(--neutral-tint, rgba(255, 255, 255, 0.03));
+  background: var(--neutral-tint);
   border: 1px dashed var(--border);
   border-radius: 8px;
   margin-bottom: 12px;
@@ -131,8 +149,8 @@
   flex-wrap: wrap;
   margin: 10px 0;
   padding: 8px 10px;
-  background: var(--accent-tint, rgba(59, 130, 246, 0.08));
-  border: 1px solid var(--accent-tint-border, rgba(59, 130, 246, 0.25));
+  background: var(--accent-tint);
+  border: 1px solid var(--accent-tint-border);
   border-radius: 8px;
 }
 
@@ -160,15 +178,15 @@
 }
 
 .wb-type-account {
-  background: rgba(34, 197, 94, 0.15);
-  color: #16a34a;
-  border: 1px solid rgba(34, 197, 94, 0.35);
+  background: var(--identity-account-tint);
+  color: var(--identity-account-ink);
+  border: 1px solid var(--identity-account-border);
 }
 
 .wb-type-key {
-  background: rgba(168, 85, 247, 0.15);
-  color: #9333ea;
-  border: 1px solid rgba(168, 85, 247, 0.35);
+  background: var(--identity-key-tint);
+  color: var(--identity-key-ink);
+  border: 1px solid var(--identity-key-border);
 }
 
 .wb-key-add-row {
@@ -190,15 +208,24 @@
 /* Default-account / default-key marker. Accent-tinted so it reads as a
    selection state rather than as another status pill. */
 .wb-default-pill {
-  background: var(--accent-tint, rgba(59, 130, 246, 0.15));
-  color: var(--accent, #3b82f6);
-  border: 1px solid var(--accent-tint-border, rgba(59, 130, 246, 0.35));
+  background: var(--accent-tint);
+  color: var(--accent-ink);
+  border: 1px solid var(--accent-tint-border);
   font-size: 10px;
   padding: 1px 6px;
 }
 
+/* The row that holds the default identity.
+ *
+ * Marked by surface, not by an accent outline: an accent border made one row of
+ * the pool look like a different *kind* of object from its neighbours, and it
+ * competed with the accent-tinted pills inside the row. `--surface2` is the
+ * app's established selected-surface ( `.metric-card.expandable.active` on the
+ * overview uses the same pair), so a selected pool row now reads the same way a
+ * selected card does. */
 .wb-credential-row--default {
-  border-color: var(--accent, #3b82f6);
+  background: var(--surface2);
+  box-shadow: var(--shadow-sm);
 }
 
 .wb-points {
@@ -209,14 +236,23 @@
 
 .wb-checkin-note {
   font-size: 11px;
-  color: #3b82f6;
+  color: var(--accent);
 }
 
-/* The "设为默认" button reads as selected while it is the default. */
+/* The "设为默认" button reads as selected while it is the default.
+ *
+ * Selected-by-background rather than selected-by-outline, matching the row it
+ * sits in. The hover deepens the tint rather than swapping the surface: the row
+ * behind it is already `--surface2`, so a `--surface2` hover would vanish. */
 .btn-active {
+  background: var(--accent-tint);
+  border-color: var(--accent-tint-border);
+  color: var(--accent-ink);
+}
+
+.btn-active:hover {
+  background: var(--surface);
   border-color: var(--accent);
-  color: var(--accent);
-  background: var(--accent-tint, rgba(59, 130, 246, 0.12));
 }
 
 /* ── WorkBuddy QR Code Modal ─────────────────────────────────────── */
@@ -235,6 +271,9 @@
   margin-bottom: 16px;
 }
 
+/* Not a theme colour: a QR code must sit on white to scan, so the box keeps a
+   literal white plate and dark ink under both themes. The two literals here are
+   the deliberate exception to "colours come from tokens". */
 .wb-qr-box {
   background: #ffffff;
   padding: 16px;
@@ -268,27 +307,34 @@
   color: var(--muted);
 }
 
+/* The waiting indicator inside the QR dialog. Was Tailwind blue `#3b82f6`,
+   which is not this app's accent (`--accent` is `#0071e3`), so it rendered a
+   visibly different blue from the link and the accent-tinted chrome beside it.
+   Now follows the theme like every other accent-coloured element. */
 .wb-pulse-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #3b82f6;
-  box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7);
+  background: var(--accent);
+  box-shadow: 0 0 0 0 var(--accent-ring);
   animation: wb-pulse 1.8s infinite;
 }
 
 @keyframes wb-pulse {
   0% {
     transform: scale(0.95);
-    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7);
+    box-shadow: 0 0 0 0 var(--accent-ring);
   }
   70% {
     transform: scale(1);
-    box-shadow: 0 0 0 6px rgba(59, 130, 246, 0);
+    /* Fades to the accent's own zero-alpha value rather than `transparent`:
+       interpolating to `transparent` passes through grey, which reads as a
+       dirty halo on a dark surface. */
+    box-shadow: 0 0 0 6px var(--accent-ring-clear);
   }
   100% {
     transform: scale(0.95);
-    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+    box-shadow: 0 0 0 0 var(--accent-ring-clear);
   }
 }
 
@@ -298,7 +344,7 @@
 
 .wb-external-link {
   font-size: 12px;
-  color: var(--accent, #3b82f6);
+  color: var(--accent);
   text-decoration: underline;
   cursor: pointer;
 }
@@ -323,7 +369,7 @@
   align-items: center;
   justify-content: center;
   padding: 10px;
-  background: var(--surface, rgba(255, 255, 255, 0.03));
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
 }
@@ -333,6 +379,14 @@
   font-weight: 700;
   line-height: 1.2;
 }
+
+/* Outcome colouring for the report's summary numbers and its status cells.
+   These were inline `style="color:var(--success, #2e8b45)"` in the report
+   markup, which duplicated the palette in JS — and with fallback values that
+   disagreed with the tokens. As classes they read from the theme. */
+.wb-tone-ok { color: var(--success); }
+.wb-tone-pending { color: var(--accent); }
+.wb-tone-err { color: var(--error); }
 
 .wb-stat-label {
   font-size: 11px;
@@ -358,4 +412,36 @@
   color: var(--muted);
   font-weight: 500;
   font-size: 12px;
+}
+
+/* The account cell: the label leads, the id sits quieter beside it. */
+.wb-checkin-account {
+  font-weight: 600;
+}
+
+.wb-checkin-id {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.wb-checkin-detail {
+  font-size: 12px;
+}
+
+/* Failure detail for the QR dialog: the reason occupies its own block. */
+.wb-qr-error {
+  color: var(--error);
+  padding: 20px;
+}
+
+/* The poll status line's outcome. `.wb-qr-poll-status` already lays out the
+   row; these two only carry the tone. */
+.wb-qr-status-ok {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.wb-qr-status-err {
+  color: var(--error);
 }

@@ -34,9 +34,50 @@
   --error-tint-border: rgba(220, 53, 69, .25);
   --accent-tint: rgba(0, 113, 227, .1);
   --accent-tint-border: rgba(0, 113, 227, .2);
+  /* The accent at the opacity the QR poll's pulsing ring needs, plus the fully
+     transparent end of that animation. Separate tokens because neither tint
+     above is opaque enough to read as a glow, and because `box-shadow` has to
+     interpolate between two concrete colours — `transparent` would fade through
+     grey, and `color-mix()` is unavailable in this webview's minimum target. */
+  --accent-ring: rgba(0, 113, 227, .7);
+  --accent-ring-clear: rgba(0, 113, 227, 0);
   --neutral-tint: rgba(110, 110, 115, .1);
   --neutral-tint-border: rgba(110, 110, 115, .2);
   --danger-border: rgba(220, 53, 69, .3);
+
+  /* "Ink" variants: the semantic colours darkened for use as *small text on a
+     tint of themselves*.
+   *
+   * `--success` and friends are fill colours, tuned to be legible as a solid
+   * block. Reused as 10–11px text on their own pale tint they only reach about
+   * 2.3–3.8:1, which is below the 4.5:1 the pill labels need — so the status
+   * pills carry two colours: the fill/border from the token above, and the text
+   * from here. They are darker than the tint and lighter than a solid block.
+   * Each is measured against its own tint composited on `--surface`; dark mode
+   * goes the other way and brightens, because there the tint sits on a dark
+   * surface. */
+  --success-ink: #177a33;
+  --warning-ink: #96540a;
+  --error-ink: #c0392b;
+
+  /* Identity markers: which kind of pool entry a row is (a logged-in account vs
+     a pasted API key). These are categorical, not status — deliberately not the
+     semantic success/error hues, so the type pill stays readable beside a state
+     pill in the same row without the two reading as the same signal. */
+  --identity-account-tint: rgba(34, 197, 94, .15);
+  --identity-account: #16a34a;
+  --identity-account-border: rgba(34, 197, 94, .35);
+  --identity-key-tint: rgba(168, 85, 247, .15);
+  --identity-key: #9333ea;
+  --identity-key-border: rgba(168, 85, 247, .35);
+  /* As with the status colours above, the ink is darker than the fill so the
+     10px label on a tint of itself clears 4.5:1 (`#16a34a` on its own tint was
+     2.9:1). */
+  --identity-account-ink: #116b30;
+  --identity-key-ink: #6b21a8;
+  /* Accent as small text on `--accent-tint` — used by `.wb-default-pill` and
+     `.btn-active`. `--accent` itself measures 4.1:1 there. */
+  --accent-ink: #0058b0;
 
   /* Shape */
   --radius-sm: 4px;
@@ -90,5 +131,41 @@
     --danger-border: rgba(255, 69, 58, .35);
     --accent-tint: rgba(10, 132, 255, .14);
     --accent-tint-border: rgba(10, 132, 255, .3);
+
+    /* The semantic tints need a dark value too, or a pill's text brightens with
+       the theme while its wash and outline stay at the light-mode colour — the
+       two then disagree, and the light wash reads as grey mud on a dark
+       surface. Alpha rises slightly to keep the same apparent strength against
+       the darker backdrop. */
+    --success-tint: rgba(48, 209, 88, .16);
+    --success-tint-border: rgba(48, 209, 88, .32);
+    --warning-tint: rgba(255, 159, 10, .16);
+    --warning-tint-border: rgba(255, 159, 10, .32);
+    --error-tint: rgba(255, 69, 58, .16);
+    --error-tint-border: rgba(255, 69, 58, .32);
+    --neutral-tint: rgba(152, 152, 157, .16);
+    --neutral-tint-border: rgba(152, 152, 157, .32);
+
+    /* Brightened rather than darkened: on a dark surface the ink must be
+       lighter than the tint to read at all. Measured against the same tints. */
+    --success-ink: #5ee88f;
+    --warning-ink: #ffb340;
+    --error-ink: #ff8a80;
+    /* Follows the dark accent rather than staying on the light one. */
+    --accent-ring: rgba(10, 132, 255, .7);
+    --accent-ring-clear: rgba(10, 132, 255, 0);
+
+    /* Brightened with the theme, the way --success/--error/--warning are: the
+       light-mode greens and purples read as muddy on a dark surface. */
+    --identity-account-tint: rgba(48, 209, 88, .16);
+    --identity-account: #4ade80;
+    --identity-account-border: rgba(48, 209, 88, .4);
+    --identity-key-tint: rgba(191, 128, 255, .18);
+    --identity-key: #c084fc;
+    --identity-key-border: rgba(191, 128, 255, .42);
+    /* Brightened, matching the direction the semantic inks take here. */
+    --identity-account-ink: #6ee7a0;
+    --identity-key-ink: #d8b4fe;
+    --accent-ink: #6cb6ff;
   }
 }

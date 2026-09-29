@@ -68,6 +68,11 @@ const MOCK = {
   get_providers: { providers: [{ id: 'workbuddy-cn', name: 'WorkBuddy CN' }, { id: 'openai', name: 'OpenAI' }] },
   get_claude_config: { env: { ANTHROPIC_MODEL: 'deepseek-chat' } },
   get_codex_config: { supported: true, catalog_exists: false, catalog_path: '/tmp/cat.json', config_path: '/tmp/cfg.toml' },
+  get_dsh_config: {
+    supported: true, settings_path: '/tmp/.dsh/settings.yaml', settings_exists: true,
+    provider_exists: true, model_count: 4, base_url: 'http://127.0.0.1:3457/v1',
+    credential_present: true,
+  },
   get_request_logs: { items: [], total: 0, models: [], clients: [], sessions: [] },
   get_logs: { entries: [] },
   wb_credentials_list: {
@@ -107,6 +112,9 @@ const EXPECTED = {
   rowStates: ['正常', '冷却中', '已启用'],
   defaultRowFlags: [true, false, false],
   selectValue: 'cred-1',
+  // The DSH group renders its live state on load, from get_dsh_config.
+  dshButtonPresent: true,
+  dshStatus: '当前 4 个模型 · http://127.0.0.1:3457/v1 · 凭据已就绪',
 };
 
 const server = http.createServer((req, res) => {
@@ -221,6 +229,8 @@ try {
         rowStates: rows.map((r) => r.querySelector('.wb-state-pill')?.textContent),
         defaultRowFlags: rows.map((r) => r.classList.contains('wb-credential-row--default')),
         selectValue: sel?.value,
+        dshButtonPresent: Boolean(document.querySelector('#btn-apply-dsh-config')),
+        dshStatus: t('#dsh-config-status'),
       };
     })()`,
   });
@@ -231,6 +241,8 @@ try {
   check('rowStates', b.rowStates, EXPECTED.rowStates);
   check('defaultRowFlags', b.defaultRowFlags, EXPECTED.defaultRowFlags);
   check('selectValue', b.selectValue, EXPECTED.selectValue);
+  check('dsh button present', b.dshButtonPresent, EXPECTED.dshButtonPresent);
+  check('dsh status', b.dshStatus, EXPECTED.dshStatus);
 
   // Cross-module integration 1: palette's dynamic import of the settings view.
   await send('Runtime.evaluate', { expression: 'window.__CALLS__.length = 0;' });
