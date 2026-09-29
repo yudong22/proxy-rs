@@ -65,7 +65,7 @@ function options(pairs, id, title) {
 /**
  * The table view's column headers.
  *
- * Column widths live in CSS (`components.css`), not inline: a fixed-layout table
+ * Column widths live in CSS (`logs.css`), not inline: a fixed-layout table
  * sizes columns from `width`, and keeping the numbers in one place is what stops
  * a header from disagreeing with the cell rules that clip against it.
  */

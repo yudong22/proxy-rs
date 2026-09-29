@@ -10,17 +10,7 @@ import { html, raw } from '../core/dom.js';
 import { appState } from '../core/state.js';
 import { formatDuration } from '../lib/format.js';
 import { openModal } from './modal.js';
-
-/** Status pill, matching the one the table row shows. */
-function statusBadge(item) {
-  if (item.status >= 200 && item.status < 300) {
-    return html`<span class="badge-pill status-pill status-2xx">${item.status} OK</span>`;
-  }
-  if (item.status >= 400 && item.status < 500) {
-    return html`<span class="badge-pill status-pill status-4xx">${item.status}</span>`;
-  }
-  return html`<span class="badge-pill status-pill status-5xx">${item.status || 'ERR'}</span>`;
-}
+import { statusBadge, isFailedRequest, overridePillClass } from './pills.js';
 
 /** Open the detail view for the row with this id, if it is still loaded. */
 export function showRequestModal(id) {
@@ -45,14 +35,14 @@ export function showRequestModal(id) {
       </tr>`
     : '';
 
-  const isErr = item.status >= 400 || Boolean(item.error);
+  const isErr = isFailedRequest(item);
 
   const overrideRows = (item.override_key || item.override_model)
     ? html`
       <tr>
         <td class="detail-key">Override 结果</td>
         <td class="detail-val">
-          <span class="badge-pill override-pill ${isErr ? 'override-failed' : 'override-ok'}">
+          <span class="badge-pill override-pill ${overridePillClass(item)}">
             ${isErr ? '✗ 纠错尝试后仍失败' : '✓ 纠错切换成功'}
           </span>
         </td>

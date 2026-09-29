@@ -1,0 +1,227 @@
+/* Metric cards, the session speed table and section/key-value blocks. */
+
+/* ── Metric Cards ─────────────────────────────────────────────── */
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.metric-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  box-shadow: var(--shadow-sm);
+}
+
+.metric-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.metric-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Secondary line under a card's value: the account a balance belongs to.
+   Deliberately quiet — it names the value above it, it is not a second metric. */
+.metric-sub {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Session speed table (输出速度 drill-down) ────────────────── */
+
+/* One transposed table: metrics are rows, the recent conversations are columns,
+   so a single measure reads straight across sessions. */
+.speed-sessions {
+  width: 100%;
+  border-collapse: collapse;
+  /* Auto layout rather than the request table's fixed layout: the columns are
+     session ids of very different lengths, and each should take the width it
+     needs. The panel is inside `.section`, so it already has its own frame. */
+  table-layout: auto;
+  font-size: 12px;
+}
+
+.speed-sessions th,
+.speed-sessions td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+
+.speed-sessions tbody tr:last-child th,
+.speed-sessions tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* The metric-label column: fixed at 220px so the metric names line up whatever
+   the session ids are, and never wrap (`首 token 平均（TTFT）` is the longest). */
+.speed-sessions th.col-metric {
+  width: 220px;
+  min-width: 220px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.speed-sessions td {
+  font-variant-numeric: tabular-nums;
+  vertical-align: top;
+}
+
+/* The session header cells. Ids are abbreviated to one segment, so they stay on
+   a single line; the full id is in the cell's `title`. */
+.speed-sessions th.col-session-cell {
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* The conversation the card above describes. Marked by a tinted column so it is
+   findable without reading every header. */
+.speed-sessions th.col-session-cell.is-current,
+.speed-sessions td.is-current {
+  color: var(--accent);
+  background: var(--surface2);
+}
+
+.speed-sessions td.is-current {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Metric cells never wrap: each holds one short figure, and allowing a wrap
+   would make the rows jump in height as values change. */
+.speed-sessions tr > td {
+  white-space: nowrap;
+}
+
+.speed-sessions .speed-empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 12px;
+}
+
+.metric-card.running .metric-value { color: var(--success); }
+.metric-card.stopped .metric-value { color: var(--error); }
+
+/* A card that does something on click. Hover lifts it on its own shadow — no
+   accent border in any state, so a clickable card never draws a blue outline. */
+.metric-card.clickable {
+  cursor: pointer;
+  transition: background-color .15s, box-shadow .15s;
+}
+
+.metric-card.clickable:hover {
+  box-shadow: var(--shadow);
+}
+
+/* A card that expands a panel *below itself* (缓存命中率 / 输出速度). Open state is
+   a light surface plus the flipped caret — deliberately not an accent border: a
+   blue outline read as a stray line across the page and competed with the value.
+   Scoped to `.expandable` so the refresh/navigate cards, which are clickable but
+   reveal nothing, never take an "open" appearance. */
+.metric-card.expandable.active {
+  background: var(--surface2);
+  box-shadow: var(--shadow);
+}
+
+/* The disclosure caret. Drawn as a CSS triangle rather than a "▾" glyph, for the
+   same reason `views.css` draws the settings caret: a typed glyph renders at
+   inconsistent size and baseline across the fonts this webview can fall back to.
+   Points down while collapsed ("click to expand"), rotated up while open. The
+   span is empty text, so without these borders it measured 0×0 and the rotation
+   had nothing to turn — the caret was invisible in both states. */
+.stat-caret {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin-left: 3px;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  vertical-align: middle;
+  transition: transform .15s;
+}
+
+.metric-card.expandable.active .stat-caret {
+  transform: rotate(180deg);
+}
+
+/* In-flight feedback for the 剩余积分 card, whose click triggers an upstream
+   billing request: dimmed value plus a caret spin makes the wait legible and
+   signals that clicking again will not speed it up. */
+.metric-card.loading {
+  pointer-events: none;
+  opacity: .65;
+}
+
+.metric-card.loading .metric-value {
+  animation: pulse-soft 1.1s ease-in-out infinite;
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .45; }
+}
+
+/* ── Section & Key/Value List ─────────────────────────────────── */
+
+.section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 14px;
+}
+
+.section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .04em;
+  margin-bottom: 12px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 8px 16px;
+  font-size: 12px;
+}
+
+.kv dt {
+  color: var(--muted);
+  align-self: center;
+}
+
+.kv dd {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+

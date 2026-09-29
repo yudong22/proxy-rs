@@ -33,3 +33,7 @@ npm-debug.log*
 # Unrelated reference project kept locally (has its own repository)
 
 .DS_Store
+
+# Front-end check scratch (headless Chrome profiles)
+.chrome-profile/
+.chrome-smoke/

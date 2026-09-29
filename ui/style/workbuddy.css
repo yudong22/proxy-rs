@@ -1,0 +1,361 @@
+/* WorkBuddy pools, QR modal and check-in report. */
+
+/* ── WorkBuddy credential pool (settings) ───────────────────────── */
+
+.wb-credential-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wb-credential-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface, rgba(255, 255, 255, 0.02));
+}
+
+.wb-credential-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.wb-credential-label {
+  font-weight: 600;
+}
+
+.wb-credential-id {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.wb-credential-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.wb-state-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+}
+
+.wb-state-pill.wb-state-ok {
+  background: rgba(52, 199, 89, 0.14);
+  color: #2e8b45;
+}
+
+.wb-state-pill.wb-state-cooldown {
+  background: rgba(214, 158, 46, 0.14);
+  color: #a8790a;
+}
+
+.wb-state-pill.wb-state-expired {
+  background: rgba(255, 59, 48, 0.12);
+  color: #c0392b;
+}
+
+.wb-state-pill.wb-state-disabled {
+  background: var(--neutral-tint);
+  color: var(--muted);
+}
+
+.wb-sticky-note {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+#wb-status.error {
+  color: var(--error);
+}
+
+.wb-pool-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0 12px 0;
+}
+
+.wb-manual-section {
+  padding: 12px;
+  background: var(--neutral-tint, rgba(255, 255, 255, 0.03));
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+/* ── WorkBuddy schedule row ─────────────────────────────────────── */
+
+.wb-schedule-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.wb-checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.wb-time-input {
+  width: 110px;
+}
+
+.wb-schedule-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ── WorkBuddy API key pool ─────────────────────────────────────── */
+
+/* Unified default-identity selector (accounts + keys in one). */
+.wb-default-identity-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+  padding: 8px 10px;
+  background: var(--accent-tint, rgba(59, 130, 246, 0.08));
+  border: 1px solid var(--accent-tint-border, rgba(59, 130, 246, 0.25));
+  border-radius: 8px;
+}
+
+.wb-default-identity-row label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.wb-default-identity-select {
+  min-width: 240px;
+  max-width: 380px;
+  padding: 5px 8px;
+}
+
+.wb-default-key-hint {
+  font-size: 11px;
+}
+
+/* Type marker distinguishing an account (login state) from an API key. */
+.wb-type-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+
+.wb-type-account {
+  background: rgba(34, 197, 94, 0.15);
+  color: #16a34a;
+  border: 1px solid rgba(34, 197, 94, 0.35);
+}
+
+.wb-type-key {
+  background: rgba(168, 85, 247, 0.15);
+  color: #9333ea;
+  border: 1px solid rgba(168, 85, 247, 0.35);
+}
+
+.wb-key-add-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.wb-key-input {
+  width: 240px;
+}
+
+.wb-label-input {
+  width: 140px;
+}
+
+/* Default-account / default-key marker. Accent-tinted so it reads as a
+   selection state rather than as another status pill. */
+.wb-default-pill {
+  background: var(--accent-tint, rgba(59, 130, 246, 0.15));
+  color: var(--accent, #3b82f6);
+  border: 1px solid var(--accent-tint-border, rgba(59, 130, 246, 0.35));
+  font-size: 10px;
+  padding: 1px 6px;
+}
+
+.wb-credential-row--default {
+  border-color: var(--accent, #3b82f6);
+}
+
+.wb-points {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.wb-checkin-note {
+  font-size: 11px;
+  color: #3b82f6;
+}
+
+/* The "设为默认" button reads as selected while it is the default. */
+.btn-active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-tint, rgba(59, 130, 246, 0.12));
+}
+
+/* ── WorkBuddy QR Code Modal ─────────────────────────────────────── */
+
+.wb-qr-modal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 10px 0;
+}
+
+.wb-qr-tip {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 16px;
+}
+
+.wb-qr-box {
+  background: #ffffff;
+  padding: 16px;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 240px;
+  min-height: 240px;
+}
+
+.wb-qr-box svg {
+  display: block;
+  width: 220px;
+  height: 220px;
+}
+
+.wb-qr-loading {
+  color: #333333;
+  font-size: 13px;
+}
+
+.wb-qr-poll-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 18px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.wb-pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3b82f6;
+  box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7);
+  animation: wb-pulse 1.8s infinite;
+}
+
+@keyframes wb-pulse {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 6px rgba(59, 130, 246, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+  }
+}
+
+.wb-qr-link-row {
+  margin-top: 14px;
+}
+
+.wb-external-link {
+  font-size: 12px;
+  color: var(--accent, #3b82f6);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ── WorkBuddy Checkin Report Modal ──────────────────────────────── */
+
+.wb-checkin-report-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.wb-checkin-summary-cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+
+.wb-stat-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 10px;
+  background: var(--surface, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.wb-stat-val {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.wb-stat-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.wb-checkin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-top: 8px;
+}
+
+.wb-checkin-table th,
+.wb-checkin-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.wb-checkin-table th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+}

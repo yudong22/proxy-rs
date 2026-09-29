@@ -152,12 +152,33 @@ tasks:
     cmds:
       - cargo test -- --nocapture --test-threads=1
 
+  # ── Front-end (ui/) ──────────────────────────────────────────────────────
+  # The UI has no bundler, so nothing else would catch a stylesheet that is not
+  # linked, an import that no module exports, or an id lookup that misses.
+
+  ui-check:
+    desc: Check ui/ consistency (stylesheet cascade, imports, ids)
+    cmds:
+      - node ui/tools/check-ui.mjs
+
+  ui-smoke:
+    desc: Boot ui/ in headless Chrome against a mock backend and assert behaviour
+    cmds:
+      - node ui/tools/smoke.mjs
+
+  ui-test:
+    desc: Run both front-end checks
+    cmds:
+      - task: ui-check
+      - task: ui-smoke
+
   check:
-    desc: Run all checks (fmt, lint, test)
+    desc: Run all checks (fmt, lint, test, ui)
     cmds:
       - task: fmt-check
       - task: lint
       - task: test
+      - task: ui-test
 
   clean:
     desc: Clean build artifacts

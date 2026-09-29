@@ -36,7 +36,7 @@ const actions = [
     kbd: 'T',
     run: async () => {
       switchTab('settings');
-      const { testUpstream } = await import('./settings.js');
+      const { testUpstream } = await import('./settings/index.js');
       testUpstream($('#settings-test-result'));
     },
   },

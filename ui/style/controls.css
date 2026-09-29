@@ -1,0 +1,154 @@
+/* Buttons, form controls and the toggle switch. */
+
+/* ── Buttons ──────────────────────────────────────────────────── */
+
+.btn {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 14px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+  transition: all .15s;
+}
+
+.btn:hover {
+  border-color: var(--accent);
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.btn-small {
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+.btn-danger {
+  color: var(--error);
+  border-color: var(--danger-border);
+}
+
+.btn-danger:hover {
+  background: var(--danger-tint);
+  border-color: var(--error);
+}
+
+/* Three-dot quick-actions menu button (opens the ⌘K palette). */
+.btn-palette {
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  padding: 3px 9px;
+}
+
+.btn-show-hide {
+  padding: 0 10px;
+}
+
+.btn:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+/* Small inline "复制" affordance attached to a value in a <dd>. */
+.btn-copy {
+  background: var(--surface2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.btn-copy:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* ── Form Controls ────────────────────────────────────────────── */
+/* Shared by the log filters and the settings form: same box, different size. */
+
+.log-select, .log-input {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.log-input { width: 160px; }
+
+.hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+/* ── Toggle Switch ────────────────────────────────────────────── */
+
+.toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 44px;
+  height: 26px;
+  cursor: pointer;
+  /* The switch is the direct sibling of the checkbox it mirrors, so the
+     input:checked + .toggle-slider rules below bind. */
+  flex: 0 0 auto;
+}
+
+.toggle input {
+  position: absolute;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+
+.toggle-slider {
+  position: relative;
+  width: 44px;
+  height: 26px;
+  background: var(--surface2);
+  border-radius: 13px;
+  border: 1px solid var(--border);
+  transition: background .2s, border-color .2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
+  transition: transform .2s;
+}
+
+input:checked + .toggle-slider {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+input:checked + .toggle-slider::before {
+  transform: translateX(18px);
+}
+

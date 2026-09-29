@@ -12,17 +12,7 @@ import { shortSessionId, shortTime, formatDuration } from '../lib/format.js';
 import { confirmAction } from './confirm.js';
 import { toast } from './toast.js';
 import { showRequestModal } from './request-modal.js';
-
-/** Status pill for a 2xx/4xx/5xx (or failed) response. */
-function statusBadge(item) {
-  if (item.status >= 200 && item.status < 300) {
-    return html`<span class="badge-pill status-pill status-2xx">${item.status} OK</span>`;
-  }
-  if (item.status >= 400 && item.status < 500) {
-    return html`<span class="badge-pill status-pill status-4xx">${item.status}</span>`;
-  }
-  return html`<span class="badge-pill status-pill status-5xx">${item.status || 'ERR'}</span>`;
-}
+import { statusBadge, isFailedRequest, overridePillClass } from './pills.js';
 
 /** Session cell: client pill + shortened id, or an em dash when unknown. */
 function sessionCell(item) {
@@ -47,8 +37,8 @@ function overrideCell(item) {
   if (!key && !model) {
     return html`<span class="cell-override-none">—</span>`;
   }
-  const isErr = item.status >= 400 || Boolean(item.error);
-  const pillClass = isErr ? 'override-failed' : 'override-ok';
+  const isErr = isFailedRequest(item);
+  const pillClass = overridePillClass(item);
   const prefix = isErr ? '✗ ' : '✓ ';
   const label = [key, model].filter(Boolean).join(' @ ');
   const displayLabel = isErr ? `${prefix}${label} (仍失败)` : `${prefix}${label}`;
@@ -66,7 +56,7 @@ function overrideCell(item) {
  * tags and the cell would print `<span class="…">` as text.
  */
 function row(item) {
-  const isErr = item.status >= 400 || Boolean(item.error);
+  const isErr = isFailedRequest(item);
   const input = item.input_tokens ? item.input_tokens.toLocaleString() : '0';
   const output = item.output_tokens ? item.output_tokens.toLocaleString() : '0';
   const cacheHint = item.cache_read_tokens > 0

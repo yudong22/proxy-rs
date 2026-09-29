@@ -7,13 +7,19 @@
   <link rel="icon" type="image/svg+xml" href="assets/logo.svg">
 
   <!-- Stylesheets load in cascade order: tokens define the variables every
-       later file reads, then reset, shell, shared components, and finally the
-       view-specific rules that are allowed to override components. -->
+       later file reads, then reset/utilities, controls, badges, overlays, the
+       shell layout, shared cards, logs/table, view styles, and finally the
+       WorkBuddy-specific rules that are allowed to override everything above. -->
   <link rel="stylesheet" href="style/tokens.css">
   <link rel="stylesheet" href="style/base.css">
+  <link rel="stylesheet" href="style/controls.css">
+  <link rel="stylesheet" href="style/badges.css">
+  <link rel="stylesheet" href="style/overlays.css">
   <link rel="stylesheet" href="style/layout.css">
-  <link rel="stylesheet" href="style/components.css">
+  <link rel="stylesheet" href="style/cards.css">
+  <link rel="stylesheet" href="style/logs.css">
   <link rel="stylesheet" href="style/views.css">
+  <link rel="stylesheet" href="style/workbuddy.css">
 </head>
 
 <!--

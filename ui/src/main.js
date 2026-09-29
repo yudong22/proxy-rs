@@ -33,7 +33,7 @@ import {
   pollRequestLogs,
 } from './views/logs.js';
 import { fetchRequestLogs } from './components/table.js';
-import { initSettings, loadSettings, renderSettings } from './views/settings.js';
+import { initSettings, loadSettings, renderSettings } from './views/settings/index.js';
 import { initPalette, close as closePalette } from './views/palette.js';
 
 // ── Tab routing ────────────────────────────────────────────────
