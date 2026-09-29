@@ -29,25 +29,31 @@
   border: 1px solid var(--error-tint-border);
 }
 
+/* Stream mode: a property of the request, not an outcome, so it is neutral and
+   leans on weight instead of hue. The accent version was the third blue in a
+   row (with the inspect button and the accent chrome) competing for the eye
+   while carrying no state. `.stream-true` is the notable case, so it is the
+   stronger of the two. */
 .stream-pill.stream-true {
-  background: var(--accent-tint);
-  color: var(--accent);
-  border: 1px solid var(--accent-tint-border);
-}
-
-.stream-pill.stream-false {
   background: var(--neutral-tint);
-  color: var(--muted);
+  color: var(--text);
   border: 1px solid var(--neutral-tint-border);
 }
 
+.stream-pill.stream-false {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
 /* Override pill: marks a request that an exception override (failover session
-   switch, degraded retry, …) rerouted onto a different credential/model. Warm
-   amber so an overridden row stands out from the green/neutral pills next to
-   it without reading as an error.
-   Uses the semantic tokens rather than their literal values: the previous
-   hardcoded equivalents were the semantic colours spelled out again, so they
-   kept light-mode values under a dark theme. */
+   switch, degraded retry, …) rerouted onto a different credential/model.
+ *
+ * Amber for the plain case, and green/red only for the outcome — but note the
+ * distinction from the STATUS pill beside it: that one reports the HTTP result,
+ * this one reports whether the *reroute* rescued the request. They can disagree
+ * (a 200 whose override failed, a 500 that was retried and still failed), which
+ * is why the override pill keeps its own colour rather than inheriting status. */
 .override-pill {
   background: var(--warning-tint);
   color: var(--warning-ink);
@@ -61,14 +67,12 @@
   gap: 3px;
 }
 
-/* The outcome of the override, not the fact of it: green when the reroute
-   rescued the request, red when it failed anyway. */
-.override-pill.override-ok {
-  background: var(--success-tint);
-  color: var(--success-ink);
-  border-color: var(--success-tint-border);
-}
-
+/* The outcome is carried by the pill's own ✓/✗ prefix and by its wording
+   ("仍失败"), so it does not also need a hue: green here duplicated the STATUS
+   pill's green in the same row — both are derived from the same failed-request
+   test — and two green pills side by side say one thing. Only the failed case
+   keeps a colour, because that is the one worth noticing; the successful case
+   stays on the amber base, which reads as "an override happened". */
 .override-pill.override-failed {
   background: var(--error-tint);
   color: var(--error-ink);
@@ -79,33 +83,20 @@
   color: var(--muted);
 }
 
-/* One colour per client dialect, so a mixed log can be scanned by hue even
-   before the dropdown is touched. These hues are brand colours and are
-   deliberately not tokenised. */
+/* The client dialect (dsh / claude / codex).
+ *
+ * Deliberately monochrome. This pill used to carry one brand hue per client,
+ * which put three more saturated colours into a row that already uses colour for
+ * stream mode, HTTP status and override outcome — five hues in one line, with
+ * the client's being the only one that repeats what its own label already says.
+ * The label carries the identity; colour is reserved for state. */
 .client-pill {
-  background: rgba(120, 130, 150, .14);
-  color: var(--muted);
-  border: 1px solid rgba(120, 130, 150, .25);
+  background: var(--neutral-tint);
+  color: var(--muted-ink);
+  border: 1px solid var(--neutral-tint-border);
   font-size: 10px;
   padding: 1px 6px;
   flex: 0 0 auto;
-}
-
-.client-pill.client-codex {
-  background: rgba(16, 163, 127, .12);
-  color: #10a37f;
-  border-color: rgba(16, 163, 127, .3);
-}
-
-.client-pill.client-claude {
-  background: rgba(216, 119, 76, .14);
-  color: #d8774c;
-  border-color: rgba(216, 119, 76, .32);
-}
-
-.client-pill.client-dsh {
-  background: rgba(90, 130, 220, .14);
-  color: #5a82dc;
-  border-color: rgba(90, 130, 220, .32);
+  font-weight: 600;
 }
 

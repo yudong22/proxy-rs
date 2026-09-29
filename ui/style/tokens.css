@@ -45,6 +45,11 @@
   --neutral-tint-border: rgba(110, 110, 115, .2);
   --danger-border: rgba(220, 53, 69, .3);
 
+  /* The muted text colour for use *on a neutral tint* rather than on a plain
+     surface. `--muted` clears 4.5:1 on `--surface`, but the neutral pill sits on
+     a grey wash, which costs about 0.6 — enough to drop it under AA. */
+  --muted-ink: #5a5a5f;
+
   /* "Ink" variants: the semantic colours darkened for use as *small text on a
      tint of themselves*.
    *
@@ -145,6 +150,7 @@
     --error-tint-border: rgba(255, 69, 58, .32);
     --neutral-tint: rgba(152, 152, 157, .16);
     --neutral-tint-border: rgba(152, 152, 157, .32);
+    --muted-ink: #b0b0b5;
 
     /* Brightened rather than darkened: on a dark surface the ink must be
        lighter than the tint to read at all. Measured against the same tints. */

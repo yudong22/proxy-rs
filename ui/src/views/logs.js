@@ -106,28 +106,37 @@ export function renderLogsView() {
          each of its groups is framed already. The inner panes drop their own
          border/shadow so this reads as a single card rather than nested boxes. -->
     <div class="logs-panel">
-      <!-- Row 1 (shared by both views): view toggle + log-directory shortcut. -->
+      <!-- Row 1 (shared by both views): view toggle + log-directory shortcut,
+           with the table's own actions pushed to the right edge. Those actions
+           live here rather than in the filter row because the filter row has no
+           room left for them: four selects plus the search box already fill it,
+           so the count/refresh/clear used to wrap onto a third line of chrome
+           above the table. -->
       <div class="logs-toolbar">
         <div class="view-mode-group">
           <button type="button" class="btn-toggle active" id="view-mode-table" title="表格视图">表格</button>
           <button type="button" class="btn-toggle" id="view-mode-console" title="原始控制台日志">控制台</button>
         </div>
         <button class="btn btn-small" id="btn-reveal-logs" title="在访达中显示日志文件">日志目录</button>
-      </div>
 
-      <!-- Row 2 (table view): filters on the left, table actions on the right,
-           mirroring the console subbar's layout. -->
-      <div class="logs-filter-row" id="table-filter-row">
-        <div class="logs-filter-group">
-          ${raw(tableFilters)}
-          <input type="text" id="table-search-input" class="log-input" placeholder="搜索模型/路由/会话/错误...">
-        </div>
-        <div class="logs-actions">
+        <!-- Table-only, so the console view hides this whole group. -->
+        <div class="logs-actions" id="table-actions">
           <span class="log-count" id="table-log-count">0 条记录</span>
           <label class="auto-scroll-label">
             <input type="checkbox" id="table-autorefresh" checked> 实时刷新
           </label>
           <button class="btn btn-small btn-danger" id="btn-clear-db-logs" title="清空数据库记录">清空记录</button>
+        </div>
+      </div>
+
+      <!-- Row 2 (table view): the filters and the search box, on one line.
+           The session select is width-capped in CSS — left to itself the browser
+           sizes it to the longest option, and session ids are 40+ character
+           UUIDs, which alone took more width than the other three combined. -->
+      <div class="logs-filter-row" id="table-filter-row">
+        <div class="logs-filter-group">
+          ${raw(tableFilters)}
+          <input type="text" id="table-search-input" class="log-input" placeholder="搜索模型/路由/会话/错误...">
         </div>
       </div>
 
@@ -176,12 +185,13 @@ export function setLogsViewMode(mode) {
 
   const isTable = mode === 'table';
   setHidden($('#table-filter-row'), !isTable);
+  setHidden($('#table-actions'), !isTable);
   setHidden($('#table-view'), !isTable);
   setHidden($('#console-view'), isTable);
 
-  // `console-filter-row` no longer exists as a separate row: both rows below the
-  // toolbar are table-specific and the console's own subbar lives inside
-  // #console-view, so the console pane needs no extra row to hide.
+  // The table's count/refresh/clear now share the toolbar with the view switch,
+  // so they are hidden with the rest of the table chrome. The console keeps its
+  // own copies inside #console-view, which is why nothing here has to move.
 
   if (isTable) fetchRequestLogs();
   else fetchLogs();

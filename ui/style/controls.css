@@ -113,6 +113,15 @@
 
 .log-input { width: 160px; }
 
+/* Native checkboxes and radios paint with the OS accent, which on this platform
+   is a different blue from `--accent` — so every "实时刷新" / "自动滚动" tick
+   added a second, unintended blue to the page. This is the one-line switch that
+   makes the native control follow the app's palette. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+}
+
 .hint {
   font-size: 11px;
   color: var(--muted);

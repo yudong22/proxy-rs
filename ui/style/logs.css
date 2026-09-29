@@ -63,11 +63,30 @@
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  /* Fills the row so the four selects and the search box lay out on one line
+     at the app's default window width. */
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
-/* Count + 实时刷新 + 清空记录, kept together and pushed to the right edge of
-   the filter row (margin-left:auto also right-aligns it if it wraps onto its
-   own line). */
+/* A select sizes itself to its widest option, and the session list carries 40+
+   character UUIDs — so this one control was 379px wide on its own, as much as
+   the other three filters combined, and it pushed the search box onto a second
+   line. Capped and ellipsised instead: the full value is still readable when
+   the dropdown is open, and the chosen session stays legible in the closed
+   control. */
+#table-client-filter {
+  max-width: 220px;
+  text-overflow: ellipsis;
+}
+
+/* Same reason, milder: a long model id should not stretch its filter either. */
+#table-model-filter {
+  max-width: 190px;
+  text-overflow: ellipsis;
+}
+
+/* Count + 实时刷新 + 清空记录, pushed to the right edge of the toolbar. */
 .logs-actions {
   display: flex;
   align-items: center;
@@ -82,20 +101,34 @@
   border-radius: var(--radius-sm);
   overflow: hidden;
   background: var(--surface2);
+  /* Matches `.btn-small` exactly, so the segmented control and the button beside
+     it share a height. This used to be sized by its own padding, which came out
+     26px against the button's 29px — a 3px step that read as a misalignment. */
+  height: 29px;
 }
 
 /* Sized to match `.btn-small` so the segmented control and the buttons beside
    it share one height and baseline; only the active state differs (accent fill
    vs the neutral button surface). */
 .btn-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
   background: transparent;
   border: none;
-  padding: 5px 12px;
+  padding: 0 12px;
   font-size: 11px;
+  font-family: inherit;
+  line-height: 1;
   font-weight: 600;
   color: var(--muted);
   cursor: pointer;
   transition: all .15s ease;
+}
+
+.btn-toggle:hover {
+  color: var(--text);
 }
 
 .btn-toggle.active {
@@ -303,21 +336,26 @@
   white-space: nowrap;
 }
 
+/* The row's only action. Neutral rather than accent-on-accent: the accent is
+   already spoken for by the STREAMED pill and the error row in the same glance,
+   and a third accent element in one row made the table read as busier than the
+   data warrants. It still gains visibility on hover. */
 .btn-inspect {
   background: transparent;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 2px 8px;
   font-size: 11px;
-  color: var(--accent);
+  font-family: inherit;
+  color: var(--muted);
   cursor: pointer;
   transition: all .15s ease;
 }
 
 .btn-inspect:hover {
-  background: var(--accent);
-  color: #fff;
-  border-color: var(--accent);
+  background: var(--surface2);
+  color: var(--text);
+  border-color: var(--muted);
 }
 
 .table-pagination {
