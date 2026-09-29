@@ -290,10 +290,14 @@ function renderSpeedTable(m) {
     },
     {
       label: '工具调用用时',
+      // Cumulative over the session's whole window, so it routinely reaches
+      // hours — a long agent session spends far more time waiting on tools than
+      // generating. Formatted to minutes like 模型用时 above: the raw second
+      // count was unreadable at this scale (`14190.1秒` is nearly 4 hours).
       value: s =>
         s.tool_wait_ms === null || s.tool_wait_ms === undefined
           ? '—'
-          : `${formatSeconds(s.tool_wait_ms)}${s.tool_waits > 1 ? `（${s.tool_waits} 次）` : ''}`,
+          : `${formatLongDuration(s.tool_wait_ms)}${s.tool_waits > 1 ? `（${s.tool_waits} 次）` : ''}`,
     },
     {
       label: '首 token 平均（TTFT）',

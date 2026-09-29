@@ -124,10 +124,15 @@ export function formatLongDuration(ms) {
 }
 
 /**
- * Seconds with one decimal, for the TTFT / tool-wait rows: `x.x秒`.
+ * Seconds with one decimal, for a *per-event* figure such as the mean TTFT:
+ * `x.x秒`.
  *
  * Integer milliseconds below a second keep more information, so they are shown
  * as milliseconds instead of "0.0秒".
+ *
+ * Not for a cumulative total: a session's total tool wait reaches hours, where
+ * a single decimal on a five-digit second count is unreadable. Use
+ * [`formatLongDuration`] for anything that accumulates.
  */
 export function formatSeconds(ms) {
   if (ms === null || ms === undefined) return '—';

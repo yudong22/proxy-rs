@@ -1,6 +1,6 @@
 [package]
 name = "proxy-rs"
-version = "1.9.11"
+version = "1.9.12"
 edition = "2021"
 authors = [
     "yudong22 (孙东) <3cking@163.com>",

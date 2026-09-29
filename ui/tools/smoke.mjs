@@ -59,7 +59,10 @@ const MOCK = {
     // stats::SessionMetrics). `cache_hit_pct` is null when unmeasured.
     requests: 7, cache_hit_pct: 62,
     recent: [{
-      session_id: 'dsh:0.1.6', model_ms: 1500, tool_wait_ms: 200, tool_waits: 2,
+      // A cumulative tool wait in the hours range, so this fixture exercises
+      // `formatLongDuration`'s minutes path rather than a sub-minute value that
+      // both formatters would render identically.
+      session_id: 'dsh:0.1.6', model_ms: 1500, tool_wait_ms: 14_190_100, tool_waits: 1281,
       avg_ttft_ms: 300, output_tokens: 500, speed_tps: 42.5,
       requests: 7, cache_hit_pct: 62,
     }],
@@ -105,7 +108,7 @@ const EXPECTED = {
     '请求次数': '7',
     '缓存命中': '62%',
     '模型用时': '1.5秒',
-    '工具调用用时': '200毫秒（2 次）',
+    '工具调用用时': '236分 30秒（1281 次）',
     '首 token 平均（TTFT）': '300毫秒',
     '输出 tokens': '500',
     '输出速度（TPS）': '42.5 tok/s',
