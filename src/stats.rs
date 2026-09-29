@@ -268,7 +268,11 @@ pub struct SessionTurn {
     pub id: i64,
     pub created_at: String,
     pub model: String,
+    /// Prompt tokens billed as fresh input.
+    pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Prompt tokens served from the upstream's cache.
+    pub cache_read_tokens: i64,
     /// End-to-end request duration (includes the client's read tail).
     pub duration_ms: i64,
     pub ttft_ms: i64,
@@ -341,6 +345,11 @@ pub struct SessionMetrics {
     /// Σ tool wait (ms) attributed within this window, and how many gaps.
     pub tool_wait_ms: i64,
     pub tool_waits: i64,
+    /// Σ fresh input tokens across the window (all turns, measured or not —
+    /// this is a token count, not a rate, so an unmeasured turn still counts).
+    pub input_tokens: i64,
+    /// Σ prompt tokens served from cache across the same window.
+    pub cache_read_tokens: i64,
 }
 
 impl SessionMetrics {
@@ -369,6 +378,22 @@ impl SessionMetrics {
         }
         Some(self.tool_wait_ms)
     }
+
+    /// Cache-hit percentage over the window: cache_read / (input + cache_read).
+    ///
+    /// Same formula as [`DayStats::cache_hit_pct`], so a session's figure and
+    /// the overview's daily figure mean the same thing. `None` when the window
+    /// carried no prompt traffic at all: a session with no requests has no hit
+    /// rate, and showing "0%" would read as "nothing was cached" rather than
+    /// "nothing was measured" — the same distinction the speed card draws
+    /// between a real 0 and an unmeasured value.
+    pub fn cache_hit_pct(&self) -> Option<i64> {
+        let denom = self.input_tokens + self.cache_read_tokens;
+        if denom <= 0 {
+            return None;
+        }
+        Some(self.cache_read_tokens * 100 / denom)
+    }
 }
 
 /// Fold a session's turns (oldest first) into one aggregate.
@@ -394,6 +419,10 @@ fn fold_session_turns(session_id: &str, turns: &[SessionTurn]) -> SessionMetrics
             metrics.output_tokens += turn.output_tokens;
             metrics.model_ms += turn.model_ms;
         }
+        // Token totals count every turn: they are quantities, not rates, so a
+        // turn with no timing still contributed prompt traffic.
+        metrics.input_tokens += turn.input_tokens;
+        metrics.cache_read_tokens += turn.cache_read_tokens;
         if turn.ttft_ms > 0 {
             metrics.ttft_samples += 1;
             metrics.ttft_sum_ms += turn.ttft_ms;
@@ -1053,48 +1082,75 @@ impl StatsDb {
     }
 
     /// The conversation the overview's speed card should describe: the one whose
-    /// newest request is the most recent in the database.
+    /// newest request is the most recent **today**.
     ///
     /// A session with no id (unidentified client) is not a conversation, so it
     /// never wins here — the card would otherwise describe an anonymous request
     /// that cannot be followed up.
     pub fn latest_session_id(&self) -> Result<Option<String>> {
+        self.latest_session_id_on(&local_date_string())
+    }
+
+    /// [`Self::latest_session_id`] restricted to one local day.
+    ///
+    /// The card describes today's traffic, so a conversation whose last request
+    /// was yesterday must not win the slot — it would show a stale speed while
+    /// today's sessions were still running.
+    pub fn latest_session_id_on(&self, date: &str) -> Result<Option<String>> {
         let handle = self.read_conn();
         let id = handle
             .get()
             .query_row(
                 "SELECT session_id FROM request_logs
-                  WHERE session_id != ''
+                  WHERE session_id != '' AND date = ?1
                   ORDER BY id DESC
                   LIMIT 1",
-                [],
+                params![date],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
         Ok(id)
     }
 
-    /// Metrics for the most recently active conversation.
+    /// Metrics for the most recently active conversation, **as of today**.
     ///
     /// Convenience wrapper over [`Self::latest_session_id`] +
     /// [`Self::query_session_metrics`] so the GUI makes one round-trip.
     pub fn query_latest_session_metrics(&self) -> Result<SessionMetrics> {
-        match self.latest_session_id()? {
-            Some(id) => self.query_session_metrics(&id),
+        self.query_latest_session_metrics_on(&local_date_string())
+    }
+
+    /// [`Self::query_latest_session_metrics`] against an explicit date.
+    ///
+    /// Takes the date rather than reading the clock so the "day" boundary is
+    /// testable without freezing time.
+    pub fn query_latest_session_metrics_on(&self, date: &str) -> Result<SessionMetrics> {
+        match self.latest_session_id_on(date)? {
+            Some(id) => self.query_session_metrics_on(&id, date),
             None => Ok(SessionMetrics::default()),
         }
     }
 
-    /// Per-session aggregates for the `limit` most recently active conversations,
-    /// newest first — the overview's speed panel compares them side by side.
+    /// Per-session aggregates for the `limit` most recently active conversations
+    /// **that were active today**, newest first — the overview's speed panel
+    /// compares them side by side.
     ///
     /// Each row is folded exactly like [`Self::query_session_metrics`] (same
-    /// window cap, same weighting), so a session's figure does not change
-    /// depending on which query produced it.
+    /// window cap, same weighting, same day), so a session's figure does not
+    /// change depending on which query produced it.
     ///
     /// Only identified sessions appear: an empty `session_id` is not a
     /// conversation and cannot be compared with one.
     pub fn query_recent_session_metrics(&self, limit: usize) -> Result<Vec<SessionMetrics>> {
+        self.query_recent_session_metrics_on(limit, &local_date_string())
+    }
+
+    /// [`Self::query_recent_session_metrics`] against an explicit date.
+    pub fn query_recent_session_metrics_on(
+        &self,
+        limit: usize,
+        date: &str,
+    ) -> Result<Vec<SessionMetrics>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1106,29 +1162,39 @@ impl StatsDb {
         let handle = self.read_conn();
         let conn = handle.get();
 
+        // Restricted to today, for the same reason the current session's figure
+        // is: the panel exists to compare *today's* conversations, and a session
+        // that ran only yesterday would otherwise sit in the comparison with a
+        // full-window figure beside today's partial ones.
         let mut stmt = conn.prepare(
             "SELECT session_id FROM request_logs
-              WHERE session_id != ''
+              WHERE session_id != '' AND date = ?1
               GROUP BY session_id
               ORDER BY MAX(id) DESC
-              LIMIT ?1",
+              LIMIT ?2",
         )?;
         let ids: Vec<String> = stmt
-            .query_map(params![limit as i64], |row| row.get::<_, String>(0))?
+            .query_map(params![date, limit as i64], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            out.push(Self::fold_session_on(conn, &id)?);
+            out.push(Self::fold_session_on(conn, &id, Some(date))?);
         }
         Ok(out)
     }
 
-    /// Session-level speed metrics for the overview's 输出速度 card.
+    /// Session-level speed metrics for the overview's 输出速度 card, as of today.
+    pub fn query_session_metrics(&self, session_id: &str) -> Result<SessionMetrics> {
+        self.query_session_metrics_on(session_id, &local_date_string())
+    }
+
+    /// [`Self::query_session_metrics`] against an explicit date.
     ///
-    /// Folds the session's most recent [`SESSION_METRICS_MAX_TURNS`] turns into
-    /// one time-weighted aggregate (see [`SessionMetrics`]) so the figure is
-    /// stable instead of changing with every turn.
+    /// Folds the session's most recent [`SESSION_METRICS_MAX_TURNS`] turns
+    /// **from that day** into one time-weighted aggregate (see
+    /// [`SessionMetrics`]) so the figure is stable instead of changing with
+    /// every turn.
     ///
     /// The window is taken **newest-first** by `id` and then reversed, so the cap
     /// always keeps the *recent* turns — the conversation's live behaviour —
@@ -1137,44 +1203,76 @@ impl StatsDb {
     /// Tool time is summed across the window: the proxy never executes tools (the
     /// client does, then reports back in a later request), so the gap between a
     /// tool-requesting turn and its successor is the only observable tool time.
-    pub fn query_session_metrics(&self, session_id: &str) -> Result<SessionMetrics> {
+    pub fn query_session_metrics_on(&self, session_id: &str, date: &str) -> Result<SessionMetrics> {
         if session_id.is_empty() {
             return Ok(SessionMetrics::default());
         }
         let handle = self.read_conn();
-        Self::fold_session_on(handle.get(), session_id)
+        Self::fold_session_on(handle.get(), session_id, Some(date))
     }
 
     /// Read one session's window from `conn` and fold it.
     ///
     /// Takes the connection rather than acquiring its own so callers can reuse a
     /// single handle for many sessions (see `query_recent_session_metrics`).
-    fn fold_session_on(conn: &Connection, session_id: &str) -> Result<SessionMetrics> {
-        let mut stmt = conn.prepare(
-            "SELECT id, created_at, model, output_tokens, duration_ms,
-                    ttft_ms, model_ms, ended_with_tool_call
-               FROM request_logs
-              WHERE session_id = ?1
-              ORDER BY id DESC
-              LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![session_id, SESSION_METRICS_MAX_TURNS], |row| {
-            let tool_int: i64 = row.get(7)?;
+    ///
+    /// `date` restricts the window to one local day; `None` folds the session's
+    /// whole history. The panel always passes a date — "today" — because an
+    /// unbounded figure would mix yesterday's throughput into today's card.
+    fn fold_session_on(
+        conn: &Connection,
+        session_id: &str,
+        date: Option<&str>,
+    ) -> Result<SessionMetrics> {
+        const COLUMNS: &str = "id, created_at, model, input_tokens, output_tokens,
+                               cache_read_tokens, duration_ms, ttft_ms, model_ms,
+                               ended_with_tool_call";
+        let sql = match date {
+            Some(_) => format!(
+                "SELECT {COLUMNS}
+                   FROM request_logs
+                  WHERE session_id = ?1 AND date = ?2
+                  ORDER BY id DESC
+                  LIMIT ?3"
+            ),
+            None => format!(
+                "SELECT {COLUMNS}
+                   FROM request_logs
+                  WHERE session_id = ?1
+                  ORDER BY id DESC
+                  LIMIT ?2"
+            ),
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        let read_row = |row: &rusqlite::Row<'_>| {
+            let tool_int: i64 = row.get(9)?;
             Ok(SessionTurn {
                 id: row.get(0)?,
                 created_at: row.get(1)?,
                 model: row.get(2)?,
-                output_tokens: row.get(3)?,
-                duration_ms: row.get(4)?,
-                ttft_ms: row.get(5)?,
-                model_ms: row.get(6)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cache_read_tokens: row.get(5)?,
+                duration_ms: row.get(6)?,
+                ttft_ms: row.get(7)?,
+                model_ms: row.get(8)?,
                 ended_with_tool_call: tool_int != 0,
             })
-        })?;
+        };
+
+        let rows = match date {
+            Some(d) => stmt
+                .query_map(params![session_id, d, SESSION_METRICS_MAX_TURNS], read_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(params![session_id, SESSION_METRICS_MAX_TURNS], read_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
 
         // Newest-first from SQL (so LIMIT keeps the recent end); the fold reads
         // chronologically, which is what makes "previous turn" meaningful.
-        let mut turns: Vec<SessionTurn> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut turns: Vec<SessionTurn> = rows;
         turns.reverse();
 
         Ok(fold_session_turns(session_id, &turns))
@@ -1554,7 +1652,9 @@ mod tests {
             false,
         );
 
-        let m = db.query_session_metrics("claude:s1").unwrap();
+        let m = db
+            .query_session_metrics_on("claude:s1", "2026-09-28")
+            .unwrap();
         assert_eq!(m.turns, 2);
         assert_eq!(m.measured_turns, 2);
         assert_eq!(m.output_tokens, 600, "tokens sum");
@@ -1579,12 +1679,15 @@ mod tests {
         assert_eq!(m.last_at.as_deref(), Some("2026-09-28 10:00:20"));
 
         // An unknown session yields an empty result rather than an error.
-        let empty = db.query_session_metrics("nobody").unwrap();
+        let empty = db.query_session_metrics_on("nobody", "2026-09-28").unwrap();
         assert_eq!(empty.turns, 0);
         assert_eq!(empty.tps(), None);
         assert_eq!(empty.avg_ttft_ms(), None);
         assert_eq!(empty.tool_wait_ms(), None);
-        assert_eq!(db.query_session_metrics("").unwrap().turns, 0);
+        assert_eq!(
+            db.query_session_metrics_on("", "2026-09-28").unwrap().turns,
+            0
+        );
     }
 
     /// Unmeasured turns do not drag the aggregate down.
@@ -1620,7 +1723,9 @@ mod tests {
             false,
         );
 
-        let m = db.query_session_metrics("claude:s4").unwrap();
+        let m = db
+            .query_session_metrics_on("claude:s4", "2026-09-28")
+            .unwrap();
         assert_eq!(m.turns, 2, "both rows are turns");
         assert_eq!(m.measured_turns, 1, "only one carried a span");
         assert_eq!(
@@ -1650,7 +1755,9 @@ mod tests {
             false,
         );
 
-        let m = db.query_session_metrics("claude:s5").unwrap();
+        let m = db
+            .query_session_metrics_on("claude:s5", "2026-09-28")
+            .unwrap();
         assert_eq!(m.turns, 1);
         assert_eq!(m.measured_turns, 0);
         assert_eq!(m.tps(), None);
@@ -1688,7 +1795,9 @@ mod tests {
             insert_turn(&db, "claude:s6", &created, 2_000, 100, 1_000, 10, false);
         }
 
-        let m = db.query_session_metrics("claude:s6").unwrap();
+        let m = db
+            .query_session_metrics_on("claude:s6", "2026-09-28")
+            .unwrap();
         assert_eq!(m.turns, SESSION_METRICS_MAX_TURNS, "window is capped");
         // The huge ancient row would dominate the sum if it were included.
         assert_eq!(
@@ -1749,7 +1858,7 @@ mod tests {
         anon.session_id = "";
         let _ = db.record_request_log(anon);
 
-        let recent = db.query_recent_session_metrics(3).unwrap();
+        let recent = db.query_recent_session_metrics_on(3, "2026-09-28").unwrap();
         let ids: Vec<&str> = recent.iter().map(|m| m.session_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1762,15 +1871,21 @@ mod tests {
         assert_eq!(recent[1].turns, 1);
 
         // The limit is honoured, and 0 asks for nothing.
-        let only_one = db.query_recent_session_metrics(1).unwrap();
+        let only_one = db.query_recent_session_metrics_on(1, "2026-09-28").unwrap();
         assert_eq!(only_one.len(), 1);
         assert_eq!(only_one[0].session_id, "claude:old");
-        assert!(db.query_recent_session_metrics(0).unwrap().is_empty());
+        assert!(db
+            .query_recent_session_metrics_on(0, "2026-09-28")
+            .unwrap()
+            .is_empty());
 
         // A database with no identified sessions yields an empty list, not an
         // error or a nameless row.
         let empty = StatsDb::in_memory().unwrap();
-        assert!(empty.query_recent_session_metrics(3).unwrap().is_empty());
+        assert!(empty
+            .query_recent_session_metrics_on(3, "2026-09-28")
+            .unwrap()
+            .is_empty());
     }
 
     /// A session in the `recent` list reports exactly the same aggregate as the
@@ -1800,8 +1915,10 @@ mod tests {
             false,
         );
 
-        let single = db.query_session_metrics("claude:a").unwrap();
-        let listed = db.query_recent_session_metrics(5).unwrap();
+        let single = db
+            .query_session_metrics_on("claude:a", "2026-09-28")
+            .unwrap();
+        let listed = db.query_recent_session_metrics_on(5, "2026-09-28").unwrap();
         let found = listed
             .iter()
             .find(|m| m.session_id == "claude:a")
@@ -1848,7 +1965,9 @@ mod tests {
             false,
         );
 
-        let m = db.query_session_metrics("claude:s2").unwrap();
+        let m = db
+            .query_session_metrics_on("claude:s2", "2026-09-28")
+            .unwrap();
         assert_eq!(m.turns, 2);
         assert_eq!(
             m.tool_wait_ms(),
@@ -1906,7 +2025,9 @@ mod tests {
             false,
         );
 
-        let m = db.query_session_metrics("claude:s7").unwrap();
+        let m = db
+            .query_session_metrics_on("claude:s7", "2026-09-28")
+            .unwrap();
         assert_eq!(m.tool_waits, 2, "two tool round-trips");
         assert_eq!(m.tool_wait_ms(), Some(16_000), "two 8s waits summed");
     }
@@ -1943,6 +2064,333 @@ mod tests {
             ],
         )
         .expect("insert test turn");
+    }
+
+    /// [`insert_turn`] with prompt-side token counts, for the cache-hit tests.
+    ///
+    /// Kept separate so the dozen existing call sites do not have to pass two
+    /// more zeroes to express "this fixture never cared about prompt tokens".
+    #[allow(clippy::too_many_arguments)]
+    fn insert_turn_with_prompt(
+        db: &StatsDb,
+        session: &str,
+        created_at: &str,
+        input_tokens: i64,
+        cache_read_tokens: i64,
+        duration_ms: i64,
+        ttft_ms: i64,
+        model_ms: i64,
+        output_tokens: i64,
+    ) {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "INSERT INTO request_logs (
+                date, created_at, model, route, input_tokens, cache_read_tokens,
+                output_tokens, duration_ms, ttft_ms, model_ms,
+                ended_with_tool_call, streamed, status, session_id, client
+             ) VALUES (?1, ?2, 'hy3', '/v1/messages', ?3, ?4, ?5, ?6, ?7, ?8, 0, 1, 200, ?9, 'claude')",
+            params![
+                &created_at[..10],
+                created_at,
+                input_tokens,
+                cache_read_tokens,
+                output_tokens,
+                duration_ms,
+                ttft_ms,
+                model_ms,
+                session
+            ],
+        )
+        .expect("insert test turn with prompt");
+    }
+
+    /// A session's figures are restricted to the given day.
+    ///
+    /// This is what makes the panel describe "today": turns from an earlier date
+    /// must not reach the aggregate, even for the same session id.
+    #[test]
+    fn session_metrics_are_restricted_to_the_requested_day() {
+        let db = StatsDb::in_memory().unwrap();
+
+        // Yesterday: a huge, fast turn that would dominate any figure.
+        insert_turn(
+            &db,
+            "claude:day",
+            "2026-09-28 10:00:00",
+            1_000,
+            10,
+            1_000,
+            100_000,
+            false,
+        );
+        // Today: two ordinary turns.
+        insert_turn(
+            &db,
+            "claude:day",
+            "2026-09-29 10:00:00",
+            2_000,
+            100,
+            1_000,
+            100,
+            false,
+        );
+        insert_turn(
+            &db,
+            "claude:day",
+            "2026-09-29 10:00:30",
+            2_000,
+            100,
+            1_000,
+            100,
+            false,
+        );
+
+        let today = db
+            .query_session_metrics_on("claude:day", "2026-09-29")
+            .unwrap();
+        assert_eq!(today.turns, 2, "yesterday's turn must be excluded");
+        assert_eq!(today.output_tokens, 200);
+
+        // The same session, read as of yesterday, sees only that day.
+        let yesterday = db
+            .query_session_metrics_on("claude:day", "2026-09-28")
+            .unwrap();
+        assert_eq!(yesterday.turns, 1);
+        assert_eq!(yesterday.output_tokens, 100_000);
+
+        // A day with no traffic is empty rather than an error.
+        let empty = db
+            .query_session_metrics_on("claude:day", "2026-09-27")
+            .unwrap();
+        assert_eq!(empty.turns, 0);
+        assert_eq!(empty.tps(), None);
+    }
+
+    /// The day filter applies to the comparison columns too, so a session that
+    /// ran only on an earlier day is not listed beside today's.
+    #[test]
+    fn recent_sessions_are_restricted_to_the_requested_day() {
+        let db = StatsDb::in_memory().unwrap();
+        insert_turn(
+            &db,
+            "claude:old",
+            "2026-09-28 10:00:00",
+            1_000,
+            10,
+            1_000,
+            500,
+            false,
+        );
+        insert_turn(
+            &db,
+            "claude:new",
+            "2026-09-29 10:00:00",
+            1_000,
+            10,
+            1_000,
+            500,
+            false,
+        );
+
+        let today = db.query_recent_session_metrics_on(5, "2026-09-29").unwrap();
+        assert_eq!(today.len(), 1, "yesterday-only session must not be listed");
+        assert_eq!(today[0].session_id, "claude:new");
+
+        let yesterday = db.query_recent_session_metrics_on(5, "2026-09-28").unwrap();
+        assert_eq!(yesterday.len(), 1);
+        assert_eq!(yesterday[0].session_id, "claude:old");
+    }
+
+    /// The card's session is today's last one, not the most recent ever.
+    #[test]
+    fn latest_session_id_ignores_an_earlier_day() {
+        let db = StatsDb::in_memory().unwrap();
+        // Inserted second, so it also has the higher row id — only the day
+        // filter can keep it out.
+        insert_turn(
+            &db,
+            "claude:today",
+            "2026-09-29 09:00:00",
+            1_000,
+            10,
+            1_000,
+            100,
+            false,
+        );
+        insert_turn(
+            &db,
+            "claude:yesterday",
+            "2026-09-28 23:00:00",
+            1_000,
+            10,
+            1_000,
+            100,
+            false,
+        );
+
+        assert_eq!(
+            db.latest_session_id_on("2026-09-29").unwrap().as_deref(),
+            Some("claude:today")
+        );
+        assert_eq!(
+            db.latest_session_id_on("2026-09-28").unwrap().as_deref(),
+            Some("claude:yesterday")
+        );
+        assert_eq!(db.latest_session_id_on("2026-09-27").unwrap(), None);
+    }
+
+    /// Request count and cache-hit rate over the window.
+    ///
+    /// The rate uses the same formula as the overview's daily figure
+    /// (`cache_read / (input + cache_read)`), so a session's number and the
+    /// day's number mean the same thing.
+    #[test]
+    fn session_metrics_report_request_count_and_cache_hit_rate() {
+        let db = StatsDb::in_memory().unwrap();
+        // 300 fresh input + 700 cached = 70% hit, over two requests.
+        insert_turn_with_prompt(
+            &db,
+            "claude:cache",
+            "2026-09-29 10:00:00",
+            100,
+            400,
+            1_000,
+            50,
+            1_000,
+            10,
+        );
+        insert_turn_with_prompt(
+            &db,
+            "claude:cache",
+            "2026-09-29 10:00:10",
+            200,
+            300,
+            1_000,
+            50,
+            1_000,
+            10,
+        );
+
+        let m = db
+            .query_session_metrics_on("claude:cache", "2026-09-29")
+            .unwrap();
+        assert_eq!(m.turns, 2, "requests = turns in the day window");
+        assert_eq!(m.input_tokens, 300);
+        assert_eq!(m.cache_read_tokens, 700);
+        assert_eq!(m.cache_hit_pct(), Some(70));
+    }
+
+    /// An unmeasured turn still counts toward the token totals.
+    ///
+    /// These are quantities, not rates: a plain non-streamed reply contributes
+    /// no generation time but its prompt tokens are real traffic, and dropping
+    /// them would understate the session's input.
+    #[test]
+    fn prompt_tokens_count_even_on_an_unmeasured_turn() {
+        let db = StatsDb::in_memory().unwrap();
+        // model_ms = 0 => unmeasurable for the rate, but tokens are recorded.
+        insert_turn_with_prompt(
+            &db,
+            "claude:u",
+            "2026-09-29 10:00:00",
+            100,
+            900,
+            500,
+            0,
+            0,
+            50,
+        );
+
+        let m = db
+            .query_session_metrics_on("claude:u", "2026-09-29")
+            .unwrap();
+        assert_eq!(m.turns, 1);
+        assert_eq!(m.measured_turns, 0);
+        assert_eq!(m.tps(), None, "no generation span, so no rate");
+        assert_eq!(m.input_tokens, 100);
+        assert_eq!(m.cache_read_tokens, 900);
+        assert_eq!(m.cache_hit_pct(), Some(90));
+    }
+
+    /// No prompt traffic means no hit rate — `None`, not 0%.
+    ///
+    /// A session with requests but no token accounting must not claim it cached
+    /// nothing; the panel renders `None` as `—`.
+    #[test]
+    fn cache_hit_is_none_rather_than_zero_without_prompt_traffic() {
+        let db = StatsDb::in_memory().unwrap();
+        insert_turn(
+            &db,
+            "claude:notokens",
+            "2026-09-29 10:00:00",
+            1_000,
+            50,
+            1_000,
+            10,
+            false,
+        );
+
+        let m = db
+            .query_session_metrics_on("claude:notokens", "2026-09-29")
+            .unwrap();
+        assert_eq!(m.turns, 1);
+        assert_eq!(m.cache_hit_pct(), None);
+        // A defaulted aggregate reports nothing at all.
+        assert_eq!(SessionMetrics::default().cache_hit_pct(), None);
+    }
+
+    /// The defaulted metrics report nothing rather than a misleading zero.
+    #[test]
+    fn default_session_metrics_have_no_cache_or_turns() {
+        let m = SessionMetrics::default();
+        assert_eq!(m.turns, 0);
+        assert_eq!(m.cache_hit_pct(), None);
+        assert_eq!(m.input_tokens, 0);
+        assert_eq!(m.cache_read_tokens, 0);
+    }
+
+    /// A turn written through the real logging path is found by "today".
+    ///
+    /// The other session-metric tests insert rows directly with an explicit
+    /// date, which cannot catch the failure this one guards: `record_request_log`
+    /// stamping a `date` the day filter does not match (wrong format, wrong
+    /// timezone, empty). That would make the whole panel silently show "—".
+    #[test]
+    fn a_turn_recorded_now_is_visible_to_the_today_filter() {
+        let db = StatsDb::in_memory().unwrap();
+
+        let tokens = TokenRecord {
+            input: 40,
+            cache_read: 60,
+            cache_write: 0,
+            output: 25,
+        };
+        let mut out = outcome(
+            "claude-3-5-sonnet-20241022",
+            "/v1/messages",
+            &tokens,
+            200,
+            None,
+            true,
+        );
+        out.session_id = "claude:live";
+        out.client = "claude";
+        db.record_request_log(out).unwrap();
+
+        // `query_session_metrics` (no explicit date) is exactly what the GUI
+        // command calls, so this covers the production path end to end.
+        let m = db.query_session_metrics("claude:live").unwrap();
+        assert_eq!(m.turns, 1, "the row must fall inside today's window");
+        assert_eq!(m.input_tokens, 40);
+        assert_eq!(m.cache_read_tokens, 60);
+        assert_eq!(m.cache_hit_pct(), Some(60));
+
+        // And the card's session is found the same way.
+        assert_eq!(
+            db.latest_session_id().unwrap().as_deref(),
+            Some("claude:live")
+        );
+        assert_eq!(db.query_recent_session_metrics(3).unwrap().len(), 1);
     }
 
     #[test]

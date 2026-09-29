@@ -210,6 +210,10 @@ export async function refreshStats() {
  * summed tokens over summed generation time, TTFT is the mean across measured
  * turns, and the tool figure is the total attributed inside the window.
  *
+ * **The window is today.** The backend restricts the whole aggregate — the
+ * current session and every comparison column — to the local date, so the panel
+ * answers "how is today going" rather than mixing days into one rate.
+ *
  * Every field is rendered even when unmeasured — a missing number shows as "—"
  * so the panel never implies a measurement that was not taken.
  */
@@ -235,8 +239,8 @@ export async function refreshSessionMetrics() {
     if (turns > 0) parts.push(`平均 ${turns} 轮`);
     if (m.output_tokens > 0) parts.push(`共 ${formatNumber(m.output_tokens)} tokens`);
     card.title = parts.length
-      ? `${parts.join(' · ')} — 点击查看会话生成详情`
-      : '暂无可测量的生成记录';
+      ? `${parts.join(' · ')}（今日）— 点击查看会话生成详情`
+      : '今日暂无可测量的生成记录';
   }
 
   renderSpeedTable(m);
@@ -283,6 +287,22 @@ function renderSpeedTable(m) {
   // Metric rows, in display order. Each returns display text for one session;
   // `—` is reserved for "not measured" so a real 0 stays tellable apart.
   const rows = [
+    {
+      label: '请求次数',
+      // Today's requests for this session. `requests` is the count of turns the
+      // window folded in, and the window is the current day, so this reads as
+      // "how many requests today" without a second query.
+      value: s => (s.requests > 0 ? formatNumber(s.requests) : '—'),
+    },
+    {
+      label: '缓存命中',
+      // `null` when the window carried no prompt traffic, which is not the same
+      // as 0% — an unmeasured session must not claim it cached nothing.
+      value: s =>
+        s.cache_hit_pct === null || s.cache_hit_pct === undefined
+          ? '—'
+          : `${s.cache_hit_pct}%`,
+    },
     {
       label: '模型用时',
       value: s => (s.model_ms > 0 ? formatLongDuration(s.model_ms) : '—'),

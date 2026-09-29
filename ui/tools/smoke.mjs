@@ -55,9 +55,13 @@ const MOCK = {
   get_session_metrics: {
     speed_tps: 42.5, model: 'deepseek-chat', measured_turns: 3, output_tokens: 500,
     session_id: 'dsh:0.1.6',
+    // Today's request count and cache-hit rate for this session (see
+    // stats::SessionMetrics). `cache_hit_pct` is null when unmeasured.
+    requests: 7, cache_hit_pct: 62,
     recent: [{
       session_id: 'dsh:0.1.6', model_ms: 1500, tool_wait_ms: 200, tool_waits: 2,
       avg_ttft_ms: 300, output_tokens: 500, speed_tps: 42.5,
+      requests: 7, cache_hit_pct: 62,
     }],
   },
   get_settings: {
@@ -95,7 +99,18 @@ const MOCK = {
 
 /** What the UI must produce. Values captured from the pre-split build. */
 const EXPECTED = {
-  counts: { credentialRows: 3, providerOptions: 3, speedRows: 6 },
+  counts: { credentialRows: 3, providerOptions: 3, speedRows: 8 },
+  // 7 metric rows + the 会话 header row.
+  speedMetrics: {
+    '请求次数': '7',
+    '缓存命中': '62%',
+    '模型用时': '1.5秒',
+    '工具调用用时': '200毫秒（2 次）',
+    '首 token 平均（TTFT）': '300毫秒',
+    '输出 tokens': '500',
+    '输出速度（TPS）': '42.5 tok/s',
+  },
+  speedHeaderLabels: ['dsh:0.1.6'],
   text: {
     metricProvider: 'workbuddy-cn',
     metricPoints: '1234.50',
@@ -218,6 +233,21 @@ try {
           providerOptions: document.querySelector('#setting-provider')?.options.length,
           speedRows: document.querySelectorAll('#speed-sessions-body tr').length,
         },
+        // The 输出速度 drill-down: metric row label -> that row's value cell for
+        // the current session. Asserted by name rather than by row count so
+        // adding a metric does not look like a regression, and a missing one
+        // cannot hide behind a matching total.
+        speedMetrics: (() => {
+          const out = {};
+          for (const tr of document.querySelectorAll('#speed-sessions-body tr')) {
+            const th = tr.querySelector('th.col-metric');
+            const td = tr.querySelector('td');
+            if (th && td) out[th.textContent.trim()] = td.textContent.trim();
+          }
+          return out;
+        })(),
+        speedHeaderLabels: [...document.querySelectorAll('#speed-sessions-body th.col-session-cell')]
+          .map((th) => th.textContent.trim()),
         text: {
           metricProvider: t('#metric-provider'), metricPoints: t('#metric-points'),
           metricPointsAccount: t('#metric-points-account'), metricSpeed: t('#metric-speed'),
@@ -243,6 +273,8 @@ try {
   check('selectValue', b.selectValue, EXPECTED.selectValue);
   check('dsh button present', b.dshButtonPresent, EXPECTED.dshButtonPresent);
   check('dsh status', b.dshStatus, EXPECTED.dshStatus);
+  check('speed drill-down metrics', b.speedMetrics, EXPECTED.speedMetrics);
+  check('speed drill-down session columns', b.speedHeaderLabels, EXPECTED.speedHeaderLabels);
 
   // Cross-module integration 1: palette's dynamic import of the settings view.
   await send('Runtime.evaluate', { expression: 'window.__CALLS__.length = 0;' });

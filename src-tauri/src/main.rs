@@ -206,6 +206,12 @@ const RECENT_SESSIONS: usize = 3;
 /// measurable — an unmeasured turn (a plain non-streamed reply, or a request
 /// served before this feature existed) must render as `—`, not as a fabricated
 /// number.
+///
+/// **The whole window is restricted to today** (local date) — the card, the
+/// current session's row and the comparison columns alike. The panel answers
+/// "how is today going", so folding yesterday's turns in would mix two days into
+/// one rate and make the columns inconsistent: the current session described as
+/// of today while a neighbour was described as of last week.
 #[tauri::command]
 async fn get_session_metrics(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     let stats = ctx.stats.clone();
@@ -248,6 +254,13 @@ fn session_metrics_json(m: &proxy_rs::stats::SessionMetrics) -> Value {
         "avg_ttft_ms": m.avg_ttft_ms(),
         "tool_wait_ms": m.tool_wait_ms(),
         "tool_waits": m.tool_waits,
+        // Today's request count and cache-hit rate for this session. `turns` is
+        // already the count of requests folded in — and the window is limited to
+        // today — so the panel shows it as 请求次数 without a second query.
+        "requests": m.turns,
+        "input_tokens": m.input_tokens,
+        "cache_read_tokens": m.cache_read_tokens,
+        "cache_hit_pct": m.cache_hit_pct(),
     })
 }
 
