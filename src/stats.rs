@@ -831,6 +831,19 @@ impl StatsDb {
             [],
         )?;
 
+        // DSH ids used to be stored with the harness's fixed `session-` prefix
+        // (`dsh:session-<uuid>`); `session::detect` now strips it so a DSH id
+        // reads like the bare-uuid `claude:`/`codex:` ones. Rewrite the existing
+        // rows too, or the filter would list the same conversation twice — once
+        // under each spelling — after the format change. The `session-` word is
+        // fixed, so this only ever shortens keys and never merges two ids.
+        conn.execute(
+            "UPDATE request_logs
+                SET session_id = 'dsh:' || substr(session_id, length('dsh:session-') + 1)
+              WHERE session_id LIKE 'dsh:session-%'",
+            [],
+        )?;
+
         // Upstream timings arrived with the overview's output-speed card. The
         // loop above only handles TEXT columns, so these get their own numeric
         // pass; old rows keep 0, which the UI renders as "unknown" rather than

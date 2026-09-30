@@ -1260,7 +1260,7 @@ async fn apply_codex_config(ctx: State<'_, Arc<AppContext>>) -> Result<Value, St
 /// Report the DSH provider wiring so the UI can show the current state.
 #[tauri::command]
 async fn get_dsh_config() -> Result<Value, String> {
-    let settings_path = match dsh_config::settings_path() {
+    let patch_path = match dsh_config::patch_path() {
         Some(p) => p,
         None => {
             return Ok(json!({
@@ -1272,19 +1272,21 @@ async fn get_dsh_config() -> Result<Value, String> {
 
     let credentials_path = dsh_config::credentials_path();
 
-    if !settings_path.exists() {
+    if !patch_path.exists() {
         return Ok(json!({
             "supported": true,
-            "settings_path": settings_path.display().to_string(),
+            "profile": dsh_config::active_profile(),
+            "settings_path": patch_path.display().to_string(),
             "settings_exists": false,
             "provider_exists": false,
             "model_count": 0,
             "base_url": null,
             "credential_present": false,
+            "session_header": false,
         }));
     }
 
-    let settings_text = std::fs::read_to_string(&settings_path).map_err(|e| e.to_string())?;
+    let settings_text = std::fs::read_to_string(&patch_path).map_err(|e| e.to_string())?;
     let credentials_text = credentials_path
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok());
@@ -1292,24 +1294,26 @@ async fn get_dsh_config() -> Result<Value, String> {
 
     Ok(json!({
         "supported": true,
-        "settings_path": settings_path.display().to_string(),
+        "profile": dsh_config::active_profile(),
+        "settings_path": patch_path.display().to_string(),
         "settings_exists": true,
         "provider_exists": state.provider_exists,
         "model_count": state.model_ids.len(),
         "base_url": state.base_url,
         "credential_present": state.credential_present,
+        "session_header": state.session_header,
     }))
 }
 
-/// Write this proxy into DSH's `settings.yaml` as the `proxy-rs` provider.
+/// Write this proxy into the active DSH profile's patch file.
 ///
-/// Only that provider's `baseURL` and `models` are touched; the rest of the
-/// document (other providers, the default model, UI preferences, plugin
-/// namespaces) is left byte-for-byte intact. See `dsh_config` for why the write
-/// is textual rather than a YAML round-trip.
+/// Only that provider's `baseURL`, `sessionHeader` and `models` are touched;
+/// the rest of the document (other patch rows, sibling providers, the default
+/// model, hand-set profile keys and comments) is left byte-for-byte intact. See
+/// `dsh_config` for why the write is textual rather than a YAML round-trip.
 #[tauri::command]
 async fn apply_dsh_config(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
-    let settings_path = dsh_config::settings_path()
+    let patch_path = dsh_config::patch_path()
         .ok_or_else(|| "DSH_HOME / HOME 未设置，无法定位 DSH 配置".to_string())?;
     let credentials_path = dsh_config::credentials_path()
         .ok_or_else(|| "DSH_HOME / HOME 未设置，无法定位 DSH 凭据文件".to_string())?;
@@ -1349,8 +1353,8 @@ async fn apply_dsh_config(ctx: State<'_, Arc<AppContext>>) -> Result<Value, Stri
     let dsh_models: Vec<dsh_config::DshModel> =
         models.iter().map(dsh_config::to_dsh_model).collect();
 
-    let (settings_path, credentials_path, credential_added) =
-        dsh_config::apply(&settings_path, &credentials_path, &base_url, &dsh_models)
+    let (patch_path, credentials_path, credential_added) =
+        dsh_config::apply(&patch_path, &credentials_path, &base_url, &dsh_models)
             .map_err(|e| format!("写入 DSH 配置失败: {}", e))?;
 
     ctx.logs
@@ -1360,7 +1364,7 @@ async fn apply_dsh_config(ctx: State<'_, Arc<AppContext>>) -> Result<Value, Stri
                 "已写入 DSH 配置（{} 个模型，{}）: {}",
                 dsh_models.len(),
                 base_url,
-                settings_path.display()
+                patch_path.display()
             ),
         )
         .await;
@@ -1369,9 +1373,11 @@ async fn apply_dsh_config(ctx: State<'_, Arc<AppContext>>) -> Result<Value, Stri
         "ok": true,
         "models": dsh_models.len(),
         "base_url": base_url,
-        "settings_path": settings_path.display().to_string(),
+        "profile": dsh_config::active_profile(),
+        "settings_path": patch_path.display().to_string(),
         "credentials_path": credentials_path.display().to_string(),
         "credential_added": credential_added,
+        "session_header": dsh_config::SESSION_HEADER,
         "note": "DSH 会在下次请求时读取新配置，无需重启",
     }))
 }

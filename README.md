@@ -39,7 +39,7 @@
 ### 4. 极致桌面与原生体验
 - **系统托盘常驻**：原生托盘图标实时展示服务运行状态，支持一键启停，关闭主窗口后台静默运行。
 - **三栏现代化控制台**：运行状态总览 / 实时交互日志 / 服务配置面板，支持快捷键呼出 `⌘K` 快捷命令。
-- **生态一键联动**：一键将代理地址与模型映射写入 `~/.claude/settings.json`，即开即用。
+- **生态一键联动**：一键将代理地址与模型映射写入 `~/.claude/settings.json`；DSH 则写入活动 profile 的 `cordis.patch.yml`（并顺带开启会话头，使日志按**会话**而非客户端版本归类），即开即用。
 - **macOS LaunchAgent**：原生支持开机自启无缝守护，优雅重启与单一实例防冲突。
 
 ---
@@ -301,7 +301,7 @@ src/                       # 代理核心库 crate: proxy_rs（纯 Rust，无 GU
   credits.rs               # Layer 3：余额查询适配层
   claude_config.rs         # Layer 3：写入 ~/.claude/settings.json 的模型槽位
   codex_config.rs          # Layer 3：生成 Codex 模型目录并接入 ~/.codex/config.toml
-  dsh_config.rs            # Layer 3：把本代理写入 ~/.dsh/settings.yaml（文本级最小改动）
+  dsh_config.rs            # Layer 3：把本代理写入 DSH 活动 profile 的 cordis.patch.yml（文本级最小改动）
   workbuddy_auth.rs        # Layer 3：WorkBuddy 登录态凭据存储、指纹头、token 刷新
   session_pool.rs          # Layer 3：凭据池（默认优先 + 4xx 切换粘滞）
   providers.rs             # Layer 3：预置厂商模板与动态模型发现

@@ -1,27 +1,44 @@
 //! DSH (DeepSeek Harness) provider wiring.
 //!
-//! Writes the `proxy-rs` provider into `~/.dsh/settings.yaml` so the harness
-//! talks to this proxy. Mirrors `codex_config.rs` in approach, and for the same
-//! reason: the settings document belongs to the user.
+//! Writes the `proxy-rs` provider into the active profile's
+//! `$DSH_HOME/profiles/<name>/cordis.patch.yml` so the harness talks to this
+//! proxy. Mirrors `codex_config.rs` in approach, and for the same reason: the
+//! configuration document belongs to the user.
+//!
+//! Why the target is the profile patch and not `settings.yaml`:
+//!
+//!   * `settings.yaml` no longer exists in current DSH. The harness *renames*
+//!     it to `settings.yaml.imported` on first boot and moves each section into
+//!     the profile that owns it (`SettingsForms.importLegacyDocument` in
+//!     `@deepseek-ai/dsh-settings`). Writing the old path produced a file the
+//!     running harness never reads.
+//!   * A profile's settings are a **patch list**: a top-level YAML array whose
+//!     entries target a loader row by `id`. Editing the patch list is how every
+//!     other DSH surface changes these values, so this writer does the same.
 //!
 //! Why this is a hand-rolled text patch and not a YAML round-trip:
 //!
-//!   * `settings.yaml` is a *shared* document. It carries other providers, the
-//!     agent's default model, UI/locale/permission preferences and whatever
-//!     namespaces plugins added. A serialize-the-whole-document write would
-//!     reformat all of it.
-//!   * Measured on a real file, a `serde_yaml` parse→serialize pass took it from
-//!     2831 to 2110 bytes: flow-style mappings were expanded to block style and
-//!     the layout was rearranged wholesale. That is a violation, not a diff.
-//!   * DSH's own writer patches at leaf level to preserve comments and
-//!     formatting (see `settings-file`'s `patchNode`). Writing this file in any
-//!     other way would fight it.
+//!   * The patch file is a *shared* document. It carries other rows (locale,
+//!     theme, permissions, the default model) and arbitrary user comments. A
+//!     serialize-the-whole-document write would reformat all of it — and DSH's
+//!     own writer patches at leaf level to preserve comments and formatting, so
+//!     a wholesale rewrite would fight it.
+//!   * A patch entry's `config` **replaces** the target row's whole config
+//!     (`applyEntryPatches` assigns `target[key] = value`), it does not merge.
+//!     So the `llm-pi-ai` entry must keep every sibling provider and every
+//!     hand-set profile key; only the fields below are allowed to change.
 //!
-//! So the write is confined to two leaf values inside the `proxy-rs` provider
-//! (`baseURL` and `models`); every byte outside them is copied through
-//! untouched. If the provider block cannot be located confidently the write
-//! refuses rather than guessing — a corrupted shared config is far worse than a
-//! reported error.
+//! The write is confined to three leaves inside the `proxy-rs` provider —
+//! `baseURL`, `sessionHeader` and `models`. Every byte outside them is copied
+//! through untouched. If the provider block cannot be located confidently the
+//! write refuses rather than guessing: a corrupted shared config is far worse
+//! than a reported error.
+//!
+//! Both YAML styles are accepted, because a patch file is hand-editable and the
+//! two shapes appear in the wild: the block style the harness writes
+//! (`proxy-rs:` followed by indented `key: value` lines) and the flow style
+//! (`proxy-rs:` followed by a `{ … }` mapping) used by the retired
+//! `settings.yaml`.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -42,6 +59,21 @@ const NAMESPACE: &str = "llm-pi-ai";
 /// The provider id this proxy registers itself as.
 const PROVIDER: &str = "proxy-rs";
 
+/// The HTTP field DSH must send for proxy-rs to key requests by conversation.
+///
+/// Without it the gateway sees only the `deepseek-harness/<version>`
+/// user-agent and merges every chat in an install under `dsh:<version>`.
+/// Writing it here is what makes the session filter work on a fresh install
+/// without a manual edit.
+pub const SESSION_HEADER: &str = "x-deepseek-harness-session-id";
+
+/// Filename of a profile's user patch layer.
+const PROFILE_PATCH_FILENAME: &str = "cordis.patch.yml";
+/// Directory under the Harness home holding every profile.
+const PROFILES_DIRNAME: &str = "profiles";
+/// Shipped profile `dsh web` uses, and the fallback when nothing else matches.
+const DEFAULT_PROFILE: &str = "web";
+
 /// Harness home, honoring `DSH_HOME` and falling back to `~/.dsh`.
 pub fn dsh_home() -> Option<PathBuf> {
     std::env::var("DSH_HOME")
@@ -56,9 +88,93 @@ pub fn dsh_home() -> Option<PathBuf> {
         })
 }
 
-/// The settings document.
-pub fn settings_path() -> Option<PathBuf> {
-    dsh_home().map(|h| h.join("settings.yaml"))
+/// Directory holding every profile.
+pub fn profiles_dir() -> Option<PathBuf> {
+    dsh_home().map(|h| h.join(PROFILES_DIRNAME))
+}
+
+/// Name of the profile whose patch file should be edited.
+///
+/// Resolution order, most authoritative first:
+///
+/// 1. `DSH_PROFILE`, when it names a directory that exists — the launcher sets
+///    it, so this is exact whenever the GUI inherits the environment.
+/// 2. The most recently modified profile whose patch file already declares this
+///    provider: that is the profile the user's DSH is actually wired to.
+/// 3. The most recently modified profile with a patch file at all.
+/// 4. `web`, the shipped default for `dsh web`.
+///
+/// A GUI process normally has no `DSH_PROFILE`, which is why the on-disk
+/// evidence outranks the guess in cases 2–3 rather than writing to `web` blind
+/// and leaving a second, dead provider block behind.
+pub fn active_profile() -> String {
+    if let Some(name) = std::env::var("DSH_PROFILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        if profiles_dir()
+            .map(|d| d.join(&name).is_dir())
+            .unwrap_or(false)
+        {
+            return name;
+        }
+    }
+
+    let Some(dir) = profiles_dir() else {
+        return DEFAULT_PROFILE.to_string();
+    };
+    let mut declaring: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let mut any_patch: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return DEFAULT_PROFILE.to_string();
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let patch = entry.path().join(PROFILE_PATCH_FILENAME);
+        let Ok(meta) = std::fs::metadata(&patch) else {
+            continue;
+        };
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if std::fs::read_to_string(&patch)
+            .map(|text| declares_provider(&text))
+            .unwrap_or(false)
+        {
+            declaring.push((modified, name.clone()));
+        }
+        any_patch.push((modified, name));
+    }
+
+    let newest = |mut v: Vec<(std::time::SystemTime, String)>| {
+        v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        v.into_iter().next().map(|(_, name)| name)
+    };
+    newest(declaring)
+        .or_else(|| newest(any_patch))
+        .unwrap_or_else(|| DEFAULT_PROFILE.to_string())
+}
+
+/// Whether a patch document already wires this provider.
+///
+/// Both document shapes count: the profile patch list, where the namespace is
+/// the entry's `id:` (`- id: llm-pi-ai`), and the retired `settings.yaml`, where
+/// it is a top-level key. Requiring the provider key as well keeps this from
+/// matching a document that merely mentions the namespace.
+fn declares_provider(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    let namespaced = lines.iter().any(|l| {
+        let t = l.trim_start();
+        t.trim() == format!("{NAMESPACE}:")
+            || t.strip_prefix("- ")
+                .map(|rest| rest.trim() == format!("id: {NAMESPACE}"))
+                .unwrap_or(false)
+    });
+    namespaced && lines.iter().any(|l| l.trim() == format!("{PROVIDER}:"))
+}
+
+/// The profile patch document this writer edits.
+pub fn patch_path() -> Option<PathBuf> {
+    profiles_dir().map(|d| d.join(active_profile()).join(PROFILE_PATCH_FILENAME))
 }
 
 /// The credential store.
@@ -89,6 +205,9 @@ pub struct DshState {
     pub model_ids: Vec<String>,
     /// True when the referenced credential is present in the credential store.
     pub credential_present: bool,
+    /// True when the provider already sends the conversation session id, so the
+    /// gateway's per-conversation session filter works.
+    pub session_header: bool,
 }
 
 /// Map a provider model onto a DSH entry.
@@ -107,83 +226,78 @@ pub fn to_dsh_model(m: &crate::providers::GuiModel) -> DshModel {
     }
 }
 
-// ── Reading ─────────────────────────────────────────────────────────────────
-
-/// Locate the `proxy-rs` provider block inside `text`.
-///
-/// Returns `(start, end)` line indices of the block body, where `start` is the
-/// line after the opening `{` and `end` is the index of the matching `}`.
-/// `None` when the provider (or its opening brace) is not there.
-fn find_provider_body(lines: &[String]) -> Option<(usize, usize)> {
-    let provider_at = lines
-        .iter()
-        .position(|l| l.trim() == format!("{PROVIDER}:"))?;
-
-    // The body opens with a `{` (the file uses a flow mapping) somewhere in the
-    // few lines that follow the key.
-    let open =
-        (provider_at + 1..lines.len().min(provider_at + 3)).find(|&i| lines[i].trim() == "{")?;
-
-    let open_indent = indent_of(&lines[open]);
-    let mut depth = 0usize;
-    for (i, line) in lines.iter().enumerate().skip(open) {
-        for ch in line.chars() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        // The provider block closes at the brace that opens at
-                        // `open_indent`; anything else means the shape is not
-                        // what this writer understands.
-                        if indent_of(line) == open_indent {
-                            return Some((open + 1, i));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    None
-}
+// ── Shared line helpers ─────────────────────────────────────────────────────
 
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// Read the `key: value` scalar on a body line, if present.
-fn scalar_at(lines: &[String], key: &str) -> Option<String> {
-    lines.iter().find_map(|l| {
-        let t = l.trim();
-        let rest = t
-            .strip_prefix(key)?
-            .strip_prefix(':')?
-            .trim()
-            .trim_end_matches(',')
-            .trim();
-        if rest.is_empty() {
-            None
-        } else {
-            Some(rest.to_string())
+fn is_blank(line: &str) -> bool {
+    line.trim().is_empty()
+}
+
+/// The minimum indentation of the lines in `from..limit` that sit deeper than
+/// `parent_indent`, i.e. the indentation its direct children use.
+fn child_indent(
+    lines: &[String],
+    from: usize,
+    limit: usize,
+    parent_indent: usize,
+) -> Option<usize> {
+    let mut min = usize::MAX;
+    for line in lines.iter().take(limit).skip(from) {
+        if is_blank(line) {
+            continue;
         }
+        let ind = indent_of(line);
+        if ind <= parent_indent {
+            break;
+        }
+        if ind < min {
+            min = ind;
+        }
+    }
+    (min != usize::MAX).then_some(min)
+}
+
+/// Locate a direct child `key:` of the block whose value starts at `from`.
+///
+/// `from` must be the first line *inside* the parent's value (i.e. one past the
+/// parent's own key line), because the child indentation is derived from the
+/// lines scanned here.
+///
+/// Only the block's own indentation level is matched, so a nested `id:` inside
+/// the model list can never be mistaken for the entry's `id:`, and the search
+/// stops as soon as the scan leaves the parent block.
+fn find_child(
+    lines: &[String],
+    from: usize,
+    limit: usize,
+    parent_indent: usize,
+    key: &str,
+) -> Option<usize> {
+    let ci = child_indent(lines, from, limit, parent_indent)?;
+    let want = format!("{key}:");
+    let spaced = format!("{want} ");
+    (from..limit).find(|&i| {
+        let line = &lines[i];
+        !is_blank(line)
+            && indent_of(line) == ci
+            && (line.trim() == want || line.trim().starts_with(&spaced))
     })
 }
 
-/// Model ids inside the provider body, in order.
-fn model_ids_at(lines: &[String]) -> Vec<String> {
-    lines
-        .iter()
-        .filter_map(|l| {
-            let t = l.trim();
-            let rest = t.strip_prefix("id:")?.trim().trim_end_matches(',').trim();
-            if rest.is_empty() {
-                None
-            } else {
-                Some(unquote(rest))
-            }
-        })
-        .collect()
+/// Exclusive end of the value block belonging to the key line at `key_at`.
+fn value_block_end(lines: &[String], key_at: usize, key_indent: usize, limit: usize) -> usize {
+    let mut i = key_at + 1;
+    while i < limit {
+        let line = &lines[i];
+        if !is_blank(line) && indent_of(line) <= key_indent {
+            break;
+        }
+        i += 1;
+    }
+    i
 }
 
 fn unquote(v: &str) -> String {
@@ -197,23 +311,227 @@ fn unquote(v: &str) -> String {
     }
 }
 
-/// Inspect a settings document without modifying it.
-pub fn read_state(settings_text: &str, credentials_text: Option<&str>) -> DshState {
-    let lines: Vec<String> = settings_text.lines().map(|s| s.to_string()).collect();
-    let Some((start, end)) = find_provider_body(&lines) else {
+/// Read the `key: value` scalar on a body line, if present.
+fn scalar_at(lines: &[String], key: &str) -> Option<String> {
+    let want = format!("{key}:");
+    lines.iter().find_map(|l| {
+        let t = l.trim();
+        let rest = t.strip_prefix(&want)?.trim().trim_end_matches(',').trim();
+        if rest.is_empty() {
+            None
+        } else {
+            Some(unquote(rest))
+        }
+    })
+}
+
+/// Model ids in `lines`, in order, accepting both block and flow list shapes.
+///
+/// Block entries read `- id: x`; flow entries read `id: x,`. Only a leading
+/// `session-`-style key is stripped, so a nested field cannot be mistaken for
+/// the id.
+fn model_ids_in(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let t = l.trim();
+            let t = t.strip_prefix("- ").unwrap_or(t);
+            let rest = t.strip_prefix("id:")?.trim().trim_end_matches(',').trim();
+            if rest.is_empty() {
+                None
+            } else {
+                Some(unquote(rest))
+            }
+        })
+        .collect()
+}
+
+// ── Locating the provider block ─────────────────────────────────────────────
+
+/// A located provider block inside the document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderSpan {
+    /// First line of the provider's body.
+    body_start: usize,
+    /// Exclusive end of the provider's body.
+    body_end: usize,
+    /// Indentation of the `proxy-rs:` key itself.
+    key_indent: usize,
+    /// Line index of the `providers:` key that owns it, when the shape has one.
+    providers_at: Option<usize>,
+    /// True for the braced (`{ … }`) style, which renders `models` as a flow
+    /// list and needs a trailing comma on every field but the last.
+    is_flow: bool,
+}
+
+/// Locate `proxy-rs:` inside a profile patch list (`- id: llm-pi-ai`).
+///
+/// Returns `None` when the patch list, the entry, or the provider key is
+/// missing — the caller decides whether that is an insert or a refusal.
+fn find_block_span(lines: &[String]) -> Option<ProviderSpan> {
+    let (entry_start, entry_end, entry_indent) = find_entry(lines)?;
+
+    let config_at = find_child(lines, entry_start + 1, entry_end, entry_indent, "config")?;
+    let config_indent = indent_of(&lines[config_at]);
+    let config_end = value_block_end(lines, config_at, config_indent, entry_end);
+    let providers_at = find_child(lines, config_at + 1, config_end, config_indent, "providers")?;
+
+    let providers_indent = indent_of(&lines[providers_at]);
+    let providers_end = value_block_end(lines, providers_at, providers_indent, config_end);
+
+    let provider_at = find_child(
+        lines,
+        providers_at + 1,
+        providers_end,
+        providers_indent,
+        PROVIDER,
+    )?;
+    let key_indent = indent_of(&lines[provider_at]);
+    let body_end = value_block_end(lines, provider_at, key_indent, providers_end);
+
+    Some(ProviderSpan {
+        body_start: provider_at + 1,
+        body_end,
+        key_indent,
+        providers_at: Some(providers_at),
+        is_flow: false,
+    })
+}
+
+/// Find the `- id: llm-pi-ai` list item, as `(start, end, indent)`.
+fn find_entry(lines: &[String]) -> Option<(usize, usize, usize)> {
+    let want = format!("id: {NAMESPACE}");
+    let start = lines.iter().position(|l| {
+        let t = l.trim_start();
+        t.strip_prefix("- ")
+            .map(|rest| rest.trim() == want)
+            .unwrap_or(false)
+    })?;
+    let indent = indent_of(&lines[start]);
+    let mut end = lines.len();
+    for (i, line) in lines.iter().enumerate().skip(start + 1) {
+        if is_blank(line) {
+            continue;
+        }
+        if indent_of(line) <= indent {
+            end = i;
+            break;
+        }
+    }
+    Some((start, end, indent))
+}
+
+/// Locate `proxy-rs:` in the retired `settings.yaml` shape, where `llm-pi-ai:`
+/// is a top-level mapping and `providers:` holds a flow mapping.
+fn find_flow_span(lines: &[String]) -> Option<ProviderSpan> {
+    let ns_at = lines
+        .iter()
+        .position(|l| l.trim() == format!("{NAMESPACE}:"))?;
+    let ns_indent = indent_of(&lines[ns_at]);
+    let ns_end = value_block_end(lines, ns_at, ns_indent, lines.len());
+
+    let providers_at = find_child(lines, ns_at + 1, ns_end, ns_indent, "providers")?;
+
+    // The flow body opens with a `{` on one of the few lines after the key.
+    let open =
+        (providers_at + 1..lines.len().min(providers_at + 4)).find(|&i| lines[i].trim() == "{")?;
+    let open_indent = indent_of(&lines[open]);
+
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, line) in lines.iter().enumerate().skip(open) {
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && indent_of(line) == open_indent {
+                        close = Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close.is_some() {
+            break;
+        }
+    }
+    let close = close?;
+
+    let provider_at = (open + 1..close).find(|&i| lines[i].trim() == format!("{PROVIDER}:"))?;
+    let key_indent = indent_of(&lines[provider_at]);
+
+    // The provider's own body is braced too, and its model entries close with
+    // their own `}` lines. The provider's closing brace is therefore the one
+    // that (a) balances the brace opened right after the key and (b) sits at
+    // that brace's indentation — a nested entry's brace is deeper.
+    let provider_open = (provider_at + 1..close).find(|&i| lines[i].trim() == "{")?;
+    let provider_open_indent = indent_of(&lines[provider_open]);
+    let mut depth = 0usize;
+    let mut body_end = close;
+    for (i, line) in lines.iter().enumerate().skip(provider_open) {
+        if i > close {
+            break;
+        }
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && indent_of(line) == provider_open_indent {
+                        body_end = i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if body_end != close {
+            break;
+        }
+    }
+
+    Some(ProviderSpan {
+        // Start *after* the opening brace so the body holds only the fields.
+        body_start: provider_open + 1,
+        body_end,
+        key_indent,
+        providers_at: Some(providers_at),
+        is_flow: true,
+    })
+}
+
+/// Locate the provider in whichever document shape `text` uses.
+fn find_span(lines: &[String]) -> Option<ProviderSpan> {
+    find_block_span(lines).or_else(|| find_flow_span(lines))
+}
+
+// ── Reading ─────────────────────────────────────────────────────────────────
+
+/// Inspect a patch document without modifying it.
+pub fn read_state(patch_text: &str, credentials_text: Option<&str>) -> DshState {
+    let lines: Vec<String> = patch_text.lines().map(|s| s.to_string()).collect();
+    let credential_present = credentials_text.map(credential_present).unwrap_or(false);
+    let Some(span) = find_span(&lines) else {
         return DshState {
             provider_exists: false,
             base_url: None,
             model_ids: Vec::new(),
-            credential_present: credentials_text.map(credential_present).unwrap_or(false),
+            credential_present,
+            session_header: false,
         };
     };
-    let body = &lines[start..end];
+    let body = &lines[span.body_start..span.body_end];
     DshState {
         provider_exists: true,
         base_url: scalar_at(body, "baseURL"),
-        model_ids: model_ids_at(body),
-        credential_present: credentials_text.map(credential_present).unwrap_or(false),
+        model_ids: model_ids_in(body),
+        credential_present,
+        session_header: body.iter().any(|l| {
+            l.trim()
+                .strip_prefix("sessionHeader:")
+                .map(|rest| rest.trim() == SESSION_HEADER)
+                .unwrap_or(false)
+        }),
     }
 }
 
@@ -250,12 +568,42 @@ fn yaml_scalar(value: &str) -> String {
     }
 }
 
-/// Render the `models:` value in the same flow style the document already uses.
+/// Render a block-style `models:` list body, indented under its key.
 ///
-/// `indent` is the indentation of the `models:` key itself; the bracket and
-/// entry indents are derived from it so a rewritten block keeps the file's
-/// existing shape instead of a serializer's idea of it.
-fn render_models_value(models: &[DshModel], indent: usize) -> String {
+/// Inline flow scalars are used for `input`/`reasoningEfforts`, which keeps each
+/// model's fields on simple single lines while staying ordinary YAML.
+fn render_models_block(models: &[DshModel], key_indent: usize) -> Vec<String> {
+    let item = " ".repeat(key_indent + 2);
+    let field = " ".repeat(key_indent + 4);
+    let mut out = Vec::new();
+    for m in models {
+        out.push(format!("{item}- id: {}", yaml_scalar(&m.id)));
+        if let Some(name) = &m.name {
+            out.push(format!("{field}name: {}", yaml_scalar(name)));
+        }
+        if let Some(cw) = m.context_window {
+            out.push(format!("{field}contextWindow: {cw}"));
+        }
+        if let Some(mt) = m.max_tokens {
+            out.push(format!("{field}maxTokens: {mt}"));
+        }
+        if let Some(images) = m.supports_images {
+            let input = if images {
+                "[ text, image ]"
+            } else {
+                "[ text ]"
+            };
+            out.push(format!("{field}input: {input}"));
+        }
+        if m.supports_reasoning == Some(true) {
+            out.push(format!("{field}reasoningEfforts: {{ high: high }}"));
+        }
+    }
+    out
+}
+
+/// Render the flow-style `models:` value, matching the document's own style.
+fn render_models_flow(models: &[DshModel], indent: usize) -> String {
     let sp = |n: usize| " ".repeat(n);
     let mut out = format!("{}[\n", sp(indent + 2));
     for (i, m) in models.iter().enumerate() {
@@ -298,61 +646,136 @@ fn render_models_value(models: &[DshModel], indent: usize) -> String {
 
 // ── Writing ─────────────────────────────────────────────────────────────────
 
-/// Replace `baseURL` and `models` inside the `proxy-rs` provider.
-///
-/// Every other line — including `apiKeyEnv`, `api`, `reasoningEffort`, sibling
-/// providers and every other namespace — is copied through byte-for-byte.
+/// Replace `baseURL`, `sessionHeader` and `models` inside the `proxy-rs`
+/// provider, leaving every other line byte-for-byte intact.
 pub fn upsert_provider(text: &str, base_url: &str, models: &[DshModel]) -> Result<String> {
     if models.is_empty() {
-        anyhow::bail!("refusing to write an empty model list into DSH settings");
+        anyhow::bail!("refusing to write an empty model list into the DSH profile patch");
     }
     let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
     let had_trailing_newline = text.ends_with('\n');
 
-    let (start, end) = find_provider_body(&lines).ok_or_else(|| {
+    let span = find_span(&lines).ok_or_else(|| {
         anyhow::anyhow!(
             "could not locate the `{PROVIDER}` provider under `{NAMESPACE}.providers` in the DSH \
-             settings document; refusing to rewrite it. Add the provider once by hand (or via the \
+             profile patch; refusing to rewrite it. Add the provider once by hand (or via the \
              DSH Models page) and retry"
         )
     })?;
 
-    // Replace the two leaf values inside the body, walking backwards so earlier
-    // indices stay valid.
-    let body: Vec<String> = lines[start..end].to_vec();
-
-    if let Some(rel) = body
-        .iter()
-        .position(|l| l.trim_start().starts_with("baseURL:"))
-    {
-        let ind = indent_of(&body[rel]);
-        lines[start + rel] = format!("{}baseURL: {},", " ".repeat(ind), base_url);
-    } else {
-        return Err(anyhow::anyhow!(
-            "the `{PROVIDER}` provider has no `baseURL` key to update"
-        ));
+    if span.is_flow {
+        return upsert_flow(text, span, base_url, models, had_trailing_newline);
     }
 
-    // `models:` opens a bracketed list; find its extent by bracket balance.
-    let Some(models_rel) = body
+    // `baseURL` must exist to anchor the write: without it the document is not
+    // a provider this writer understands, and inventing one would be guesswork.
+    let base_at = find_child(
+        &lines,
+        span.body_start,
+        span.body_end,
+        span.key_indent,
+        "baseURL",
+    )
+    .ok_or_else(|| anyhow::anyhow!("the `{PROVIDER}` provider has no `baseURL` key to update"))?;
+    let field_indent = indent_of(&lines[base_at]);
+    lines[base_at] = format!("{}baseURL: {base_url}", " ".repeat(field_indent));
+
+    // `sessionHeader` is what makes the gateway's session filter work. It is
+    // replaced when present and inserted right after `baseURL` when absent, so
+    // a re-run finds it exactly where it was left.
+    let session_at = find_child(
+        &lines,
+        span.body_start,
+        span.body_end,
+        span.key_indent,
+        "sessionHeader",
+    );
+    let session_line = format!(
+        "{}sessionHeader: {SESSION_HEADER}",
+        " ".repeat(field_indent)
+    );
+    match session_at {
+        Some(at) => lines[at] = session_line,
+        None => lines.insert(base_at + 1, session_line),
+    }
+
+    // The span shifted by one line whenever the key was inserted.
+    let shift = usize::from(session_at.is_none());
+    let body_start = span.body_start;
+    let body_end = span.body_end + shift;
+
+    let models_at = find_child(&lines, body_start, body_end, span.key_indent, "models")
+        .ok_or_else(|| {
+            anyhow::anyhow!("the `{PROVIDER}` provider has no `models` key to update")
+        })?;
+    let models_indent = indent_of(&lines[models_at]);
+    let models_end = value_block_end(&lines, models_at, models_indent, body_end);
+
+    // The key line is re-emitted without any inline value (`models: []`), then
+    // the rendered block. Replacing the whole value block keeps a re-run
+    // idempotent rather than appending a second list.
+    let mut replacement = vec![format!("{}models:", " ".repeat(models_indent))];
+    replacement.extend(render_models_block(models, models_indent));
+    lines.splice(models_at..models_end, replacement);
+
+    let mut out = lines.join("\n");
+    if had_trailing_newline || out.is_empty() {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// The flow-style writer for the retired `settings.yaml` shape.
+fn upsert_flow(
+    text: &str,
+    span: ProviderSpan,
+    base_url: &str,
+    models: &[DshModel],
+    had_trailing_newline: bool,
+) -> Result<String> {
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let body: Vec<String> = lines[span.body_start..span.body_end].to_vec();
+
+    let base_rel = body
+        .iter()
+        .position(|l| l.trim_start().starts_with("baseURL:"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("the `{PROVIDER}` provider has no `baseURL` key to update")
+        })?;
+    let ind = indent_of(&body[base_rel]);
+    lines[span.body_start + base_rel] = format!("{}baseURL: {base_url},", " ".repeat(ind));
+
+    let session_rel = body
+        .iter()
+        .position(|l| l.trim_start().starts_with("sessionHeader:"));
+    let session_line = format!("{}sessionHeader: {SESSION_HEADER},", " ".repeat(ind));
+    match session_rel {
+        Some(rel) => lines[span.body_start + rel] = session_line,
+        None => lines.insert(span.body_start + base_rel + 1, session_line),
+    }
+
+    let shift = usize::from(session_rel.is_none());
+    let body_start = span.body_start;
+    let body_end = span.body_end + shift;
+    let body: Vec<String> = lines[body_start..body_end].to_vec();
+
+    let models_rel = body
         .iter()
         .position(|l| l.trim_start().starts_with("models:"))
-    else {
-        return Err(anyhow::anyhow!(
-            "the `{PROVIDER}` provider has no `models` key to update"
-        ));
-    };
+        .ok_or_else(|| {
+            anyhow::anyhow!("the `{PROVIDER}` provider has no `models` key to update")
+        })?;
     let models_indent = indent_of(&body[models_rel]);
 
     let open_rel = (models_rel + 1..body.len())
         .find(|&i| body[i].trim() == "[")
         .ok_or_else(|| anyhow::anyhow!("`models` is not a bracketed list"))?;
 
-    let mut depth = 0usize;
-    let mut close_rel = None;
     // Only square brackets are counted: the entries' `{ … }` braces and any
     // `input: [ text, image ]` inside them are nested within the list, so the
     // bracket that returns the depth to zero is the list's own terminator.
+    let mut depth = 0usize;
+    let mut close_rel = None;
     for (i, line) in body.iter().enumerate().skip(open_rel) {
         for ch in line.chars() {
             match ch {
@@ -374,14 +797,11 @@ pub fn upsert_provider(text: &str, base_url: &str, models: &[DshModel]) -> Resul
         anyhow::anyhow!("the `models` list is not terminated with `]` inside the provider block")
     })?;
 
-    let rendered: Vec<String> = render_models_value(models, models_indent)
+    let rendered: Vec<String> = render_models_flow(models, models_indent)
         .lines()
         .map(|s| s.to_string())
         .collect();
 
-    // Rebuild the key line plus the list. The list keeps its own opening `[`
-    // (it is the first rendered line); only the `models:` key is re-emitted
-    // here, so a re-run finds the same shape it just wrote.
     let key_line = if body[models_rel].trim_end().ends_with(',') {
         format!("{}models:,", " ".repeat(models_indent))
     } else {
@@ -399,7 +819,10 @@ pub fn upsert_provider(text: &str, base_url: &str, models: &[DshModel]) -> Resul
         }
     }
 
-    lines.splice(start + models_rel..=start + close_rel, replacement);
+    lines.splice(
+        body_start + models_rel..=body_start + close_rel,
+        replacement,
+    );
 
     let mut out = lines.join("\n");
     if had_trailing_newline || out.is_empty() {
@@ -463,30 +886,30 @@ pub fn ensure_credential(text: &str) -> String {
 
 /// Write the provider and credential, backing up what is replaced.
 ///
-/// Returns `(settings_path, credentials_path, credential_added)`.
+/// Returns `(patch_path, credentials_path, credential_added)`.
 pub fn apply(
-    settings_path: &Path,
+    patch_path: &Path,
     credentials_path: &Path,
     base_url: &str,
     models: &[DshModel],
 ) -> Result<(PathBuf, PathBuf, bool)> {
-    let settings_text = std::fs::read_to_string(settings_path).with_context(|| {
+    let patch_text = std::fs::read_to_string(patch_path).with_context(|| {
         format!(
-            "failed to read {} — create it once by launching DSH",
-            settings_path.display()
+            "failed to read {} — start DSH once so it creates the profile, or create the file",
+            patch_path.display()
         )
     })?;
 
-    let updated = upsert_provider(&settings_text, base_url, models)?;
+    let updated = upsert_provider(&patch_text, base_url, models)?;
 
-    if let Some(dir) = settings_path.parent() {
+    if let Some(dir) = patch_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let _ = std::fs::copy(
-        settings_path,
-        settings_path.with_extension(format!("yaml.proxy-rs-backup-{}", backup_stamp())),
+        patch_path,
+        patch_path.with_extension(format!("yml.proxy-rs-backup-{}", backup_stamp())),
     );
-    write_atomic(settings_path, &updated)?;
+    write_atomic(patch_path, &updated)?;
 
     // The credential is written only when missing, so an existing (possibly
     // meaningful) value is never overwritten.
@@ -508,7 +931,7 @@ pub fn apply(
     }
 
     Ok((
-        settings_path.to_path_buf(),
+        patch_path.to_path_buf(),
         credentials_path.to_path_buf(),
         credential_added,
     ))
@@ -571,11 +994,46 @@ fn backup_stamp() -> String {
 mod tests {
     use super::*;
 
-    /// Mirrors the real document's shape: a flow mapping for `providers`, an
-    /// unrelated namespace before it, a sibling provider, and other top-level
-    /// keys after it. Comments are included because preserving them is the
-    /// whole reason this writer is textual.
-    const FIXTURE: &str = r#"# user notes that must survive
+    /// Mirrors the real profile patch: a top-level list of id-targeted entries,
+    /// the `llm-pi-ai` entry with a block-style provider, sibling rows before
+    /// and after, and comments — which are included because preserving them is
+    /// the whole reason this writer is textual.
+    const PATCH: &str = r#"# Your patch layer for this dsh profile.
+- id: ui-settings-general
+  name: "@deepseek-ai/dsh-client-ui-settings-general"
+  config:
+    welcomeNoticeVersion: 2026-09-28.1
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      proxy-rs:
+        apiKeyEnv: PROXY_RS_API_KEY
+        api: openai-completions
+        reasoningEffort: high
+        customFlag: keep-me
+        baseURL: http://127.0.0.1:3457/v1
+        models:
+          - id: hy3
+            name: Hy3
+            contextWindow: 192000
+            maxTokens: 64000
+            input: [ text ]
+            reasoningEfforts: { high: high }
+          - id: glm-5.3-flash
+            name: GLM-5.3-Flash
+            contextWindow: 1000000
+            maxTokens: 32000
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: proxy-rs
+    model: hy3
+"#;
+
+    /// The retired `settings.yaml` shape, kept so a flow-style document is
+    /// still updatable rather than refused.
+    const FLOW: &str = r#"# user notes that must survive
 ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 llm-pi-ai:
@@ -587,7 +1045,6 @@ llm-pi-ai:
         {
           apiKeyEnv: PROXY_RS_API_KEY,
           api: openai-completions,
-          reasoningEffort: high,
           baseURL: http://127.0.0.1:3457/v1,
           models:
             [
@@ -595,14 +1052,7 @@ llm-pi-ai:
                   id: hy3,
                   name: Hy3,
                   contextWindow: 192000,
-                  reasoningEfforts: { high: high },
                   maxTokens: 64000
-                },
-              {
-                  id: glm-5.3-flash,
-                  name: GLM-5.3-Flash,
-                  contextWindow: 1000000,
-                  maxTokens: 32000
                 }
             ]
         }
@@ -623,56 +1073,96 @@ agent-default-model:
         }
     }
 
-    fn ids_in(text: &str) -> Vec<String> {
+    fn models_in(text: &str) -> Vec<String> {
         let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
-        let (s, e) = find_provider_body(&lines).expect("provider body");
-        model_ids_at(&lines[s..e])
+        let span = find_span(&lines).expect("provider span");
+        model_ids_in(&lines[span.body_start..span.body_end])
     }
 
     #[test]
     fn read_state_finds_provider_and_models() {
-        let st = read_state(FIXTURE, None);
+        let st = read_state(PATCH, None);
         assert!(st.provider_exists);
         assert_eq!(st.base_url.as_deref(), Some("http://127.0.0.1:3457/v1"));
         assert_eq!(st.model_ids, vec!["hy3", "glm-5.3-flash"]);
         assert!(!st.credential_present);
+        assert!(!st.session_header);
     }
 
     #[test]
     fn read_state_reports_missing_provider() {
-        let st = read_state("llm-pi-ai:\n  providers:\n    {}\n", None);
+        let st = read_state("- id: locale\n  config:\n    preference: zh\n", None);
         assert!(!st.provider_exists);
     }
 
     #[test]
-    fn upsert_preserves_everything_outside_the_two_leaf_values() {
-        let out = upsert_provider(FIXTURE, "http://127.0.0.1:9999/v1", &[model("hy4")]).unwrap();
+    fn read_state_reports_the_session_header() {
+        let out = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
+        let st = read_state(&out, None);
+        assert!(
+            st.session_header,
+            "the writer must leave sessionHeader configured"
+        );
+        assert_eq!(st.model_ids, vec!["hy3"]);
+    }
+
+    #[test]
+    fn upsert_writes_the_session_header_when_absent() {
+        let out = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
+        assert!(out.contains("sessionHeader: x-deepseek-harness-session-id"));
+    }
+
+    #[test]
+    fn upsert_replaces_an_existing_session_header_rather_than_duplicating() {
+        let once = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
+        let twice = upsert_provider(&once, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
+        assert_eq!(once, twice, "re-running must not keep changing the file");
+        assert_eq!(twice.matches("sessionHeader:").count(), 1);
+    }
+
+    #[test]
+    fn upsert_preserves_everything_outside_the_managed_leaves() {
+        let out = upsert_provider(PATCH, "http://127.0.0.1:9999/v1", &[model("hy4")]).unwrap();
 
         // Untouched context, in both directions.
-        assert!(out.contains("# user notes that must survive"));
-        assert!(out.contains("welcomeNoticeVersion: 2026-08-13.1"));
-        assert!(out.contains("other-gateway:"));
-        assert!(out.contains("apiKeyEnv: OTHER_KEY"));
-        assert!(out.contains("baseURL: https://other.test/v1"));
-        assert!(out.contains("agent-default-model:"));
-        assert!(out.contains("  provider: proxy-rs"));
+        assert!(out.contains("# Your patch layer for this dsh profile."));
+        assert!(out.contains("welcomeNoticeVersion: 2026-09-28.1"));
+        assert!(out.contains("- id: agent-default-model"));
+        assert!(out.contains("    model: hy3"));
 
-        // Untouched keys inside the provider itself.
+        // Untouched keys inside the provider itself, including one this writer
+        // knows nothing about.
         assert!(out.contains("apiKeyEnv: PROXY_RS_API_KEY"));
         assert!(out.contains("api: openai-completions"));
         assert!(out.contains("reasoningEffort: high"));
+        assert!(out.contains("customFlag: keep-me"));
 
-        // The two values that were meant to change.
+        // The values that were meant to change.
         assert!(out.contains("baseURL: http://127.0.0.1:9999/v1"));
         assert!(!out.contains("3457"));
-        assert_eq!(ids_in(&out), vec!["hy4"]);
+        assert_eq!(models_in(&out), vec!["hy4"]);
     }
 
     #[test]
     fn upsert_is_idempotent() {
-        let once = upsert_provider(FIXTURE, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
+        let once = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
         let twice = upsert_provider(&once, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
         assert_eq!(once, twice, "re-running must not keep changing the file");
+    }
+
+    #[test]
+    fn upsert_keeps_the_models_inside_the_provider_block() {
+        // The block locator must stop at the provider's own boundary: a rewrite
+        // that ran past it would corrupt the sibling entry below.
+        let out =
+            upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[model("a"), model("b")]).unwrap();
+        let lines: Vec<String> = out.lines().map(|s| s.to_string()).collect();
+        let span = find_span(&lines).expect("provider span");
+        assert_eq!(
+            model_ids_in(&lines[span.body_start..span.body_end]),
+            vec!["a", "b"]
+        );
+        assert!(out.contains("- id: agent-default-model"));
     }
 
     #[test]
@@ -685,8 +1175,8 @@ agent-default-model:
             supports_images: Some(true),
             supports_reasoning: Some(true),
         };
-        let out = upsert_provider(FIXTURE, "http://127.0.0.1:3457/v1", &[m]).unwrap();
-        assert!(out.contains("id: deepseek-v4.1-flash"));
+        let out = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[m]).unwrap();
+        assert!(out.contains("- id: deepseek-v4.1-flash"));
         assert!(out.contains("name: Deepseek-V4.1-Flash"));
         assert!(out.contains("contextWindow: 1000000"));
         assert!(out.contains("maxTokens: 128000"));
@@ -696,35 +1186,34 @@ agent-default-model:
 
     #[test]
     fn upsert_omits_unknown_capability_rather_than_inventing_it() {
-        let out = upsert_provider(FIXTURE, "http://127.0.0.1:3457/v1", &[model("plain")]).unwrap();
-        assert!(out.contains("id: plain"));
+        let out = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[model("plain")]).unwrap();
+        assert!(out.contains("- id: plain"));
         assert!(!out.contains("reasoningEfforts"));
         assert!(!out.contains("input:"));
         assert!(!out.contains("contextWindow"));
     }
 
     #[test]
-    fn rendered_list_has_no_trailing_comma_before_the_bracket() {
-        let out = upsert_provider(
-            FIXTURE,
-            "http://127.0.0.1:3457/v1",
-            &[model("a"), model("b")],
-        )
-        .unwrap();
-        // The last field of the last entry must not carry a comma.
-        let line = out
-            .lines()
-            .rev()
-            .find(|l| l.trim().starts_with('}'))
-            .expect("closing brace");
-        assert!(line.trim().ends_with('}'), "got {line:?}");
+    fn upsert_refuses_an_empty_model_list() {
+        assert!(upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[]).is_err());
+    }
+
+    #[test]
+    fn upsert_refuses_when_the_provider_is_absent() {
+        let text = "- id: locale\n  name: \"@deepseek-ai/dsh-client-locale\"\n  config:\n    preference: zh\n";
+        let err = upsert_provider(text, "http://x/v1", &[model("a")]).unwrap_err();
+        assert!(
+            err.to_string().contains("could not locate"),
+            "must explain itself, got {err}"
+        );
+        assert_eq!(text, text, "input untouched on refusal");
     }
 
     #[test]
     fn upsert_keeps_the_documents_trailing_newline() {
-        let out = upsert_provider(FIXTURE, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
+        let out = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
         assert!(out.ends_with('\n'));
-        let no_newline = FIXTURE.trim_end_matches('\n').to_string();
+        let no_newline = PATCH.trim_end_matches('\n').to_string();
         let out2 =
             upsert_provider(&no_newline, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
         assert!(
@@ -734,22 +1223,20 @@ agent-default-model:
     }
 
     #[test]
-    fn upsert_refuses_an_empty_model_list() {
-        assert!(upsert_provider(FIXTURE, "http://127.0.0.1:3457/v1", &[]).is_err());
-    }
-
-    #[test]
-    fn upsert_refuses_when_the_provider_is_absent() {
-        let text = "llm-pi-ai:\n  providers:\n    {\n    }\n";
-        let err = upsert_provider(text, "http://x/v1", &[model("a")]).unwrap_err();
-        assert!(
-            err.to_string().contains("could not locate"),
-            "must explain itself, got {err}"
-        );
-        assert_eq!(
-            text, "llm-pi-ai:\n  providers:\n    {\n    }\n",
-            "input untouched on refusal"
-        );
+    fn upsert_updates_a_flow_style_document_too() {
+        // The retired `settings.yaml` shape must still be updatable: refusing it
+        // would strand anyone whose profile patch was written before the
+        // migration.
+        let out = upsert_provider(FLOW, "http://127.0.0.1:9999/v1", &[model("hy4")]).unwrap();
+        assert!(out.contains("# user notes that must survive"));
+        assert!(out.contains("other-gateway:"));
+        assert!(out.contains("baseURL: https://other.test/v1"));
+        assert!(out.contains("baseURL: http://127.0.0.1:9999/v1"));
+        assert!(out.contains("sessionHeader: x-deepseek-harness-session-id,"));
+        assert_eq!(models_in(&out), vec!["hy4"]);
+        let once = out;
+        let twice = upsert_provider(&once, "http://127.0.0.1:9999/v1", &[model("hy4")]).unwrap();
+        assert_eq!(once, twice, "flow writes must be idempotent too");
     }
 
     #[test]
@@ -803,45 +1290,43 @@ agent-default-model:
     #[test]
     fn probe_refuses_to_write_through_a_document_that_has_none() {
         // read_state must not invent a provider for a document without one.
-        let st = read_state("locale:\n  preference: zh\n", None);
+        let st = read_state("- id: locale\n  config:\n    preference: zh\n", None);
         assert!(!st.provider_exists);
         assert!(st.base_url.is_none());
         assert!(st.model_ids.is_empty());
+        assert!(!st.session_header);
     }
 
     #[test]
-    fn document_without_notes_still_produces_valid_structure() {
-        // No comment in the input: the output must not fabricate one.
-        let plain = "llm-pi-ai:\n  providers:\n    {\n      proxy-rs:\n        {\n          baseURL: http://127.0.0.1:3457/v1,\n          models:\n            [\n              { id: old }\n            ]\n        }\n    }\n";
-        let out = upsert_provider(plain, "http://127.0.0.1:3457/v1", &[model("new")]).unwrap();
-        assert_eq!(ids_in(&out), vec!["new"]);
-        assert!(!out.contains("old"));
-        assert!(!out.contains('#'));
-    }
-
-    #[test]
-    fn the_models_key_and_its_brackets_keep_their_indentation() {
-        let out = upsert_provider(FIXTURE, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
+    fn the_models_key_keeps_its_indentation() {
+        let out = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         let key = lines
             .iter()
             .position(|l| l.trim() == "models:")
             .expect("models key");
-        // The key is at the provider body's field indent, and the bracket that
-        // opens the list sits one level deeper and is still a bracket.
-        assert_eq!(indent_of(lines[key]), 10, "models key indent");
-        assert_eq!(lines[key + 1].trim(), "[");
-        assert_eq!(indent_of(lines[key + 1]), 12, "opening bracket indent");
-        assert!(lines.iter().any(|l| l.trim() == "]"));
+        // The key sits at the provider body's field indent (8 spaces in the
+        // fixture) and the entries one level deeper.
+        assert_eq!(indent_of(lines[key]), 8, "models key indent");
+        assert!(lines[key + 1].trim_start().starts_with("- id: hy3"));
+        assert_eq!(indent_of(lines[key + 1]), 10, "item indent");
         // Re-running must not drift the indentation either.
         let again = upsert_provider(&out, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
         assert_eq!(out, again);
     }
 
     #[test]
+    fn declares_provider_matches_only_the_managed_route() {
+        assert!(declares_provider(PATCH));
+        assert!(!declares_provider(
+            "- id: locale\n  config:\n    preference: zh\n"
+        ));
+    }
+
+    #[test]
     fn write_atomic_replaces_contents_and_keeps_permissions() {
         let dir = tempdir();
-        let path = dir.join("settings.yaml");
+        let path = dir.join("cordis.patch.yml");
         std::fs::write(&path, "old\n").unwrap();
         #[cfg(unix)]
         {
@@ -872,22 +1357,17 @@ agent-default-model:
     #[test]
     fn apply_writes_both_files_and_is_idempotent() {
         let dir = tempdir();
-        let settings = dir.join("settings.yaml");
+        let patch = dir.join("cordis.patch.yml");
         let creds = dir.join(".credentials.yaml");
-        std::fs::write(&settings, FIXTURE).unwrap();
+        std::fs::write(&patch, PATCH).unwrap();
         std::fs::write(
             &creds,
             "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-x\nrecords:\n",
         )
         .unwrap();
 
-        let (_, _, added) = apply(
-            &settings,
-            &creds,
-            "http://127.0.0.1:3457/v1",
-            &[model("hy3")],
-        )
-        .unwrap();
+        let (_, _, added) =
+            apply(&patch, &creds, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
         assert!(added, "credential was missing, so it should be added");
         assert!(credential_present(
             &std::fs::read_to_string(&creds).unwrap()
@@ -898,23 +1378,18 @@ agent-default-model:
             .contains("DEEPSEEK_API_KEY: sk-x"));
 
         // Second run adds nothing and leaves the files alone.
-        let before = std::fs::read_to_string(&settings).unwrap();
-        let (_, _, added2) = apply(
-            &settings,
-            &creds,
-            "http://127.0.0.1:3457/v1",
-            &[model("hy3")],
-        )
-        .unwrap();
+        let before = std::fs::read_to_string(&patch).unwrap();
+        let (_, _, added2) =
+            apply(&patch, &creds, "http://127.0.0.1:3457/v1", &[model("hy3")]).unwrap();
         assert!(!added2);
-        assert_eq!(before, std::fs::read_to_string(&settings).unwrap());
+        assert_eq!(before, std::fs::read_to_string(&patch).unwrap());
     }
 
     #[test]
-    fn apply_refuses_when_the_settings_document_is_missing() {
+    fn apply_refuses_when_the_patch_document_is_missing() {
         let dir = tempdir();
         let err = apply(
-            &dir.join("nope.yaml"),
+            &dir.join("nope.yml"),
             &dir.join(".credentials.yaml"),
             "http://127.0.0.1:3457/v1",
             &[model("hy3")],

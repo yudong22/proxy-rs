@@ -18,8 +18,10 @@
 //! | DSH (大守护) | `x-deepseek-harness-session-id` header              | `deepseek-harness/…` user-agent (client-level), `dsh-auth-*` cookie (per-install) |
 //!
 //! DSH is the one client that identifies at *client* rather than conversation
-//! granularity in practice: the shipped build omits the session header and puts
-//! no session field in the body, so the user-agent is the best available key.
+//! granularity in practice: whether the session header is sent depends on the
+//! provider profile setting `sessionHeader`, and the shipped profile leaves it
+//! unset, so the user-agent is the best available key until it is configured
+//! (see `dsh_config::SESSION_HEADER`, which the one-click write sets).
 //! See [`session_from_dsh_identity`] for the evidence.
 //!
 //! ## Why ids are namespaced (`codex:<uuid>`, `claude:<uuid>`, `dsh:<key>`)
@@ -211,6 +213,30 @@ fn session_from_claude_header(headers: &HeaderMap) -> Option<SessionInfo> {
     })
 }
 
+/// The fixed word the harness prefixes every conversation id with.
+///
+/// DSH mints its conversation identity as `session-<uuid>` — the session store
+/// builds `session-${++counter}` and the API/SDK controllers build
+/// `session-${randomUUID()}` — so this prefix is identical across every
+/// conversation and distinguishes nothing. Only a *leading* prefix is removed:
+/// ids of the `<agent>-session-<uuid>` form carry a meaningful leading segment
+/// and are left whole.
+const DSH_SESSION_PREFIX: &str = "session-";
+
+/// Drop the harness's `session-` prefix so the id matches the other dialects.
+///
+/// `codex:`/`claude:` both carry a bare uuid after their namespace, and the
+/// session filter renders `dsh:` next to them: leaving the prefix in produced
+/// `dsh:session-3a79…` beside `claude:90dc…`, which reads as a different
+/// convention and made every DSH id one segment longer than its peers.
+///
+/// Stripping happens *after* [`looks_like_session_id`] has accepted the raw
+/// value, so acceptance is unchanged: a short `session-1` id still passes on
+/// its original length rather than being rejected once reduced to `1`.
+fn strip_dsh_session_prefix(raw: &str) -> &str {
+    raw.strip_prefix(DSH_SESSION_PREFIX).unwrap_or(raw)
+}
+
 /// Read DSH's conversation id, falling back to a client-level id.
 ///
 /// The harness source *declares* `x-deepseek-harness-session-id` on both its
@@ -227,7 +253,8 @@ fn session_from_claude_header(headers: &HeaderMap) -> Option<SessionInfo> {
 /// **user-agent**, which identifies the client rather than the conversation:
 /// every chat from one installed version shares an id. That is a deliberate
 /// trade — a client-level grouping that works beats a conversation-level one
-/// that never matches.
+/// that never matches. The user-agent fallback yields a version such as
+/// `0.2.0-rc.2`, which carries no `session-` prefix and is left alone.
 fn session_from_dsh_identity(headers: &HeaderMap) -> Option<SessionInfo> {
     let raw = header(headers, "x-deepseek-harness-session-id").or_else(|| {
         let ua = header(headers, "user-agent")?;
@@ -236,9 +263,10 @@ fn session_from_dsh_identity(headers: &HeaderMap) -> Option<SessionInfo> {
             .then(|| harness_client_id(&ua))
     })?;
 
-    looks_like_session_id(&raw).then(|| SessionInfo {
+    let raw = raw.trim();
+    looks_like_session_id(raw).then(|| SessionInfo {
         client: ClientKind::Dsh,
-        session_id: format!("dsh:{}", raw.trim()),
+        session_id: format!("dsh:{}", strip_dsh_session_prefix(raw)),
         turn_id: String::new(),
         model_hint: None,
     })
@@ -749,6 +777,8 @@ mod tests {
     fn dsh_harness_session_header_wins_when_the_client_sends_one() {
         // Preferred source, kept for a future harness build that starts sending
         // it: the declared header names the conversation, not just the client.
+        // The harness's fixed `session-` prefix is stripped so the value matches
+        // the bare-uuid shape `claude:`/`codex:` already use.
         let h = headers(&[
             ("content-type", "application/json"),
             (
@@ -762,10 +792,47 @@ mod tests {
         ]);
         let info = detect(&h);
         assert_eq!(info.client, ClientKind::Dsh);
-        assert_eq!(
-            info.session_id,
-            "dsh:session-7d3f2a10-9c4b-4e21-8f77-1a2b3c4d5e6f"
-        );
+        assert_eq!(info.session_id, "dsh:7d3f2a10-9c4b-4e21-8f77-1a2b3c4d5e6f");
+    }
+
+    #[test]
+    fn dsh_session_prefix_is_stripped_but_a_peer_id_is_left_whole() {
+        // The prefix is a fixed word, so two different conversations must still
+        // land on two different ids after it is removed.
+        let one = detect(&headers(&[(
+            "x-deepseek-harness-session-id",
+            "session-3a7944c9-9229-4ceb-b9c9-7e075aa1cdc3",
+        )]));
+        let two = detect(&headers(&[(
+            "x-deepseek-harness-session-id",
+            "session-27810851-26c4-447e-b532-96acfd770d0d",
+        )]));
+        assert_eq!(one.session_id, "dsh:3a7944c9-9229-4ceb-b9c9-7e075aa1cdc3");
+        assert_eq!(two.session_id, "dsh:27810851-26c4-447e-b532-96acfd770d0d");
+        assert_ne!(one.session_id, two.session_id);
+    }
+
+    #[test]
+    fn dsh_session_id_without_the_prefix_is_not_mangled() {
+        // A value that never had the prefix must survive untouched: only the
+        // harness's own fixed prefix is removed, not any leading word.
+        let info = detect(&headers(&[(
+            "x-deepseek-harness-session-id",
+            "7d3f2a10-9c4b-4e21-8f77-1a2b3c4d5e6f",
+        )]));
+        assert_eq!(info.session_id, "dsh:7d3f2a10-9c4b-4e21-8f77-1a2b3c4d5e6f");
+    }
+
+    #[test]
+    fn dsh_short_session_id_is_accepted_on_the_raw_value() {
+        // Acceptance is decided before the prefix is removed, so a value that is
+        // only long enough because of the prefix still counts once stripped.
+        let info = detect(&headers(&[(
+            "x-deepseek-harness-session-id",
+            "session-abcd1234",
+        )]));
+        assert!(info.is_known());
+        assert_eq!(info.session_id, "dsh:abcd1234");
     }
 
     #[test]

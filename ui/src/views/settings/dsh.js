@@ -1,12 +1,18 @@
 /**
  * DSH (DeepSeek Harness) provider wiring.
  *
- * One button: write this proxy into `~/.dsh/settings.yaml` as the `proxy-rs`
- * provider, using the provider's live model list — the same shape as the Codex
- * group next door.
+ * One button: write this proxy into the active profile's
+ * `~/.dsh/profiles/<name>/cordis.patch.yml` as the `proxy-rs` provider, using
+ * the provider's live model list — the same shape as the Codex group next door.
  *
- * The Rust side owns the write and confines it to the provider's `baseURL` and
- * `models`; this module only drives the button and reports the result.
+ * The write also records `sessionHeader`, which is what makes the gateway's
+ * per-conversation session filter work; without it DSH sends only its
+ * user-agent and every chat in an install collapses into one `dsh:<version>`
+ * bucket.
+ *
+ * The Rust side owns the write and confines it to the provider's `baseURL`,
+ * `sessionHeader` and `models`; this module only drives the button and reports
+ * the result.
  */
 
 import { $ } from '../../core/dom.js';
@@ -36,7 +42,9 @@ export async function loadDshConfig() {
       return;
     }
     const credential = cfg.credential_present ? '凭据已就绪' : '凭据缺失，写入时会自动补齐';
-    status.textContent = `当前 ${cfg.model_count} 个模型 · ${cfg.base_url || '未设置地址'} · ${credential}`;
+    const session = cfg.session_header ? '会话识别已开启' : '会话识别未开启，点击写入即可开启';
+    const profile = cfg.profile ? `profile ${cfg.profile} · ` : '';
+    status.textContent = `当前 ${profile}${cfg.model_count} 个模型 · ${cfg.base_url || '未设置地址'} · ${credential} · ${session}`;
   } catch (err) {
     status.textContent = '';
   }
@@ -66,7 +74,7 @@ export async function applyDshConfig() {
     const res = await invoke('apply_dsh_config');
     if (status) {
       status.className = 'hint ok';
-      status.textContent = `✓ 已写入 ${res.models} 个模型到 ${res.settings_path}（${res.base_url}），下次请求生效`;
+      status.textContent = `✓ 已写入 ${res.models} 个模型到 ${res.settings_path}（${res.base_url}），已开启会话识别，下次请求生效`;
     }
   } catch (err) {
     if (status) {

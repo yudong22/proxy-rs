@@ -58,15 +58,34 @@ export function shortTime(createdAt) {
  * twice. When the prefix differs from the pill's client it is kept, so a
  * mismatched pair stays visible. The full value lives in the cell's `title`
  * and in the log file.
+ *
+ * A known fixed lead-in word is dropped before shortening, because that word is
+ * the same for every conversation and taking it as the display id makes them
+ * all look alike — precisely the ambiguity this column exists to resolve:
+ *
+ * - `session-` is the prefix DSH puts on every conversation id
+ *   (`session-<uuid>`), so two chats would both render as a bare `session`. The
+ *   server strips the same prefix in `session::detect`, so the stored id is
+ *   normally already bare; this also covers rows written before that change.
+ * - `dsh-auth-` is the prefix on the per-install cookie *name*, where the key
+ *   that follows is the identity.
+ *
+ * Each is matched as a whole word rather than by a "does this segment look like
+ * an id" heuristic, which would mis-shorten a legitimate uuid whose first group
+ * is all letters.
  */
+const SESSION_LEAD_INS = ['session-', 'dsh-auth-'];
+
 export function shortSessionId(sessionId, client) {
   if (!sessionId) return '';
   const idx = sessionId.indexOf(':');
   if (idx < 0) return sessionId;
   const prefix = sessionId.slice(0, idx);
   const rest = sessionId.slice(idx + 1);
-  const head = rest.split('-')[0] || rest;
-  const short = head.length < rest.length ? head : rest;
+  const lead = SESSION_LEAD_INS.find(word => rest.startsWith(word));
+  const bare = lead ? rest.slice(lead.length) : rest;
+  const head = bare.split('-')[0] || bare;
+  const short = head.length < bare.length ? head : bare;
   if (client && prefix === client) return short;
   return `${prefix}:${short}`;
 }

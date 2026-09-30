@@ -82,14 +82,16 @@ export function renderSettings() {
   `);
 
   // DSH reads its model list straight from the provider profile, so — like
-  // Codex — the registry has to be written out rather than discovered. Only
-  // the `proxy-rs` provider's address and models are touched; the rest of
-  // settings.yaml (other providers, default model, UI preferences) is kept.
-  const dsh = section('dsh', 'DSH 一键写入 (~/.dsh/settings.yaml)', html`
+  // Codex — the registry has to be written out rather than discovered. The
+  // write targets the active profile's patch file (current DSH removed the old
+  // ~/.dsh/settings.yaml), and only the `proxy-rs` provider's address, session
+  // header and models are touched; every other row and comment is kept.
+  const dsh = section('dsh', 'DSH 一键写入 (profile 的 cordis.patch.yml)', html`
     <p class="hint">
-      将本代理写入 DSH 的 <code>llm-pi-ai.providers.proxy-rs</code>，并把当前服务商的
-      <b>全部可用模型</b>同步过去。<b>只更新该 provider 的地址与模型列表</b>，
-      <code>settings.yaml</code> 中的其他内容（其他 provider、默认模型、界面偏好）原样保留。
+      将本代理写入 DSH 活动 profile 的 <code>llm-pi-ai.providers.proxy-rs</code>，并把当前服务商的
+      <b>全部可用模型</b>同步过去。<b>只更新该 provider 的地址、会话头与模型列表</b>，
+      文件中的其他内容（其他 patch 行、其他 provider、默认模型、注释）原样保留。
+      同时写入 <code>sessionHeader</code>，让日志能按<b>会话</b>而非版本号归类。
       写入前会自动备份原文件。
     </p>
     <div class="actions-row">

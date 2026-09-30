@@ -76,9 +76,10 @@ const MOCK = {
   get_claude_config: { env: { ANTHROPIC_MODEL: 'deepseek-chat' } },
   get_codex_config: { supported: true, catalog_exists: false, catalog_path: '/tmp/cat.json', config_path: '/tmp/cfg.toml' },
   get_dsh_config: {
-    supported: true, settings_path: '/tmp/.dsh/settings.yaml', settings_exists: true,
+    supported: true, profile: 'web',
+    settings_path: '/tmp/.dsh/profiles/web/cordis.patch.yml', settings_exists: true,
     provider_exists: true, model_count: 4, base_url: 'http://127.0.0.1:3457/v1',
-    credential_present: true,
+    credential_present: true, session_header: true,
   },
   get_request_logs: { items: [], total: 0, models: [], clients: [], sessions: [] },
   get_logs: { entries: [] },
@@ -132,7 +133,7 @@ const EXPECTED = {
   selectValue: 'cred-1',
   // The DSH group renders its live state on load, from get_dsh_config.
   dshButtonPresent: true,
-  dshStatus: '当前 4 个模型 · http://127.0.0.1:3457/v1 · 凭据已就绪',
+  dshStatus: '当前 profile web · 4 个模型 · http://127.0.0.1:3457/v1 · 凭据已就绪 · 会话识别已开启',
   // 缓存命中率 shows a value only — no expand affordance, no detail section.
   cacheCard: { present: true, clickable: false, expandable: false, hasCaret: false, detailExists: false },
 };
