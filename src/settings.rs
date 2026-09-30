@@ -186,8 +186,21 @@ pub fn data_dir() -> Option<PathBuf> {
 
 /// Override the data directory, for a second instance that must not share
 /// state with the installed app. `task dev` points this at `~/.proxy-rs-dev`.
-const DATA_DIR_ENV: &str = "PROXY_DATA_DIR";
-const LEGACY_DATA_DIR_ENV: &str = "ANTHROPIC_PROXY_DATA_DIR";
+pub(crate) const DATA_DIR_ENV: &str = "PROXY_DATA_DIR";
+pub(crate) const LEGACY_DATA_DIR_ENV: &str = "ANTHROPIC_PROXY_DATA_DIR";
+
+/// Serializes every test that relocates the data directory.
+///
+/// The override is a process-global env var, so two tests pointing it at
+/// different roots would interleave and each see the other's value. It lives
+/// here, outside `mod tests`, because `pool_transfer` and `workbuddy_auth`
+/// tests relocate it too and must share the one lock rather than each keeping a
+/// private mutex that guards nothing.
+#[cfg(test)]
+pub(crate) fn data_dir_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// The [`DATA_DIR_ENV`] override, `~` expanded. `None` when unset or blank.
 fn env_data_dir() -> Option<PathBuf> {
@@ -597,21 +610,15 @@ mod tests {
     }
 
     /// The data-directory override is process-global, so tests that set it must
-    /// not run concurrently with each other.
-    static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Run `body` with `PROXY_DATA_DIR` set to `value`, then restore
-    /// whatever was there. Returns the guard so the caller keeps exclusivity.
-    ///
-    /// Env vars are process-wide, so a leaked value would change what every
-    /// other test — and any `data_dir()` call in this one — resolves to.
+    /// not run concurrently with each other. The lock itself is shared with the
+    /// other modules that relocate the directory (see [`data_dir_test_lock`]).
     fn with_data_dir_env(
         value: Option<&str>,
     ) -> (
         std::sync::MutexGuard<'static, ()>,
         (Option<std::ffi::OsString>, Option<std::ffi::OsString>),
     ) {
-        let guard = DATA_DIR_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = data_dir_test_lock();
         let previous = std::env::var_os(DATA_DIR_ENV);
         let legacy_previous = std::env::var_os(LEGACY_DATA_DIR_ENV);
         std::env::remove_var(LEGACY_DATA_DIR_ENV);

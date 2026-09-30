@@ -64,7 +64,7 @@ ui/
 3. **`appState` 只放跨模块共享的值。** 视图内部状态（选中项、定时器、已加载标记）留在该模块的闭包里。加字段前先确认真的有第二个模块要读。
 4. **IPC 只走 `core/ipc.js`。** 不要在视图里直接访问 `window.__TAURI__`；`invoke` 在浏览器里会降级为日志 no-op，这正是 `ui/tools/smoke.mjs` 能脱离 Tauri 跑完整启动流程的原因。
 5. **打破循环依赖用注入，不用反向 import。** 已有两例：`palette.js` 接收 `switchTab`，`settings/oauth-qr.js` 接收 `repaint`。反向 import 会让模块初始化顺序变成隐式契约。
-6. **`settings/` 的内部划分**：`form.js` 只搭骨架，`fields.js` 是纯标记构建器，`badges.js` 管「已修改」基线，`load.js` / `save.js` 读写后端，`credential-pool.js` / `oauth-qr.js` / `checkin.js` 管身份池，`dsh.js` 管 DSH 一键写入，`index.js` 是唯一对外接口。外部（`main.js` / `palette.js`）只从 `settings/index.js` 导入。
+6. **`settings/` 的内部划分**：`form.js` 只搭骨架，`fields.js` 是纯标记构建器，`badges.js` 管「已修改」基线，`load.js` / `save.js` 读写后端，`credential-pool.js` / `oauth-qr.js` / `checkin.js` 管身份池，`pool-transfer.js` 管账号池导入 / 导出（两个弹窗），`dsh.js` 管 DSH 一键写入，`index.js` 是唯一对外接口。外部（`main.js` / `palette.js`）只从 `settings/index.js` 导入。
 
 ## 三、`id` 的命名与使用
 

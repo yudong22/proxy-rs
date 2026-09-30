@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// One WorkBuddy login-state credential.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkBuddyCredential {
     /// Stable short id used in logs and the request-log `override_key` column
     /// (`wb-<6 hex>`). Assigned once at creation, never regenerated.
@@ -126,6 +126,62 @@ pub fn load_preferences() -> PoolPreferences {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+/// What one on-disk pool file looks like right now.
+///
+/// The `load_*` accessors deliberately degrade to "empty" on any failure — a
+/// corrupt file must not stop the proxy from serving. That is right for the
+/// request path, but it makes "the file is broken" and "the pool is empty"
+/// indistinguishable to a caller, and the account-pool export is exactly the
+/// caller that must not confuse them: it would otherwise write a valid-looking
+/// bundle containing nothing and let the user carry it to another machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreState {
+    /// No file on disk. Reading it as empty is correct, not a failure.
+    Missing,
+    /// Present and parseable.
+    Ok,
+    /// Present but unreadable or unparseable; the store currently reads as
+    /// empty, and anything derived from it is silently incomplete.
+    Corrupt(String),
+}
+
+impl StoreState {
+    /// Whether this state means data is being lost on read.
+    pub fn is_corrupt(&self) -> bool {
+        matches!(self, StoreState::Corrupt(_))
+    }
+}
+
+/// Inspect one store file without changing it.
+fn inspect_store<T: serde::de::DeserializeOwned>(path: std::path::PathBuf) -> StoreState {
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => StoreState::Missing,
+        Err(e) => StoreState::Corrupt(format!("读取失败: {e}")),
+        Ok(text) => match serde_json::from_str::<T>(&text) {
+            Ok(_) => StoreState::Ok,
+            Err(e) => StoreState::Corrupt(format!("解析失败: {e}")),
+        },
+    }
+}
+
+/// Health of every file that makes up the identity pool, as `(名称, 状态)`.
+///
+/// Read-only and side-effect free: it exists so a caller can tell the user that
+/// a store is unreadable *before* acting as if it were empty.
+pub fn store_health() -> Vec<(&'static str, StoreState)> {
+    vec![
+        (
+            "账号池",
+            inspect_store::<Vec<WorkBuddyCredential>>(credentials_path()),
+        ),
+        ("密钥池", inspect_store::<Vec<ApiKeyEntry>>(api_keys_path())),
+        (
+            "偏好设置",
+            inspect_store::<PoolPreferences>(preferences_path()),
+        ),
+    ]
+}
+
 /// Persist the pool preferences.
 pub fn save_preferences(prefs: &PoolPreferences) -> Result<()> {
     let path = preferences_path();
@@ -219,7 +275,7 @@ fn default_true() -> bool {
 /// The account block of a login state. Only the fields the upstream headers
 /// need are kept; everything else in the desktop file is ignored. The desktop
 /// file spells the fields camelCase (`enterpriseId`), so the aliases matter.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkBuddyAccount {
     #[serde(default)]
@@ -318,7 +374,12 @@ pub fn credential_id(access_token: &str) -> String {
 
 /// MD5 hex digest without pulling a crypto dependency: this is a *fingerprint*,
 /// not a secret derivation — the token material is already a secret on disk.
-fn md5_hex(data: &[u8]) -> [u8; 16] {
+///
+/// `pub(crate)` because [`crate::pool_transfer`] reuses the same digest for the
+/// export bundle's integrity checksum: that checksum exists to catch a
+/// hand-edited or truncated file, not to resist an attacker, so MD5 is the
+/// right tool and a second hash implementation would be dead weight.
+pub(crate) fn md5_hex(data: &[u8]) -> [u8; 16] {
     // Minimal MD5 implementation (RFC 1321) to avoid a new dependency for what
     // is only an id fingerprint.
     let mut h: [u32; 4] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
@@ -534,7 +595,7 @@ pub fn parse_login_state(raw: &str) -> Result<WorkBuddyCredential> {
 /// Mirrors [`WorkBuddyCredential`] in shape (id / label / enabled / points) so
 /// the GUI renders both pools with the same code, but it carries a raw key
 /// instead of a login state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ApiKeyEntry {
     /// Stable short id (`k-<6 hex>`), derived from the key material so the same
     /// key imported twice collapses to one entry.

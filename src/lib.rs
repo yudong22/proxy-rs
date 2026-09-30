@@ -7,6 +7,7 @@ pub mod error;
 pub mod launch_agent;
 pub mod metrics;
 pub mod models;
+pub mod pool_transfer;
 pub mod providers;
 pub mod proxy;
 pub mod router;

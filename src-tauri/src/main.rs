@@ -14,6 +14,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, State,
 };
+use tauri_plugin_dialog::DialogExt;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -1474,18 +1475,293 @@ fn open_logs_dir() {
     let Some(dir) = settings::log_dir() else {
         return;
     };
+    reveal_in_file_manager(&dir);
+}
+
+/// Open a path in the OS file manager.
+///
+/// One `cfg` ladder for both callers (the log directory button and the export
+/// success message). The macOS branch passes `-R` when the path is a file, which
+/// selects it inside its folder instead of opening the file itself — a JSON
+/// bundle is not something to hand to the default editor by accident.
+fn reveal_in_file_manager(path: &std::path::Path) {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(&dir).spawn();
+        let mut cmd = std::process::Command::new("open");
+        if path.is_file() {
+            cmd.arg("-R");
+        }
+        let _ = cmd.arg(path).spawn();
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+        // No portable "select the file" flag on Linux; opening its directory is
+        // the closest equivalent.
+        let dir = if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        let _ = std::process::Command::new("explorer").arg(path).spawn();
     }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = path;
+    }
+}
+
+// ── Account-pool import / export ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PoolExportBody {
+    /// `None` / empty exports a plain bundle; anything else encrypts it.
+    #[serde(default)]
+    passphrase: Option<String>,
+    /// Optional **suggested** file name for the save panel's name field. The
+    /// user can change both the name and the directory in the dialog; nothing
+    /// here decides where the file lands.
+    #[serde(default)]
+    filename: Option<String>,
+}
+
+/// Export the identity pool through the native "save as" panel.
+///
+/// Order matters: the panel is shown **first**, and the pool read, Argon2id
+/// derivation and file write happen only after the user has chosen a
+/// destination. Cancelling therefore costs nothing (no wasted KDF work), and the
+/// passphrase never leaves the process until there is somewhere to write.
+///
+/// The destination comes from the OS panel, not from the webview: the frontend
+/// supplies at most a *suggested* name, which [`export_path_in`] reduces to a
+/// base name. That is why this command needs no path-sanitizing boundary of its
+/// own — there is no attacker-controlled path to sanitize.
+///
+/// The passphrase is only ever a stack value here: it is not logged, not stored
+/// and not echoed back, so a failed export cannot leave it in the log file.
+///
+/// [`export_path_in`]: proxy_rs::pool_transfer::export_path_in
+#[tauri::command]
+async fn pool_export(
+    app: tauri::AppHandle,
+    ctx: State<'_, Arc<AppContext>>,
+    body: PoolExportBody,
+) -> Result<Value, String> {
+    // `spawn_blocking` is required here, not merely tidy: the panel waits on a
+    // human, Argon2id spends tens of milliseconds, and the write is disk I/O.
+    // None of that belongs on the runtime the webview's other commands share.
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        // Where the panel opens, and what it pre-fills. The timestamped default
+        // is the fallback name, so an untouched dialog still produces a
+        // recognisable file.
+        let default_path = proxy_rs::pool_transfer::default_export_path();
+        let suggested_dir = default_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let suggested =
+            proxy_rs::pool_transfer::export_path_in(&suggested_dir, body.filename.as_deref());
+        let suggested_name = suggested
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "proxy-rs-pool.json".to_string());
+
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("导出账号池")
+            .add_filter("Proxy RS 账号池", &["json"])
+            .set_directory(&suggested_dir)
+            .set_file_name(suggested_name);
+        // A sheet attached to the window reads as part of the app; a free
+        // floating panel can end up behind the window it belongs to.
+        if let Some(window) = app.get_webview_window("main") {
+            dialog = dialog.set_parent(&window);
+        }
+
+        // The callback form, driven by a local channel, rather than
+        // `blocking_save_file`. That helper ends in `rx.recv().unwrap()`, and
+        // `save_file` discards the error from its internal
+        // `run_on_main_thread` call — so a failed dispatch would drop the sender,
+        // make `recv` return `Err`, and panic. In release this profile is
+        // `panic = "abort"`, so that would take the whole app down over a dialog
+        // that never opened. Here the same failure degrades to `None`, which the
+        // caller already treats as "cancelled".
+        //
+        // Blocking on the channel is fine: this is a blocking-pool thread, and
+        // `save_file` itself only dispatches to the main thread and returns.
+        let (tx, rx) = std::sync::mpsc::channel();
+        dialog.save_file(move |chosen| {
+            // A send failure means this command was already gone; nothing to do.
+            let _ = tx.send(chosen);
+        });
+        let chosen = rx.recv().ok().flatten();
+
+        let Some(chosen) = chosen else {
+            // Dismissed (or the panel could not open). Not an error: the caller
+            // reports it as a no-op.
+            return Ok::<_, anyhow::Error>(None);
+        };
+        let path = chosen.simplified().into_path()?;
+
+        let options = proxy_rs::pool_transfer::ExportOptions {
+            passphrase: body.passphrase,
+        };
+        let (text, outcome) = proxy_rs::pool_transfer::export_text(&options)?;
+        proxy_rs::pool_transfer::write_bundle(&path, &text)?;
+        // The text holds every token in the clear; drop it at the end of the
+        // scope that built it rather than letting it live on in the command.
+        drop(text);
+        Ok(Some((path, outcome)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let Some((path, outcome)) = result else {
+        // A cancelled export writes nothing and logs nothing: the user already
+        // knows they cancelled, and a line in the log would only be noise.
+        return Ok(json!({ "ok": false, "cancelled": true }));
+    };
+
+    // An empty bundle is written (it is valid and importable, and may carry
+    // preferences alone), but it must not be reported as a clean success: the
+    // user's next move is to trust this file on another machine. Log at WARN so
+    // the reason is recoverable afterwards.
+    if outcome.is_empty() {
+        ctx.logs
+            .push(
+                "WARN",
+                format!(
+                    "身份池导出内容为空（账号 0、密钥 0）→ {}；原因：{}",
+                    path.display(),
+                    if outcome.warnings.is_empty() {
+                        "本机身份池为空".to_string()
+                    } else {
+                        outcome.warnings.join("；")
+                    }
+                ),
+            )
+            .await;
+    } else {
+        ctx.logs
+            .push(
+                "INFO",
+                format!(
+                    "身份池已导出{}：账号 {} 个、密钥 {} 个 → {}",
+                    if outcome.encrypted {
+                        "（口令加密）"
+                    } else {
+                        ""
+                    },
+                    outcome.counts.credentials,
+                    outcome.counts.api_keys,
+                    path.display()
+                ),
+            )
+            .await;
+    }
+
+    Ok(json!({
+        "ok": true,
+        "cancelled": false,
+        "path": path.to_string_lossy(),
+        "encrypted": outcome.encrypted,
+        "counts": outcome.counts,
+        "empty": outcome.is_empty(),
+        "warnings": outcome.warnings,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PoolImportBody {
+    /// The bundle's exact text, read by the webview. The backend never picks a
+    /// file itself, so it needs no filesystem capability for this path.
+    text: String,
+    #[serde(default)]
+    passphrase: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// Read-only: what would importing this bundle do? Never writes anything.
+///
+/// Still off the async runtime: an encrypted bundle runs the same Argon2id
+/// derivation on the way in, and the preview is on the path a user can click
+/// repeatedly.
+#[tauri::command]
+async fn pool_import_preview(body: PoolImportBody) -> Result<Value, String> {
+    let preview = tauri::async_runtime::spawn_blocking(move || {
+        let mode = proxy_rs::pool_transfer::ImportMode::parse(body.mode.as_deref().unwrap_or(""))?;
+        proxy_rs::pool_transfer::preview_import(&body.text, body.passphrase.as_deref(), mode)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    serde_json::to_value(preview).map_err(|e| e.to_string())
+}
+
+/// Import a bundle and hot-apply it.
+///
+/// Re-decodes rather than trusting a previous preview: the text is what is on
+/// screen now, and previewing then applying must not be able to diverge. When
+/// the proxy is already listening it is restarted so the new accounts take
+/// effect without the user hunting for a restart button — an imported credential
+/// is useless until the running server has rebuilt its pool from the store.
+#[tauri::command]
+async fn pool_import(
+    app: tauri::AppHandle,
+    ctx: State<'_, Arc<AppContext>>,
+    body: PoolImportBody,
+) -> Result<Value, String> {
+    // Decode + decrypt + write three files, all blocking, all off the runtime.
+    let preview = tauri::async_runtime::spawn_blocking(move || {
+        let mode = proxy_rs::pool_transfer::ImportMode::parse(body.mode.as_deref().unwrap_or(""))?;
+        proxy_rs::pool_transfer::apply_import(&body.text, body.passphrase.as_deref(), mode)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    reload_pool(&ctx).await;
+    if ctx.service_ctrl.is_running() {
+        start_proxy_server(app, ctx.inner().clone());
+    }
+
+    // Counts and short ids only: the log is a file, and the pool is secrets.
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "身份池{}导入完成：账号 新增 {}/更新 {}、密钥 新增 {}/更新 {}，默认身份 {}",
+                if preview.mode == "replace" {
+                    "替换式"
+                } else {
+                    "合并式"
+                },
+                preview.credentials_added,
+                preview.credentials_updated,
+                preview.keys_added,
+                preview.keys_updated,
+                if preview.default_identity_applied.is_empty() {
+                    "未变更".to_string()
+                } else {
+                    preview.default_identity_applied.clone()
+                }
+            ),
+        )
+        .await;
+
+    serde_json::to_value(preview).map_err(|e| e.to_string())
+}
+
+/// Show an exported bundle in the OS file manager.
+#[tauri::command]
+fn reveal_path(path: String) {
+    reveal_in_file_manager(std::path::Path::new(&path));
 }
 
 fn mask_key(key: &str) -> String {
@@ -1711,6 +1987,13 @@ fn main() {
 
     let mut builder = tauri::Builder::default();
 
+    // Native file dialogs, used from Rust only (`pool_export`'s "save as"
+    // panel). The plugin also ships webview-callable commands, but
+    // `src-tauri/capabilities/default.json` grants no `dialog:` permission, so
+    // the frontend cannot reach them: the panel is opened by this process and
+    // the chosen path never passes through JS.
+    builder = builder.plugin(tauri_plugin_dialog::init());
+
     // Registered for every copy, including the launchd child. The guard is what
     // keeps the proxy bound to the one fixed port the client CLIs are pointed
     // at, so exempting the launchd copy would leave the two copies unguarded
@@ -1893,7 +2176,11 @@ fn main() {
             api_keys_add,
             api_keys_delete,
             api_keys_toggle,
-            api_keys_set_default
+            api_keys_set_default,
+            pool_export,
+            pool_import_preview,
+            pool_import,
+            reveal_path
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

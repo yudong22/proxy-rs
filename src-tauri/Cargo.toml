@@ -1,12 +1,16 @@
 [package]
 name = "proxy-rs-gui"
-version = "1.9.13"
+version = "2.0.0"
 edition = "2021"
 description = "Proxy RS Desktop GUI"
 
 [dependencies]
 tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"
+# Native "save as" panel for the account-pool export. The plugin is used only
+# for `save_file` / `pick_file`; its JS commands stay unused, because the
+# webview has no bundler and the Rust side already owns the file writing.
+tauri-plugin-dialog = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # `time` is used directly by `await_start_outcome` to report a failed bind.

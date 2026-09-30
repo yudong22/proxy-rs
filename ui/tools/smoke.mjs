@@ -13,7 +13,8 @@
  * It covers the two things a file split is most likely to break:
  *   - the boot path renders real data into every view (counts + filled values)
  *   - cross-module integration points still fire: the command palette's dynamic
- *     import of the settings view, and the account pool's repaint after OAuth.
+ *     import of the settings view, the account pool's repaint after OAuth, and
+ *     the pool import/export dialogs (preview enables 确认导入, apply repaints).
  */
 
 import fs from 'node:fs';
@@ -44,6 +45,7 @@ const MOCK = {
   get_status: {
     running: true, port: 3456, provider: 'workbuddy-cn', version: '9.9.9',
     upstream_url: 'https://example.test/v1', log_path: '/tmp/proxy.log',
+    data_dir: '/Users/test/.proxy-rs',
     launch_at_login: false, is_dev: false,
     current_identity: { id: 'cred-1', label: '测试账号一', points: 1234.5 },
   },
@@ -99,6 +101,27 @@ const MOCK = {
   test_upstream: { ok: true, detail: '上游流式响应正常' },
   wb_oauth_start: { state: 'abc', auth_url: 'https://example.test/auth', qr_svg: '<svg id="qrsvg"></svg>' },
   wb_oauth_poll: { status: 'success', credential: { label: '新扫码账号' } },
+  pool_export: {
+    ok: true, cancelled: false, path: '/tmp/proxy-rs-pool-20260101.json', encrypted: true,
+    counts: { credentials: 2, api_keys: 1 }, empty: false, warnings: [],
+  },
+  pool_import_preview: {
+    mode: 'merge', encrypted: false,
+    credentials_total: 2, credentials_added: 1, credentials_updated: 1, credentials_unchanged: 0,
+    credentials_removed: 0,
+    keys_total: 1, keys_added: 1, keys_updated: 0, keys_unchanged: 0, keys_removed: 0,
+    default_identity_applied: 'cred-1', default_identity_dropped: false,
+    checkin_enabled: true, checkin_time: '08:30',
+    warnings: ['账号 wb-000000 的 id 与 token 不一致，已按 token 重新计算为 cred-1'],
+  },
+  pool_import: {
+    mode: 'merge', encrypted: false,
+    credentials_total: 2, credentials_added: 1, credentials_updated: 1, credentials_unchanged: 0,
+    credentials_removed: 0,
+    keys_total: 1, keys_added: 1, keys_updated: 0, keys_unchanged: 0, keys_removed: 0,
+    default_identity_applied: 'cred-1', default_identity_dropped: false,
+    checkin_enabled: true, checkin_time: '08:30', warnings: [],
+  },
 };
 
 /** What the UI must produce. Values captured from the pre-split build. */
@@ -136,6 +159,40 @@ const EXPECTED = {
   dshStatus: '当前 profile web · 4 个模型 · http://127.0.0.1:3457/v1 · 凭据已就绪 · 会话识别已开启',
   // 缓存命中率 shows a value only — no expand affordance, no detail section.
   cacheCard: { present: true, clickable: false, expandable: false, hasCaret: false, detailExists: false },
+  // Account-pool import/export (2.0.0). The dialogs are modal-only, so these
+  // are read after driving them from the toolbar.
+  exportResult: '已导出 2 个账号、1 个密钥（口令加密） /tmp/proxy-rs-pool-20260101.json',
+  // The export dialog names the directory it reads and the counts it will write,
+  // so "empty export" is diagnosable from the dialog itself (mock get_status
+  // plus the two pool list commands: 2 credentials + 1 key).
+  exportSourceShown: '/Users/test/.proxy-rs',
+  exportCountsShown: '账号 2 个、密钥 1 个',
+  // Dismissing the native save panel is a no-op, not a failure: the message says
+  // so, carries no error tone, and the 导出 button is usable again.
+  exportCancelled: {
+    text: '已取消导出（未写入任何文件）',
+    isError: false,
+    retryable: true,
+  },
+  // An export that carries no identity is a failure the user must notice, even
+  // though the file itself was written successfully. Asserted as substrings: the
+  // message spans inline markup, so exact equality would only be testing
+  // whitespace.
+  exportEmpty: {
+    isError: true,
+    contains: [
+      '不包含任何账号或密钥',
+      '本机身份池为空',
+      '/tmp/proxy-rs-pool-empty.json',
+      '请在正式实例中导出',
+    ],
+  },
+  importPreview: {
+    credentialsAdded: '1',
+    credentialsUpdated: '1',
+    warningText: '账号 wb-000000 的 id 与 token 不一致，已按 token 重新计算为 cred-1',
+    identity: 'cred-1',
+  },
 };
 
 const server = http.createServer((req, res) => {
@@ -215,9 +272,11 @@ try {
   // The bridge must exist before any module evaluates so the real boot path runs.
   await send('Page.addScriptToEvaluateOnNewDocument', { source: `
     window.__CALLS__ = [];
+    window.__INVOKE_ARGS__ = {};
     window.__MOCKDATA__ = ${JSON.stringify(MOCK)};
     window.__TAURI__ = {
-      core: { invoke: (cmd) => { window.__CALLS__.push(cmd);
+      core: { invoke: (cmd, args) => { window.__CALLS__.push(cmd);
+        window.__INVOKE_ARGS__[cmd] = args;
         return Promise.resolve(Object.prototype.hasOwnProperty.call(window.__MOCKDATA__, cmd)
           ? window.__MOCKDATA__[cmd] : null); } },
       event: { listen: () => Promise.resolve(() => {}) },
@@ -336,12 +395,161 @@ try {
     if (!i.called.includes(cmd)) failures.push(`OAuth flow did not call ${cmd} (pool repaint likely broken)`);
   }
 
+  // Cross-module integration 3: the account-pool transfer dialogs (2.0.0).
+  // Both are modal-only, so the toolbar buttons are the entry point, and the
+  // import path must go preview -> (nothing written) -> apply -> pool repaint.
+  //
+  // The export leg starts by cancelling: the save panel is now a real OS sheet,
+  // so "dismissed it" is an ordinary outcome the UI must report as such instead
+  // of as a failure.
+  await send('Runtime.evaluate', { expression: `(() => {
+    window.__CALLS__ = [];
+    window.__MOCKDATA__.pool_export = { ok: false, cancelled: true };
+    const ov = document.querySelector('#request-modal-overlay');
+    ov?.classList.remove('active');
+    document.querySelector('#btn-wb-export').click();
+    document.querySelector('#btn-wb-export-run').click();
+  })()` });
+  await new Promise((r) => setTimeout(r, 300));
+
+  const cancelStep = await send('Runtime.evaluate', {
+    returnByValue: true,
+    expression: `(() => ({
+      text: (document.querySelector('#wb-export-result')?.textContent || '')
+        .replace(/\\s+/g, ' ').trim(),
+      isError: document.querySelector('#wb-export-result')?.classList.contains('error'),
+      retryable: !document.querySelector('#btn-wb-export-run')?.disabled,
+    }))()`,
+  });
+  check('cancelled export is not an error', cancelStep.result.value, EXPECTED.exportCancelled);
+
+  await send('Runtime.evaluate', { expression: `(() => {
+    window.__MOCKDATA__.pool_export = {
+      ok: true, cancelled: false, path: '/tmp/proxy-rs-pool-20260101.json', encrypted: true,
+      counts: { credentials: 2, api_keys: 1 }, empty: false, warnings: [],
+    };
+    const ov = document.querySelector('#request-modal-overlay');
+    ov?.classList.remove('active');
+    document.querySelector('#btn-wb-export').click();
+    document.querySelector('#wb-export-encrypt').checked = true;
+    document.querySelector('#wb-export-encrypt')
+      .dispatchEvent(new Event('change', { bubbles: true }));
+    document.querySelector('#wb-export-passphrase').value = 'hunter2hunter2';
+    document.querySelector('#wb-export-passphrase2').value = 'hunter2hunter2';
+    document.querySelector('#btn-wb-export-run').click();
+  })()` });
+  await new Promise((r) => setTimeout(r, 500));
+
+  // Read the export result before the next dialog replaces the modal body.
+  const exportStep = await send('Runtime.evaluate', {
+    returnByValue: true,
+    expression: `(() => ({
+      text: (document.querySelector('#wb-export-result')?.textContent || '')
+        .replace(/\\s+/g, ' ').trim(),
+      withPassphrase: Boolean(window.__INVOKE_ARGS__?.pool_export?.body?.passphrase),
+      sourceShown: (document.querySelector('#wb-export-source')?.textContent || '').trim(),
+      countsShown: (document.querySelector('#wb-export-counts')?.textContent || '').trim(),
+    }))()`,
+  });
+
+  // An empty export must not look like a success: the backend reports
+  // `empty: true` and the UI has to say so in the error tone, naming the reason.
+  await send('Runtime.evaluate', { expression: `(() => {
+    window.__MOCKDATA__.pool_export = {
+      ok: true, cancelled: false, path: '/tmp/proxy-rs-pool-empty.json', encrypted: false,
+      counts: { credentials: 0, api_keys: 0 }, empty: true,
+      warnings: ['本机身份池为空，导出的文件不包含任何账号或密钥'],
+    };
+    const ov = document.querySelector('#request-modal-overlay');
+    ov?.classList.remove('active');
+    document.querySelector('#btn-wb-export').click();
+    document.querySelector('#btn-wb-export-run').click();
+  })()` });
+  await new Promise((r) => setTimeout(r, 400));
+
+  const emptyStep = await send('Runtime.evaluate', {
+    returnByValue: true,
+    expression: `(() => {
+      const el = document.querySelector('#wb-export-result');
+      return {
+        // The message spans inline <b> tags, so collapse whitespace around the
+        // element boundaries before comparing.
+        text: (el?.textContent || '').replace(/\\s+/g, ' ').trim(),
+        isError: el?.classList.contains('error'),
+      };
+    })()`,
+  });
+  const empty = emptyStep.result.value;
+  check('empty export is an error tone', empty.isError, EXPECTED.exportEmpty.isError);
+  for (const needle of EXPECTED.exportEmpty.contains) {
+    if (!empty.text.includes(needle)) {
+      failures.push(`empty export message is missing ${JSON.stringify(needle)}\n      actual: ${empty.text}`);
+    }
+  }
+
+  // Restore the healthy mock before the import leg runs.
+  await send('Runtime.evaluate', { expression: `(() => {
+    window.__MOCKDATA__.pool_export = {
+      ok: true, cancelled: false, path: '/tmp/proxy-rs-pool-20260101.json', encrypted: true,
+      counts: { credentials: 2, api_keys: 1 }, empty: false, warnings: [],
+    };
+  })()` });
+
+  await send('Runtime.evaluate', { expression: `(() => {
+    const ov = document.querySelector('#request-modal-overlay');
+    ov?.classList.remove('active');
+    document.querySelector('#btn-wb-import').click();
+    document.querySelector('#wb-import-text').value = '{"format":"proxy-rs-pool"}';
+    document.querySelector('#btn-wb-import-preview').click();
+  })()` });
+  await new Promise((r) => setTimeout(r, 400));
+
+  // Only a successful preview may enable 确认导入; the apply call is what must
+  // repaint the pool, so the assertion covers both halves.
+  const transfer = await send('Runtime.evaluate', {
+    returnByValue: true,
+    awaitPromise: true,
+    expression: `(async () => {
+      const t = (s) => (document.querySelector(s)?.textContent || '').replace(/\\s+/g, ' ').trim();
+      const previewEnabled = !document.querySelector('#btn-wb-import-run')?.disabled;
+      const preview = {
+        credentialsAdded: t('.wb-transfer-cards .wb-stat-card:nth-child(2) .wb-stat-val'),
+        credentialsUpdated: t('.wb-transfer-cards .wb-stat-card:nth-child(3) .wb-stat-val'),
+        warningText: t('.wb-transfer-warnings li'),
+        identity: t('.wb-transfer-identity .mono'),
+      };
+      const before = window.__CALLS__.length;
+      document.querySelector('#btn-wb-import-run').click();
+      await new Promise((r) => setTimeout(r, 600));
+      return {
+        previewEnabled,
+        preview,
+        importCalled: window.__CALLS__.includes('pool_import'),
+        poolRepainted: window.__CALLS__.slice(before).includes('wb_credentials_list'),
+        modalClosed: !document.querySelector('#request-modal-overlay')?.classList.contains('active'),
+      };
+    })()`,
+  });
+  const ex = exportStep.result.value;
+  const tr = transfer.result.value;
+  check('export result text', ex.text, EXPECTED.exportResult);
+  check('export sends the passphrase', ex.withPassphrase, true);
+  // The dialog names the data directory it will read — the fact that explains an
+  // unexpectedly empty export.
+  check('export dialog shows its data directory', ex.sourceShown, EXPECTED.exportSourceShown);
+  check('export dialog shows what will be exported', ex.countsShown, EXPECTED.exportCountsShown);
+  check('preview enables 确认导入', tr.previewEnabled, true);
+  check('import preview counts', tr.preview, EXPECTED.importPreview);
+  check('import called', tr.importCalled, true);
+  check('import repaints the pool', tr.poolRepainted, true);
+  check('import closes the dialog', tr.modalClosed, true);
+
   if (runtimeErrors.length) {
     failures.push(`runtime console errors:\n      ${runtimeErrors.join('\n      ')}`);
   }
 
   console.log(`boot assertions: counts, text, credential rows, default identity`);
-  console.log(`integration: palette dynamic import + OAuth repaint`);
+  console.log(`integration: palette dynamic import + OAuth repaint + pool import/export`);
   console.log(`mock commands exercised: ${i.called.length}`);
   if (failures.length === 0) {
     console.log('\nall assertions passed');

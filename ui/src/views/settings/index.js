@@ -19,6 +19,7 @@ import {
 } from './save.js';
 import { refreshSectionBadges } from './badges.js';
 import { initCredentialPool } from './credential-pool.js';
+import { initPoolTransfer } from './pool-transfer.js';
 import { applyDshConfig, loadDshConfig } from './dsh.js';
 
 export { renderSettings, loadSettings, testUpstream, refreshSectionBadges };
@@ -41,6 +42,10 @@ export function initSettings() {
   form?.addEventListener('change', refreshSectionBadges);
 
   initCredentialPool();
+  // Import/export lives in its own module: it is a distinct workflow (a modal
+  // either way), and folding it into credential-pool.js would grow that file
+  // past the point where its list rendering is readable.
+  initPoolTransfer();
   loadCodexConfig();
   loadDshConfig();
 }

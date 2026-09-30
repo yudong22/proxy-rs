@@ -1,6 +1,6 @@
 [package]
 name = "proxy-rs"
-version = "1.9.13"
+version = "2.0.0"
 edition = "2021"
 authors = [
     "yudong22 (孙东) <3cking@163.com>",
@@ -65,6 +65,16 @@ bytes = "1.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2.189"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+
+# Optional passphrase encryption for the account-pool transfer file
+# (`src/pool_transfer.rs`). Argon2id derives the key, AES-256-GCM both encrypts
+# and authenticates, so a tampered or truncated file fails to decrypt rather
+# than importing half a pool. All three are pure Rust — no C toolchain, which
+# matters because the release profile is `panic = "abort"` and shipped as a
+# self-contained `.app`.
+argon2 = "0.5"
+aes-gcm = "0.10"
+base64 = "0.22"
 
 [profile.release]
 opt-level = "z"        # Optimize for size

@@ -160,6 +160,17 @@ export function renderSettings() {
       <button type="button" class="btn btn-small" id="btn-wb-sticky-reset">
         重置会话粘滞
       </button>
+      <button type="button" class="btn btn-small" id="btn-wb-export" title="把账号与密钥导出为可携带的文件">
+        📤 导出账号池
+      </button>
+      <button type="button" class="btn btn-small" id="btn-wb-import" title="从导出文件恢复账号与密钥">
+        📥 导入账号池
+      </button>
+    </div>
+
+    <div class="hint wb-transfer-hint">
+      导出文件内含<b>可直接使用的登录态与密钥</b>，等同于密码本：请只在自己的设备之间传递，用完即删。
+      跨机迁移时可勾选口令加密；导入不会影响其他设置，且写入前会自动备份。
     </div>
 
     <div class="wb-schedule-row">

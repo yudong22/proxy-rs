@@ -445,3 +445,117 @@
 .wb-qr-status-err {
   color: var(--error);
 }
+
+/* ── Account-pool import / export ───────────────────────────────── */
+
+/* The standing risk note under the pool toolbar. Sits in the same visual
+   register as `.hint`, but the clipboard contents deserve the warning tint
+   rather than plain grey: this is the one line in the section that describes a
+   way to lose the accounts. */
+.wb-transfer-hint {
+  padding: 8px 10px;
+  background: var(--warning-tint);
+  border: 1px solid var(--warning-tint-border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.wb-transfer-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.wb-transfer-lead {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.wb-transfer-warning {
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--warning-ink);
+  background: var(--warning-tint);
+  border: 1px solid var(--warning-tint-border);
+  border-radius: 8px;
+}
+
+/* Passphrase fields stay hidden until the encrypt switch is on; `hidden` is
+   honoured because base.css defines `[hidden]`. */
+.wb-transfer-passphrase {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wb-transfer-textarea {
+  width: 100%;
+  min-height: 120px;
+  font-family: var(--mono);
+  font-size: 11px;
+  resize: vertical;
+}
+
+.wb-transfer-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.wb-transfer-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wb-transfer-identity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+/* "Which data directory is this export reading" — the answer to an empty
+   export, so it sits above the fields rather than in a tooltip. */
+.wb-transfer-source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  padding: 8px 10px;
+  background: var(--neutral-tint);
+  border: 1px solid var(--neutral-tint-border);
+  border-radius: 8px;
+}
+
+.wb-transfer-kv {
+  color: var(--muted);
+}
+
+/* How much this export will carry. Same weight as the data-directory line it
+   sits under; the empty case is coloured by `.wb-tone-err` from JS. */
+.wb-transfer-counts {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.wb-transfer-path {
+  word-break: break-all;
+  font-size: 11px;
+}
+
+.wb-transfer-replace-note {
+  color: var(--warning-ink);
+  margin: 0;
+}
+
+.wb-transfer-warnings {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--warning-ink);
+}
