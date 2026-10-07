@@ -90,16 +90,12 @@ const MOCK = {
       { id: 'cred-1', label: '测试账号一', nickname: '甲', state: 'ok', enabled: true, points: 1234.5, sticky_sessions: 2, checked_in_today: true, masked_token: 'sk-***1', has_refresh_token: true, needs_relogin: false },
       { id: 'cred-2', label: '测试账号二', nickname: '乙', state: 'cooldown', enabled: true, points: null, sticky_sessions: 0, checked_in_today: false, masked_token: 'sk-***2', has_refresh_token: true, needs_relogin: false },
       { id: 'cred-3', label: '需重登账号', nickname: '丙', state: 'expired', enabled: true, points: null, sticky_sessions: 0, checked_in_today: false, masked_token: 'sk-***3', has_refresh_token: false, needs_relogin: true },
+      // Has a refresh token, but the endpoint rejected it: the case a static
+      // "no refresh token" check cannot see, and the reason the badge reads the
+      // durable verdict instead.
+      { id: 'cred-4', label: '令牌被拒账号', nickname: '丁', state: 'ok', enabled: true, points: 5, sticky_sessions: 0, checked_in_today: false, masked_token: 'sk-***4', has_refresh_token: true, needs_relogin: true, relogin_required_since_ms: 1790000000000, last_error: '刷新端点返回 401: token revoked' },
     ],
     default_identity_id: 'cred-1',
-  },
-  wb_refresh_logins: {
-    total: 3, refreshed: 2, failed: 1, needs_relogin: 1,
-    details: [
-      { id: 'cred-1', label: '测试账号一', refreshed: true, error: '', needs_relogin: false },
-      { id: 'cred-2', label: '测试账号二', refreshed: true, error: '', needs_relogin: false },
-      { id: 'cred-3', label: '需重登账号', refreshed: false, error: '凭据没有 refreshToken，无法刷新', needs_relogin: true },
-    ],
   },
   wb_relogin: { id: 'cred-3', label: '需重登账号', enabled: true, masked_token: 'sk-***3' },
   wb_refresh_points_single: {
@@ -140,7 +136,7 @@ const MOCK = {
 
 /** What the UI must produce. Values captured from the pre-split build. */
 const EXPECTED = {
-  counts: { credentialRows: 4, providerOptions: 3, speedRows: 8 },
+  counts: { credentialRows: 5, providerOptions: 3, speedRows: 8 },
   // 7 metric rows + the 会话 header row.
   speedMetrics: {
     '请求次数': '7',
@@ -164,9 +160,9 @@ const EXPECTED = {
     statusText: '运行中 · 端口 3456',
     appVersion: 'v9.9.9',
   },
-  rowLabels: ['测试账号一', '测试账号二', '需重登账号', '备用密钥'],
-  rowStates: ['正常', '冷却中', '已过期', '已启用'],
-  defaultRowFlags: [true, false, false, false],
+  rowLabels: ['测试账号一', '测试账号二', '需重登账号', '令牌被拒账号', '备用密钥'],
+  rowStates: ['正常', '冷却中', '已过期', '正常', '已启用'],
+  defaultRowFlags: [true, false, false, false, false],
   selectValue: 'cred-1',
   // The DSH group renders its live state on load, from get_dsh_config.
   dshButtonPresent: true,
@@ -180,10 +176,10 @@ const EXPECTED = {
   // so "empty export" is diagnosable from the dialog itself (mock get_status
   // plus the two pool list commands: 2 credentials + 1 key).
   exportSourceShown: '/Users/test/.proxy-rs',
-  exportCountsShown: '账号 3 个、密钥 1 个',
-  // Batch refresh must name the accounts needing a re-bind, not just count them:
-  // a fresh login is a manual step, so the user has to know which row to act on.
-  refreshStatusContains: ['成功 2 个', '失败 1 个', '个需要重新绑定', '需重登账号'],
+  exportCountsShown: '账号 4 个、密钥 1 个',
+  // The badge's tooltip must name the reason, since the row is where the user
+  // learns about a revoked credential now that the live log is not the only place.
+  rejectedTooltipContains: ['拒绝', 'token revoked'],
   // Dismissing the native save panel is a no-op, not a failure: the message says
   // so, carries no error tone, and the 导出 button is usable again.
   exportCancelled: {
@@ -561,24 +557,24 @@ try {
   check('import repaints the pool', tr.poolRepainted, true);
   check('import closes the dialog', tr.modalClosed, true);
 
-  // Cross-module integration 4: login-state recovery (relogin / refresh logins).
-  // The account with no refresh token must be visibly marked, batch refresh must
-  // name the account that needs a re-bind rather than only counting it, and the
-  // re-bind dialog must submit to `wb_relogin` and repaint the pool.
+  // Cross-module integration 4: login-state recovery (relogin).
+  //
+  // There is deliberately no "refresh all logins" button: renewal is automatic
+  // (the scheduler scans, and a 401 renews reactively), so the only manual step
+  // left is re-binding an account that cannot heal itself. What the badge must
+  // therefore carry is the verdict — including the case a static check cannot
+  // see, namely a credential that *has* a refresh token but was rejected.
   await send('Runtime.evaluate', { expression: `(() => {
     window.__CALLS__ = [];
     const ov = document.querySelector('#request-modal-overlay');
     ov?.classList.remove('active');
-    document.querySelector('#btn-wb-refresh-logins').click();
   })()` });
-  await new Promise((r) => setTimeout(r, 400));
 
   const recovery = await send('Runtime.evaluate', {
     returnByValue: true,
     awaitPromise: true,
     expression: `(async () => {
       const t = (s) => (document.querySelector(s)?.textContent || '').replace(/\\s+/g, ' ').trim();
-      const refreshStatus = t('#wb-status');
 
       // The per-row 刷新积分 button must refresh ONLY its own row. It used to
       // ignore its data-points id and call the pool-wide command, so this
@@ -598,6 +594,16 @@ try {
         .find((r) => r.textContent.includes('需重登账号'));
       const badge = row?.querySelector('.wb-relogin-pill')?.textContent?.trim() || '';
 
+      // A static "no refresh token" check would miss this row entirely; the
+      // durable verdict from a rejected refresh is what marks it.
+      const rejectedRow = [...document.querySelectorAll('#wb-identity-list .wb-credential-row')]
+        .find((r) => r.textContent.includes('令牌被拒账号'));
+      const rejected = {
+        marked: Boolean(rejectedRow?.querySelector('.wb-relogin-pill')),
+        // The reason belongs on the row, not only in the live log.
+        tooltip: rejectedRow?.querySelector('.wb-relogin-pill')?.getAttribute('title') || '',
+      };
+
       const before = window.__CALLS__.length;
       // The button on *that* row, not the first one in the list.
       row.querySelector('[data-relogin]').click();
@@ -607,12 +613,11 @@ try {
       document.querySelector('#btn-wb-relogin-run').click();
       await new Promise((r) => setTimeout(r, 400));
       return {
-        refreshStatus,
         reloginBadge: badge,
         dialogOpen,
         targetShown,
         rowPoints,
-        refreshCalled: window.__CALLS__.includes('wb_refresh_logins'),
+        rejected,
         reloginCalled: window.__CALLS__.includes('wb_relogin'),
         reloginBody: window.__INVOKE_ARGS__?.wb_relogin?.body?.id,
         poolRepainted: window.__CALLS__.slice(before).includes('wb_credentials_list'),
@@ -621,8 +626,15 @@ try {
     })()`,
   });
   const rc = recovery.result.value;
-  check('batch refresh called', rc.refreshCalled, true);
   check('needs-relogin account is marked', rc.reloginBadge, '需重新绑定');
+  // The capability the removed button used to provide: an account whose refresh
+  // was *rejected* still gets flagged, with the reason on the row.
+  check('rejected-refresh account is marked', rc.rejected.marked, true);
+  for (const needle of EXPECTED.rejectedTooltipContains) {
+    if (!rc.rejected.tooltip.includes(needle)) {
+      failures.push(`rejected-refresh tooltip is missing ${JSON.stringify(needle)}\n      actual: ${rc.rejected.tooltip}`);
+    }
+  }
   check('relogin dialog opens', rc.dialogOpen, true);
   check('relogin dialog names its target', rc.targetShown, 'cred-3');
   check('relogin called', rc.reloginCalled, true);
@@ -634,11 +646,6 @@ try {
   check('row 刷新积分 calls the single-identity command', rc.rowPoints.called, true);
   check('row 刷新积分 passes its own id', rc.rowPoints.id, 'cred-2');
   check('row 刷新积分 does not refresh the whole pool', rc.rowPoints.calledPoolWide, false);
-  for (const needle of EXPECTED.refreshStatusContains) {
-    if (!rc.refreshStatus.includes(needle)) {
-      failures.push(`batch refresh status is missing ${JSON.stringify(needle)}\n      actual: ${rc.refreshStatus}`);
-    }
-  }
 
   if (runtimeErrors.length) {
     failures.push(`runtime console errors:\n      ${runtimeErrors.join('\n      ')}`);

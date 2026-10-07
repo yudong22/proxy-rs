@@ -571,10 +571,13 @@ fn mask_credential(
     } else {
         "ok"
     };
-    // Whether a fresh login is the only way back. A credential with no refresh
-    // token cannot renew itself, so the GUI marks it as needing a re-bind rather
-    // than offering a refresh that is guaranteed to fail.
-    let needs_relogin = c.enabled && c.refresh_token.is_none();
+    // Whether a fresh login is the only way back. Two cases, both un-self-healing:
+    // a credential with no refresh token at all, and one whose refresh was
+    // *rejected* (revoked token). The second cannot be detected statically, so it
+    // comes from the durable marker a failed refresh writes — see
+    // `refresh_failure_needs_relogin`.
+    let needs_relogin =
+        c.enabled && (c.refresh_token.is_none() || c.relogin_required_since_ms.is_some());
     json!({
         "id": c.id,
         "label": c.label,
@@ -593,6 +596,7 @@ fn mask_credential(
         "last_refresh_at_ms": c.last_refresh_at_ms,
         "has_refresh_token": c.refresh_token.is_some(),
         "needs_relogin": needs_relogin,
+        "relogin_required_since_ms": c.relogin_required_since_ms,
         "checked_in_today": proxy_rs::workbuddy_auth::checked_in_today(
             c,
             &proxy_rs::workbuddy_auth::local_day(now),
@@ -658,38 +662,6 @@ async fn wb_credentials_add(
         )
         .await;
     Ok(mask_credential(&credential, 0, false))
-}
-
-/// Renew every enabled account's login state, now.
-///
-/// The GUI's 全量刷新登录态 button. Reports per-account outcomes so the list can
-/// mark exactly the accounts that need a fresh login instead of telling the user
-/// only that "some" failed.
-#[tauri::command]
-async fn wb_refresh_logins(
-    app: tauri::AppHandle,
-    ctx: State<'_, Arc<AppContext>>,
-) -> Result<Value, String> {
-    let report = proxy_rs::workbuddy_auth::refresh_all_credentials(&ctx.client).await;
-
-    // Refresh writes new tokens to disk; rebuild the running pool so the next
-    // request uses them without waiting for a restart.
-    reload_pool(&ctx).await;
-    if ctx.service_ctrl.is_running() {
-        start_proxy_server(app, ctx.inner().clone());
-    }
-
-    ctx.logs
-        .push(
-            "INFO",
-            format!(
-                "手动刷新登录态完成: 共 {} 个，成功 {} 个，失败 {} 个，需重新登录 {} 个",
-                report.total, report.refreshed, report.failed, report.needs_relogin
-            ),
-        )
-        .await;
-
-    Ok(json!(report))
 }
 
 #[derive(Deserialize)]
@@ -2325,7 +2297,6 @@ fn main() {
             wb_credentials_list,
             wb_credentials_add,
             wb_relogin,
-            wb_refresh_logins,
             wb_credentials_delete,
             wb_credentials_toggle,
             wb_sticky_reset,

@@ -56,6 +56,20 @@ pub struct WorkBuddyCredential {
     /// Last failure description, shown in the GUI credential list.
     #[serde(default)]
     pub last_error: String,
+    /// When a token refresh was **rejected** (not merely failed transiently),
+    /// epoch millis. `None` means no rejection is on record.
+    ///
+    /// Needed because "does this account need me to log in again?" cannot be
+    /// answered from `last_error` alone: a network blip and a revoked refresh
+    /// token both write one. Only the rejection case cannot self-heal, and it
+    /// must survive a restart — otherwise the GUI badge would forget an account
+    /// that is permanently stranded, and the user would only discover it when a
+    /// request failed.
+    ///
+    /// Cleared by a successful refresh or a re-login, so a recovered account
+    /// stops asking for attention.
+    #[serde(default)]
+    pub relogin_required_since_ms: Option<i64>,
     /// Remaining points (积分) as last queried. `None` until a refresh reads
     /// them, so the UI can distinguish "unknown" from a real zero balance.
     #[serde(default)]
@@ -667,6 +681,8 @@ pub fn parse_login_state(raw: &str) -> Result<WorkBuddyCredential> {
         enabled: true,
         cooldown_until_ms: None,
         last_error: String::new(),
+        // A freshly imported login state has not been rejected yet.
+        relogin_required_since_ms: None,
         points: None,
         points_fetched_at_ms: None,
         last_checkin_date: None,
@@ -1548,6 +1564,8 @@ pub async fn poll_oauth_token(
         enabled: true,
         cooldown_until_ms: None,
         last_error: String::new(),
+        // A brand-new login is by definition not rejected.
+        relogin_required_since_ms: None,
         points: None,
         points_fetched_at_ms: None,
         last_checkin_date: None,
@@ -1897,6 +1915,43 @@ pub struct RefreshReport {
 /// On success the renewed credential has already been written back to the store
 /// by [`refresh_credential`]. On failure the reason is persisted so the list can
 /// show it without re-probing.
+/// Whether a refresh failure can only be fixed by a new login.
+///
+/// The one place this classification lives, so the request path, the background
+/// scanner and the GUI badge cannot disagree about which accounts are stranded:
+///
+///   * **no refresh token at all** — there is nothing to renew with;
+///   * **the endpoint refused ours** (401/403, or an explicit complaint about
+///     the refresh token) — the credential is revoked.
+///
+/// Anything else (connection reset, 5xx, timeout) is retryable and must *not* be
+/// labelled relogin; otherwise a flaky network would light up every account with
+/// "需重新绑定" and train the user to ignore it.
+pub fn refresh_failure_needs_relogin(cred: &WorkBuddyCredential, error: &str) -> bool {
+    cred.refresh_token.is_none()
+        || error.contains("refreshToken")
+        || error.contains("401")
+        || error.contains("403")
+}
+
+/// Record a failed refresh on disk, distinguishing "retryable" from "log in again".
+///
+/// Both cases write `last_error` so the list can explain itself; only the
+/// un-self-healing case sets [`WorkBuddyCredential::relogin_required_since_ms`],
+/// which is what the GUI badge keys off and what must survive a restart.
+pub fn mark_credential_refresh_failure(
+    cred: &WorkBuddyCredential,
+    error: &str,
+    needs_relogin: bool,
+) {
+    let mut marked = cred.clone();
+    marked.last_error = error.to_string();
+    if needs_relogin {
+        marked.relogin_required_since_ms = Some(crate::util::unix_millis());
+    }
+    let _ = upsert_credential(marked);
+}
+
 async fn refresh_one_credential(
     client: &reqwest::Client,
     cred: &WorkBuddyCredential,
@@ -1904,25 +1959,26 @@ async fn refresh_one_credential(
     let endpoint = auth_endpoint_for(cred);
     let mut fresh = cred.clone();
     match refresh_credential(client, &endpoint, &mut fresh).await {
-        Ok(()) => RefreshResult {
-            id: fresh.id.clone(),
-            label: display_label(&fresh),
-            refreshed: true,
-            error: String::new(),
-            needs_relogin: false,
-        },
+        Ok(()) => {
+            // A successful renewal clears any previous "log in again" verdict:
+            // the account demonstrably heals itself now.
+            if cred.relogin_required_since_ms.is_some() {
+                let mut cleared = fresh.clone();
+                cleared.relogin_required_since_ms = None;
+                let _ = upsert_credential(cleared);
+            }
+            RefreshResult {
+                id: fresh.id.clone(),
+                label: display_label(&fresh),
+                refreshed: true,
+                error: String::new(),
+                needs_relogin: false,
+            }
+        }
         Err(e) => {
             let msg = e.to_string();
-            // A missing refresh token, or the endpoint refusing ours, are both
-            // "only a new login fixes this". Anything else (network blip, 5xx)
-            // is retryable and must not be labelled relogin.
-            let needs_relogin = cred.refresh_token.is_none()
-                || msg.contains("refreshToken")
-                || msg.contains("401")
-                || msg.contains("403");
-            let mut marked = cred.clone();
-            marked.last_error = msg.clone();
-            let _ = upsert_credential(marked);
+            let needs_relogin = refresh_failure_needs_relogin(cred, &msg);
+            mark_credential_refresh_failure(cred, &msg, needs_relogin);
             RefreshResult {
                 id: cred.id.clone(),
                 label: display_label(cred),
@@ -1958,17 +2014,6 @@ async fn refresh_candidates(
         needs_relogin,
         details,
     }
-}
-
-/// Renew every enabled account's access token, once.
-///
-/// The GUI's 全量刷新登录态 button.
-pub async fn refresh_all_credentials(client: &reqwest::Client) -> RefreshReport {
-    let candidates: Vec<WorkBuddyCredential> = load_credentials()
-        .into_iter()
-        .filter(|c| c.enabled)
-        .collect();
-    refresh_candidates(client, candidates).await
 }
 
 /// Renew only the accounts whose token is due, and report what happened.
@@ -2640,6 +2685,106 @@ mod tests {
     ///
     /// Regression: the button called the pool-wide refresh and ignored its own
     /// `data-points` id, so opening one row's button updated every account —
+    /// Only an un-self-healing failure may claim "需重新绑定".
+    ///
+    /// The distinction matters because the badge is the user's only cue to act:
+    /// if a network blip also set it, every account would light up on a flaky
+    /// connection and the marker would stop meaning anything. The reverse
+    /// mistake is worse — a genuinely revoked credential that is *not* flagged
+    /// leaves the user waiting for a refresh that can never succeed.
+    #[test]
+    fn only_unrecoverable_refresh_failures_need_relogin() {
+        let with_refresh = WorkBuddyCredential {
+            refresh_token: Some("ref".to_string()),
+            enabled: true,
+            ..Default::default()
+        };
+
+        // Rejected by the endpoint: a new login is the only way back.
+        assert!(refresh_failure_needs_relogin(
+            &with_refresh,
+            "刷新端点返回 401: revoked"
+        ));
+        assert!(refresh_failure_needs_relogin(
+            &with_refresh,
+            "刷新端点返回 403: forbidden"
+        ));
+        assert!(refresh_failure_needs_relogin(
+            &with_refresh,
+            "凭据没有 refreshToken，无法刷新"
+        ));
+
+        // Transient: retryable, must NOT be labelled relogin.
+        assert!(!refresh_failure_needs_relogin(
+            &with_refresh,
+            "刷新请求失败: connection reset"
+        ));
+        assert!(!refresh_failure_needs_relogin(
+            &with_refresh,
+            "刷新端点返回 500: oops"
+        ));
+        assert!(!refresh_failure_needs_relogin(
+            &with_refresh,
+            "刷新响应不是有效 JSON: eof"
+        ));
+
+        // No refresh token at all: nothing to renew with, regardless of message.
+        let without = WorkBuddyCredential {
+            refresh_token: None,
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(refresh_failure_needs_relogin(&without, "anything at all"));
+    }
+
+    /// The verdict has to outlive the process: it is written to disk and cleared
+    /// only by a recovery.
+    #[test]
+    fn a_rejected_refresh_is_recorded_until_it_recovers() {
+        let dir = std::env::temp_dir().join(format!("proxy-rs-relogin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = crate::settings::data_dir_test_lock();
+        let previous = std::env::var_os(crate::settings::DATA_DIR_ENV);
+        std::env::set_var(crate::settings::DATA_DIR_ENV, &dir);
+
+        let cred = WorkBuddyCredential {
+            id: "wb-rejected".to_string(),
+            label: "被拒账号".to_string(),
+            access_token: "tok".to_string(),
+            refresh_token: Some("ref".to_string()),
+            enabled: true,
+            ..Default::default()
+        };
+        save_credentials(std::slice::from_ref(&cred)).unwrap();
+
+        // A transient failure records the reason but not the verdict.
+        mark_credential_refresh_failure(&cred, "网络抖动", false);
+        let stored = load_credentials();
+        assert!(stored[0].relogin_required_since_ms.is_none());
+        assert_eq!(stored[0].last_error, "网络抖动");
+
+        // A rejection records the verdict, on disk.
+        mark_credential_refresh_failure(&cred, "刷新端点返回 401", true);
+        let stored = load_credentials();
+        assert!(
+            stored[0].relogin_required_since_ms.is_some(),
+            "the verdict must persist so the badge survives a restart"
+        );
+
+        // A successful recovery clears it: the account heals itself now.
+        let mut recovered = stored[0].clone();
+        recovered.relogin_required_since_ms = None;
+        upsert_credential(recovered).unwrap();
+        assert!(load_credentials()[0].relogin_required_since_ms.is_none());
+
+        match previous {
+            Some(v) => std::env::set_var(crate::settings::DATA_DIR_ENV, v),
+            None => std::env::remove_var(crate::settings::DATA_DIR_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// and a single unreachable account could not be retried on its own. These
     /// setters are what the single-identity path writes through, so the isolation
     /// property belongs here.

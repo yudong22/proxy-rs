@@ -86,13 +86,19 @@ export async function renderIdentityPool() {
       const checkinNote = c.checked_in_today
         ? raw('<span class="wb-checkin-note">今日已打卡</span>')
         : '';
-      // No refresh token means nothing can renew this account; only a fresh
-      // login brings it back. Say so on the row, so the user knows which one to
-      // re-bind instead of retrying a refresh that cannot succeed. Its own class
-      // (not the state pill's) keeps "how healthy is it" and "does it need you"
-      // as two distinguishable things.
+      // Two un-self-healing cases, and the row explains which one applies:
+      // no refresh token at all, or a refresh the endpoint rejected (revoked).
+      // Without the second the badge would miss an account that is permanently
+      // stranded despite looking perfectly healthy.
+      //
+      // Its own class (not the state pill's) keeps "how healthy is it" and "does
+      // it need you" as two distinguishable things. The reason goes in the
+      // tooltip: it is the detail that used to live only in the live log.
+      const reloginWhy = c.has_refresh_token
+        ? '刷新登录态已被上游拒绝（refreshToken 可能已失效），只能重新登录'
+        : '该账号没有 refreshToken，无法自动续期';
       const reloginNote = c.needs_relogin
-        ? raw('<span class="badge-pill wb-relogin-pill" title="该账号没有 refreshToken，无法自动续期，请点「重新绑定」">需重新绑定</span>')
+        ? raw(`<span class="badge-pill wb-relogin-pill" title="${reloginWhy}${c.last_error ? `：${c.last_error}` : ''}；请点「重新绑定」">需重新绑定</span>`)
         : '';
       return html`<div class="wb-credential-row${raw(isDefault ? ' wb-credential-row--default' : '')}">
         <div class="wb-credential-main">
@@ -317,46 +323,6 @@ export function initCredentialPool() {
   initRelogin();
   $('#btn-wb-qrcode')?.addEventListener('click', startQrCodeLogin);
   $('#btn-wb-checkin-all')?.addEventListener('click', triggerBatchCheckin);
-
-  // Renew every account's login state now. This is the recovery path for a 401
-  // that a single-account setup cannot fail over from: without it, the only way
-  // back from an expired session is to notice and re-scan.
-  $('#btn-wb-refresh-logins')?.addEventListener('click', async () => {
-    const btn = $('#btn-wb-refresh-logins');
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '⏳ 刷新中...';
-    }
-    try {
-      const report = await invoke('wb_refresh_logins');
-      await renderIdentityPool();
-      if (!report || report.total === 0) {
-        showWbStatus('账号池中没有已启用的账号可刷新');
-      } else if (report.needs_relogin > 0) {
-        // Name the accounts rather than only counting them: a fresh login is a
-        // manual step, and the user needs to know which row to act on.
-        const names = (report.details || [])
-          .filter((d) => d.needs_relogin)
-          .map((d) => d.label || d.id)
-          .join('、');
-        showWbStatus(
-          `登录态刷新：成功 ${report.refreshed} 个，失败 ${report.failed} 个；`
-          + `${report.needs_relogin} 个需要重新绑定（${names}）`,
-          true,
-        );
-        toast(`${report.needs_relogin} 个账号需重新登录，请点对应行的「重新绑定」`, 'error');
-      } else {
-        showWbStatus(`登录态刷新完成：成功 ${report.refreshed} 个，失败 ${report.failed} 个`);
-      }
-    } catch (e) {
-      showWbStatus('刷新登录态失败: ' + e, true);
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = '🔁 全量刷新登录态';
-      }
-    }
-  });
 
   $('#btn-wb-refresh-points')?.addEventListener('click', async () => {
     const btn = $('#btn-wb-refresh-points');

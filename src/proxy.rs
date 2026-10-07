@@ -970,12 +970,27 @@ async fn refresh_workbuddy_credential(
         Err(e) => {
             let msg = e.to_string();
             pool.mark_refresh_failed(&cred.id, 60_000, &msg).await;
+            // Persist the verdict as well as parking the pool entry. The
+            // in-memory cooldown expires in 60s and dies with the process, but
+            // "this account needs a new login" is a lasting fact the GUI badge
+            // must keep showing — otherwise the user only learns about a revoked
+            // credential when a request fails.
+            let needs_relogin = crate::workbuddy_auth::refresh_failure_needs_relogin(cred, &msg);
+            crate::workbuddy_auth::mark_credential_refresh_failure(cred, &msg, needs_relogin);
             gui_logs
                 .push(
                     "WARN",
                     format!(
-                        "刷新 WorkBuddy 访问令牌失败 id={} endpoint={} {} | {}",
-                        cred.id, endpoint, tag, msg
+                        "刷新 WorkBuddy 访问令牌失败 id={} endpoint={} {} | {}{}",
+                        cred.id,
+                        endpoint,
+                        tag,
+                        msg,
+                        if needs_relogin {
+                            "（需要重新登录该账号）"
+                        } else {
+                            ""
+                        }
                     ),
                 )
                 .await;

@@ -275,7 +275,7 @@ pub fn write_bundle(path: &Path, text: &str) -> Result<()>;
 
 **后台巡检**：`scheduler::run_login_state_scanner` 每 5 分钟执行一次 `refresh_due_credentials`——只有真正到期的账号才会发起请求，空闲时零流量。与打卡调度同一模式（`async fn` 由 Tauri runtime spawn，因为 `.setup()` 闭包没有 Tokio reactor）。
 
-**GUI**：工具栏新增**「🔁 全量刷新登录态」**（`wb_refresh_logins`），失败时**点名**列出需重登的账号而不只是计数；无法自愈的账号（无 refreshToken）在行内标为琥珀色**「需重新绑定」**（独立 class，与状态 pill 区分开——"健不健康"和"要不要你动手"是两件事）；每行新增**「重新绑定」**按钮（`wb_relogin`），粘贴新登录态或用扫码覆盖该条记录并保留 label / 积分 / 启用状态 / 默认身份。
+**GUI**：无法自愈的账号在行内标为琥珀色**「需重新绑定」**（独立 class，与状态 pill 区分开——"健不健康"和"要不要你动手"是两件事），tooltip 给出失败原因；每行新增**「重新绑定」**按钮（`wb_relogin`），粘贴新登录态或用扫码覆盖该条记录并保留 label / 积分 / 启用状态 / 默认身份。最初还有一个「🔁 全量刷新登录态」按钮（`wb_refresh_logins`），**已在 2.0.3 删除**，理由见第 13 节。
 
 **测试**：`needs_refresh` 兜底窗口（含"已知过期优先于兜底"）、`credential_id_for` 的 token 无关性与 enterpriseId 区分、`parse_login_state` 稳定 id、导入不改写已刷新账号且保留默认身份、合并识别旧 token 哈希条目；集成测试新增完整生命周期（登录 → 刷新换 token → 导出导入 → 重新登录）断言**始终只有一行且默认身份不变**。
 
@@ -374,7 +374,7 @@ pub fn write_bundle(path: &Path, text: &str) -> Result<()>;
 | M6 | `smoke.mjs` 传输断言、README 能力表、版本号 1.9.13 → 2.0.0 | ✅ v2.0.0 |
 | M7 | 导出改用原生「另存为」面板：`tauri-plugin-dialog` + 回调式 `save_file` + 取消语义 + 前端文案/提示调整 | ✅ v2.0.0 |
 | M8 | 「导出内容为空」不再冒充成功：`ExportOutcome::warnings` / `is_empty()` + `store_health()` 三态 + 弹窗显示数据目录与导出数量 | ✅ v2.0.0 |
-| M9 | **账号稳定身份（uid）+ 启动迁移 + 登录态自愈**：`credential_id_for` / `migrate_credential_ids` / `upsert_credential` 按身份匹配、`last_refresh_at_ms` 兜底主动续期、后台巡检、`wb_refresh_logins` / `wb_relogin`、GUI「全量刷新登录态」与每行「重新绑定」+「需重新绑定」标记 | ✅ v2.0.1 |
+| M9 | **账号稳定身份（uid）+ 启动迁移 + 登录态自愈**：`credential_id_for` / `migrate_credential_ids` / `upsert_credential` 按身份匹配、`last_refresh_at_ms` 兜底主动续期、后台巡检、`wb_relogin`、GUI 每行「重新绑定」+「需重新绑定」标记 | ✅ v2.0.1（按钮已在 2.0.3 移除）|
 
 实现中还补了几处规划未写明的细节：
 
@@ -441,6 +441,49 @@ pub fn write_bundle(path: &Path, text: &str) -> Result<()>;
 
 拆分过程中被编译器与 clippy 各拦下一次真实问题，值得记录：`blocking_save_file` 式的隐藏坑没有出现，但（a）`tests.rs` 起初仍包着 `mod tests { … }`，使它变成 `proxy::tests::tests`、`super::` 指向错层（44 个错误），（b）两个 `pub(crate)` 函数暴露了私有 `ApiFlavor`，clippy 直接拦下——后者正是"拆分时顺手放宽可见性"的典型代价，最终把这两个函数收窄为 `pub(super)`。
 
+---
 
+## 13. 2.0.3：删除「全量刷新登录态」按钮，改由徽章承担报告
 
+### 为什么它冗余
 
+2.0.1 加这个按钮时的理由是「401 后无从恢复」。但同期引入的自动路径已经把它的职责覆盖完了：
+
+| 场景 | 现在由谁处理 |
+|---|---|
+| 令牌到期前主动续期 | 后台巡检（每 5 分钟，`refresh_due_credentials`）|
+| 请求撞上 401 | 反应式刷新并重试同一凭据（`proxy.rs`）|
+| 需要人工重登 | 每行「重新绑定」|
+
+它只剩「**立即、对所有账号（含未到期的）**强制执行一次刷新」这一点自主行为，而未到期的账号本来就不该被刷——强制刷只是多花一次刷新往返。
+
+另有一个容易误解的点：按钮的 `reload_pool()` + 重启代理**并非必需**。`refresh_credential` 只写磁盘；运行中的池由请求路径自己 `pool.update_credential()` 更新，所以不点按钮也不会用到旧令牌。
+
+### 但删之前必须先补一个缺口
+
+徽章原本的判据是纯静态的：
+
+```rust
+let needs_relogin = c.enabled && c.refresh_token.is_none();
+```
+
+它只抓「没有 refreshToken」。而**有 refreshToken 但被接口拒绝（401/403）**——同样只能靠重登恢复——静态判据抓不到，只有真刷新一次才知道。而这项「试一次并报告」正是按钮的第二个作用；巡检虽然也能发现，但它写的 `last_error` **从未在界面上渲染**（`grep last_error ui/src/views/settings/*.js` 无结果），所以发现只进了日志。
+
+因此先补上判定与呈现，再删按钮：
+
+- **新增持久字段** `relogin_required_since_ms`：与 `last_error` 分开，因为一次网络抖动和一次 refresh token 被吊销都会写后者，只有前者不可自愈，且必须跨重启保留（否则徽章会忘掉一个已永久搁浅的账号，用户要等请求失败才知道）。刷新成功或重新登录时清除。
+- **判定收敛到一处** `refresh_failure_needs_relogin(cred, error)`：无 refreshToken、或错误含 401/403/refreshToken → 需要重登；连接失败/5xx/超时等可重试错误**不**标记（否则网络一抖全池亮灯，徽章就不再意味着什么）。
+- **反应式路径也落盘**：原先 `refresh_workbuddy_credential` 只 `pool.mark_refresh_failed`（内存，60 秒即过期、进程结束即丢），现在同时写持久判定。
+- **徽章 tooltip 说明原因**：区分「没有 refreshToken」与「刷新被拒」两种文案，并附上上游错误——把原先只存在于实时日志的信息放到行上。
+
+### 删除范围
+
+- 前端：工具栏按钮与其 41 行点击处理器；
+- 后端：`wb_refresh_logins` 命令（33 行，含 `reload_pool` + 重启代理）及其 handler 注册；
+- 库：`refresh_all_credentials`（唯一调用方即该命令）。
+
+`refresh_one_credential` / `refresh_candidates` 保留——巡检仍在用。
+
+### 验证
+
+除单测（判定矩阵：401/403/无 token 需重登，连接失败/500/坏 JSON 不需；以及判定落盘且只在恢复后清除）与 smoke（新增「有 refreshToken 但被拒」的 fixture，断言该行仍被标记且 tooltip 含原因）外，**用真实上游跑通了整条链路**：在隔离数据目录种入一个 `last_refresh_at_ms` 已过 6 小时兜底窗口、refreshToken 无效的账号，启动应用后巡检自动触发，上游返回真实的 `401 code 12153 refresh token failed`，判定随即落盘（`relogin_required_since_ms` 有值），且**进程退出后仍在**——正是徽章需要跨重启保留的那份数据。
