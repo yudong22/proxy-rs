@@ -257,6 +257,28 @@ pub fn write_bundle(path: &Path, text: &str) -> Result<()>;
 
 **为什么当时没有继续**：若不走服务端，客户端就必须自己持有 COS 的长期密钥才能"只输数字密码就恢复"，而这把密钥可以从 `.app` 里提取；即便用桶侧最小权限（只允许某个前缀）与生命周期规则兜底，也仍然是一个把凭据分发到每台机器的设计。既然你已经明确"不做服务端，以后再说"，这部分就只留决定、不写代码。
 
+### 6.6 账号稳定身份与登录态自愈（2.0.1）
+
+**背景**：`id` 原本是 `hash(access_token)`，而 `access_token` 每次刷新都会变。这个组合有两个后果，都在排查「导出的账号很少 / 401 后无从恢复」时被实测确认：
+
+1. **导入会打乱已在运行的账号**。`reconcile_ids` 强制 `id == hash(access_token)`，于是任何**刷新过一次**的账号都被判定为"不一致"并被改写 id；同时 `default_identity_id` 仍指向旧值，导入后默认身份被静默清空。（实测：账号 id 被改写 + `default_identity_id` 变为空串。）
+2. **重新登录会产生重复账号**。`upsert_credential` 按 id 匹配，而重新登录会算出新 id，于是同一账号变成两行、三行。
+
+**改动**：
+
+- **身份改为 `account.uid` + `enterpriseId`**（`identity_key` / `credential_id_for`）。enterpriseId 必须参与，否则同一 uid 的个人号与企业号会被合并。无 uid 时回退 token 哈希（保持对旧 fixture 兼容）。`parse_login_state`、OAuth 回写、导入三条路径统一走这个派生。
+- **启动时一次性迁移** `migrate_credential_ids()`：把存量 token 哈希 id 重新按 uid 计算，**并把 `default_identity_id` / `default_credential_id` 通过同一张改名表一起重映射**（而不是让它悬空），重复账号按最近使用合并。幂等。**用真实数据副本验证**：4 个账号全部重键、无重复、默认身份 `wb-4dcc79 → wb-9f667c` 正确跟随、token 未变、二次运行改动为 0。
+- **`upsert_credential` 按身份匹配**（`find_index`：先 id 后账号身份），命中时**保留磁盘上的 id**，这样日志、override 归属与默认身份都还能解析到它。
+- **`reconcile_ids` 不再改写 id**，改为按稳定身份重键**并重映射默认身份引用**；合并路径也改用 `find_index`，让"本机旧的 token 哈希条目"与"包里 uid 键条目"识别为同一账号。
+
+**主动续期**：真实登录态普遍**没有 `expiresAt`**，而 `needs_refresh` 对 `None` 一律返回 `false` —— 也就是说最需要续期的账号永远不会被提前续期，只能等 401 把用户请求打挂。新增 `last_refresh_at_ms` + `UNKNOWN_EXPIRY_REFRESH_AFTER_MS`（6 小时）兜底：只在"距上次续期已超过窗口"时才主动续期，**绝不覆盖已知的 `expiresAt`**，从未续期过的新导入账号也不触发（它刚由客户端签发）。每次成功刷新都会打时间戳，否则兜底永不前进。
+
+**后台巡检**：`scheduler::run_login_state_scanner` 每 5 分钟执行一次 `refresh_due_credentials`——只有真正到期的账号才会发起请求，空闲时零流量。与打卡调度同一模式（`async fn` 由 Tauri runtime spawn，因为 `.setup()` 闭包没有 Tokio reactor）。
+
+**GUI**：工具栏新增**「🔁 全量刷新登录态」**（`wb_refresh_logins`），失败时**点名**列出需重登的账号而不只是计数；无法自愈的账号（无 refreshToken）在行内标为琥珀色**「需重新绑定」**（独立 class，与状态 pill 区分开——"健不健康"和"要不要你动手"是两件事）；每行新增**「重新绑定」**按钮（`wb_relogin`），粘贴新登录态或用扫码覆盖该条记录并保留 label / 积分 / 启用状态 / 默认身份。
+
+**测试**：`needs_refresh` 兜底窗口（含"已知过期优先于兜底"）、`credential_id_for` 的 token 无关性与 enterpriseId 区分、`parse_login_state` 稳定 id、导入不改写已刷新账号且保留默认身份、合并识别旧 token 哈希条目；集成测试新增完整生命周期（登录 → 刷新换 token → 导出导入 → 重新登录）断言**始终只有一行且默认身份不变**。
+
 ---
 
 ## 7. 安全与风险
@@ -332,12 +354,12 @@ pub fn write_bundle(path: &Path, text: &str) -> Result<()>;
 
 ---
 
-## 11. 实现状态与取舍记录（2.0.0 落地后回填）
+## 11. 实现状态与取舍记录（2.0.0 / 2.0.1 落地后回填）
 
-规划在实现中被验证，也有三处明确的取舍，记在这里以免下一版重复讨论：
+规划在实现中被验证，也有几处明确的取舍，记在这里以免下一版重复讨论：
 
 1. **校验和不匹配只警告不拒绝**，但**内容会保留**。用户手工改过包是可能的（改 label、删一个账号）；直接拒绝会让文件不可用，而静默接受会隐藏"有人动过这个文件"这一事实——而后者恰恰是排查导入结果异常时最需要的信息。
-2. **id 与内容不一致时重算而非报错**（`credential_id(access_token)` / `api_key_id(key)`）。真正需要防的是"两个不同 token 塌缩到同一个 id 后其中一个消失"，重算 + 警告同时解决了可用性与正确性。
+2. **id 与内容不一致时重算而非报错**。真正需要防的是"两个不同 token 塌缩到同一个 id 后其中一个消失"，重算 + 警告同时解决了可用性与正确性。~~规则是 `credential_id(access_token)`~~ —— **这条规则本身在 2.0.1 被推翻**：token 每次刷新都会变，用它的哈希当身份会让已刷新的账号"对不上自己"，进而造成重复账号与默认身份丢失。现改为按 `account.uid` 派生，详见 6.6 节。
 3. **初版不引入 `tauri-plugin-dialog`**（导出目录固定、只能改名）。这一点已在 6.3 节被推翻：导出改用原生「另存为」面板，**仅 Rust 使用、不授予前端 `dialog:` 权限、不使用会 panic 的 `blocking_save_file`**。原判断只看到了"省一个插件"的收益，低估了固定目录在新机器上的不便。
 4. **云端同步（COS + 数字密码）搁置**，理由与已确认的后续决定见 6.4 节：没有服务端就无法做到"只输数字密码"而不把长期密钥分发到每台机器。
 
@@ -345,14 +367,16 @@ pub fn write_bundle(path: &Path, text: &str) -> Result<()>;
 
 | 阶段 | 交付物 | 状态 |
 |---|---|---|
-| M1–M3 | `src/pool_transfer.rs`（格式、归一化、checksum、Argon2id + AES-256-GCM、预览/合并/替换、备份原子写入）；17 个单测 | ✅ |
-| M3 | `tests/pool_transfer_roundtrip.rs`：明文与加密两条路径都断言"新机器上 `active_api_key` / `effective_default_identity` / `ordered_credentials` 回到导出前" | ✅ |
-| M4 | `pool_export` / `pool_import_preview` / `pool_import` / `reveal_path`；导入后 `reload_pool()` + 运行中则重启代理（无需重启应用） | ✅ |
-| M5 | `ui/src/views/settings/pool-transfer.js` + 工具栏两个按钮 + `.wb-transfer-*` 样式（写入既有 `workbuddy.css`）+ `index.js` 装配 | ✅ |
-| M6 | `smoke.mjs` 三个桩与 8 条断言（导出取消/成功文案、口令透传、预览计数与警告、确认导入触发 `pool_import` 并重绘身份池、弹窗关闭）；README 能力表；版本号 1.9.13 → 2.0.0 | ✅ |
-| M7 | （2.0.0 增补）导出改用原生「另存为」面板：`tauri-plugin-dialog` + 回调式 `save_file` + 取消语义 + 前端文案/提示调整 | ✅ |
+| M1–M3 | `src/pool_transfer.rs`（格式、归一化、checksum、Argon2id + AES-256-GCM、预览/合并/替换、备份原子写入） | ✅ v2.0.0 |
+| M3 | `tests/pool_transfer_roundtrip.rs`：明文与加密两条路径都断言"新机器上 `active_api_key` / `effective_default_identity` / `ordered_credentials` 回到导出前" | ✅ v2.0.0 |
+| M4 | `pool_export` / `pool_import_preview` / `pool_import` / `reveal_path`；导入后 `reload_pool()` + 运行中则重启代理（无需重启应用） | ✅ v2.0.0 |
+| M5 | `ui/src/views/settings/pool-transfer.js` + 工具栏两个按钮 + `.wb-transfer-*` 样式（写入既有 `workbuddy.css`）+ `index.js` 装配 | ✅ v2.0.0 |
+| M6 | `smoke.mjs` 传输断言、README 能力表、版本号 1.9.13 → 2.0.0 | ✅ v2.0.0 |
+| M7 | 导出改用原生「另存为」面板：`tauri-plugin-dialog` + 回调式 `save_file` + 取消语义 + 前端文案/提示调整 | ✅ v2.0.0 |
+| M8 | 「导出内容为空」不再冒充成功：`ExportOutcome::warnings` / `is_empty()` + `store_health()` 三态 + 弹窗显示数据目录与导出数量 | ✅ v2.0.0 |
+| M9 | **账号稳定身份（uid）+ 启动迁移 + 登录态自愈**：`credential_id_for` / `migrate_credential_ids` / `upsert_credential` 按身份匹配、`last_refresh_at_ms` 兜底主动续期、后台巡检、`wb_refresh_logins` / `wb_relogin`、GUI「全量刷新登录态」与每行「重新绑定」+「需重新绑定」标记 | ✅ v2.0.1 |
 
-实现中还补了四处规划未写明的细节：
+实现中还补了几处规划未写明的细节：
 
 - **`settings::data_dir_test_lock()` 改为跨模块共享**：该锁原先藏在 `settings` 的 `mod tests` 里，而 `pool_transfer` / 集成测试同样要重定位 `PROXY_DATA_DIR`。三个模块各持一把私有锁等于没锁，测试会随机互相污染，因此提升为 `#[cfg(test)] pub(crate)`。
 - **`pool_export` / `pool_import` / `pool_import_preview` 走 `spawn_blocking`**：整包读取、Argon2id 派生（约 19 MiB / 2 轮）、三文件写入，以及 6.3 节起新增的保存面板（等待用户）都是阻塞操作，直接在 async 命令里跑会占住 webview 其他命令共享的工作线程——这与仓库既有的 `get_stats` / `get_request_logs` 约定一致。
@@ -361,7 +385,9 @@ pub fn write_bundle(path: &Path, text: &str) -> Result<()>;
 
 ### 验收状态
 
-第 10 节清单里，**已由自动化覆盖**的是：0600 权限、归一化、错口令不写盘、加密包无明文、备份文件生成、悬空默认身份、id 重算、畸形/超大输入、`PROXY_DATA_DIR` 隔离，以及「新机器上确实可用」——这些分别落在 `src/pool_transfer.rs` 的 17 个单测、`tests/pool_transfer_roundtrip.rs` 的 2 个集成测试和 `ui/tools/smoke.mjs` 的传输断言里（含取消导出不是错误、按钮可重试）。
+第 10 节清单里，**已由自动化覆盖**的是：0600 权限、归一化、错口令不写盘、加密包无明文、备份文件生成、悬空默认身份、畸形/超大输入、`PROXY_DATA_DIR` 隔离、「新机器上确实可用」，以及 2.0.1 的**身份稳定性**（token 轮换不改 id、重新登录不新增重复、导入不改写已刷新账号且保留默认身份、兜底续期窗口）——这些落在 `src/pool_transfer.rs` 的 22 个单测、`src/workbuddy_auth.rs` 的若干单测、`tests/pool_transfer_roundtrip.rs` 的 3 个集成测试（含完整生命周期：登录 → 刷新换 token → 导出导入 → 重新登录）和 `ui/tools/smoke.mjs` 的传输/登录态恢复断言里。
+
+2.0.1 的迁移逻辑额外用**真实数据的副本**在隔离目录跑过一遍：4 个账号全部重键、无重复、`default_identity_id` 正确跟随、token 未变、二次运行改动为 0。
 
 **仍需人工验收**的是与真实面板/真实上游相关的四条：
 

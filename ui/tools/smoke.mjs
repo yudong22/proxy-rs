@@ -87,11 +87,21 @@ const MOCK = {
   get_logs: { entries: [] },
   wb_credentials_list: {
     credentials: [
-      { id: 'cred-1', label: '测试账号一', nickname: '甲', state: 'ok', enabled: true, points: 1234.5, sticky_sessions: 2, checked_in_today: true, masked_token: 'sk-***1' },
-      { id: 'cred-2', label: '测试账号二', nickname: '乙', state: 'cooldown', enabled: true, points: null, sticky_sessions: 0, checked_in_today: false, masked_token: 'sk-***2' },
+      { id: 'cred-1', label: '测试账号一', nickname: '甲', state: 'ok', enabled: true, points: 1234.5, sticky_sessions: 2, checked_in_today: true, masked_token: 'sk-***1', has_refresh_token: true, needs_relogin: false },
+      { id: 'cred-2', label: '测试账号二', nickname: '乙', state: 'cooldown', enabled: true, points: null, sticky_sessions: 0, checked_in_today: false, masked_token: 'sk-***2', has_refresh_token: true, needs_relogin: false },
+      { id: 'cred-3', label: '需重登账号', nickname: '丙', state: 'expired', enabled: true, points: null, sticky_sessions: 0, checked_in_today: false, masked_token: 'sk-***3', has_refresh_token: false, needs_relogin: true },
     ],
     default_identity_id: 'cred-1',
   },
+  wb_refresh_logins: {
+    total: 3, refreshed: 2, failed: 1, needs_relogin: 1,
+    details: [
+      { id: 'cred-1', label: '测试账号一', refreshed: true, error: '', needs_relogin: false },
+      { id: 'cred-2', label: '测试账号二', refreshed: true, error: '', needs_relogin: false },
+      { id: 'cred-3', label: '需重登账号', refreshed: false, error: '凭据没有 refreshToken，无法刷新', needs_relogin: true },
+    ],
+  },
+  wb_relogin: { id: 'cred-3', label: '需重登账号', enabled: true, masked_token: 'sk-***3' },
   api_keys_list: {
     keys: [{ id: 'key-1', label: '备用密钥', enabled: true, points: 88, masked: 'sk-***k' }],
     default_identity_id: 'cred-1',
@@ -126,7 +136,7 @@ const MOCK = {
 
 /** What the UI must produce. Values captured from the pre-split build. */
 const EXPECTED = {
-  counts: { credentialRows: 3, providerOptions: 3, speedRows: 8 },
+  counts: { credentialRows: 4, providerOptions: 3, speedRows: 8 },
   // 7 metric rows + the 会话 header row.
   speedMetrics: {
     '请求次数': '7',
@@ -150,9 +160,9 @@ const EXPECTED = {
     statusText: '运行中 · 端口 3456',
     appVersion: 'v9.9.9',
   },
-  rowLabels: ['测试账号一', '测试账号二', '备用密钥'],
-  rowStates: ['正常', '冷却中', '已启用'],
-  defaultRowFlags: [true, false, false],
+  rowLabels: ['测试账号一', '测试账号二', '需重登账号', '备用密钥'],
+  rowStates: ['正常', '冷却中', '已过期', '已启用'],
+  defaultRowFlags: [true, false, false, false],
   selectValue: 'cred-1',
   // The DSH group renders its live state on load, from get_dsh_config.
   dshButtonPresent: true,
@@ -166,7 +176,10 @@ const EXPECTED = {
   // so "empty export" is diagnosable from the dialog itself (mock get_status
   // plus the two pool list commands: 2 credentials + 1 key).
   exportSourceShown: '/Users/test/.proxy-rs',
-  exportCountsShown: '账号 2 个、密钥 1 个',
+  exportCountsShown: '账号 3 个、密钥 1 个',
+  // Batch refresh must name the accounts needing a re-bind, not just count them:
+  // a fresh login is a manual step, so the user has to know which row to act on.
+  refreshStatusContains: ['成功 2 个', '失败 1 个', '个需要重新绑定', '需重登账号'],
   // Dismissing the native save panel is a no-op, not a failure: the message says
   // so, carries no error tone, and the 导出 button is usable again.
   exportCancelled: {
@@ -544,12 +557,70 @@ try {
   check('import repaints the pool', tr.poolRepainted, true);
   check('import closes the dialog', tr.modalClosed, true);
 
+  // Cross-module integration 4: login-state recovery (relogin / refresh logins).
+  // The account with no refresh token must be visibly marked, batch refresh must
+  // name the account that needs a re-bind rather than only counting it, and the
+  // re-bind dialog must submit to `wb_relogin` and repaint the pool.
+  await send('Runtime.evaluate', { expression: `(() => {
+    window.__CALLS__ = [];
+    const ov = document.querySelector('#request-modal-overlay');
+    ov?.classList.remove('active');
+    document.querySelector('#btn-wb-refresh-logins').click();
+  })()` });
+  await new Promise((r) => setTimeout(r, 400));
+
+  const recovery = await send('Runtime.evaluate', {
+    returnByValue: true,
+    awaitPromise: true,
+    expression: `(async () => {
+      const t = (s) => (document.querySelector(s)?.textContent || '').replace(/\\s+/g, ' ').trim();
+      const refreshStatus = t('#wb-status');
+      const row = [...document.querySelectorAll('#wb-identity-list .wb-credential-row')]
+        .find((r) => r.textContent.includes('需重登账号'));
+      const badge = row?.querySelector('.wb-relogin-pill')?.textContent?.trim() || '';
+
+      const before = window.__CALLS__.length;
+      // The button on *that* row, not the first one in the list.
+      row.querySelector('[data-relogin]').click();
+      const dialogOpen = document.querySelector('#request-modal-overlay')?.classList.contains('active');
+      const targetShown = t('#modal-req-body .mono');
+      document.querySelector('#wb-relogin-text').value = '{"accessToken":"fresh-token"}';
+      document.querySelector('#btn-wb-relogin-run').click();
+      await new Promise((r) => setTimeout(r, 400));
+      return {
+        refreshStatus,
+        reloginBadge: badge,
+        dialogOpen,
+        targetShown,
+        refreshCalled: window.__CALLS__.includes('wb_refresh_logins'),
+        reloginCalled: window.__CALLS__.includes('wb_relogin'),
+        reloginBody: window.__INVOKE_ARGS__?.wb_relogin?.body?.id,
+        poolRepainted: window.__CALLS__.slice(before).includes('wb_credentials_list'),
+        dialogClosed: !document.querySelector('#request-modal-overlay')?.classList.contains('active'),
+      };
+    })()`,
+  });
+  const rc = recovery.result.value;
+  check('batch refresh called', rc.refreshCalled, true);
+  check('needs-relogin account is marked', rc.reloginBadge, '需重新绑定');
+  check('relogin dialog opens', rc.dialogOpen, true);
+  check('relogin dialog names its target', rc.targetShown, 'cred-3');
+  check('relogin called', rc.reloginCalled, true);
+  check('relogin targets the row it was opened from', rc.reloginBody, 'cred-3');
+  check('relogin repaints the pool', rc.poolRepainted, true);
+  check('relogin closes the dialog', rc.dialogClosed, true);
+  for (const needle of EXPECTED.refreshStatusContains) {
+    if (!rc.refreshStatus.includes(needle)) {
+      failures.push(`batch refresh status is missing ${JSON.stringify(needle)}\n      actual: ${rc.refreshStatus}`);
+    }
+  }
+
   if (runtimeErrors.length) {
     failures.push(`runtime console errors:\n      ${runtimeErrors.join('\n      ')}`);
   }
 
   console.log(`boot assertions: counts, text, credential rows, default identity`);
-  console.log(`integration: palette dynamic import + OAuth repaint + pool import/export`);
+  console.log(`integration: palette + OAuth repaint + pool import/export + login recovery`);
   console.log(`mock commands exercised: ${i.called.length}`);
   if (failures.length === 0) {
     console.log('\nall assertions passed');

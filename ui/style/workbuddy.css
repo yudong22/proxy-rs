@@ -446,6 +446,17 @@
   color: var(--error);
 }
 
+/* "This account needs you": no refresh token, so nothing can renew it and only a
+   fresh login helps. Its own class rather than the state pill's, because a row
+   already shows health and the two facts must stay distinguishable — an account
+   can look healthy and still be one refresh away from being stranded. Amber, not
+   red: it is a to-do, not a failure. */
+.wb-relogin-pill {
+  background: var(--warning-tint);
+  border: 1px solid var(--warning-tint-border);
+  color: var(--warning-ink);
+}
+
 /* ── Account-pool import / export ───────────────────────────────── */
 
 /* The standing risk note under the pool toolbar. Sits in the same visual

@@ -157,6 +157,10 @@ export function renderSettings() {
       <button type="button" class="btn btn-small" id="btn-wb-refresh-points">
         💎 刷新积分
       </button>
+      <button type="button" class="btn btn-small" id="btn-wb-refresh-logins"
+        title="立即续期所有账号的登录态；无法自动续期的账号会在列表中标为「需重新绑定」">
+        🔁 全量刷新登录态
+      </button>
       <button type="button" class="btn btn-small" id="btn-wb-sticky-reset">
         重置会话粘滞
       </button>

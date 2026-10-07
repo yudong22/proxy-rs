@@ -68,6 +68,15 @@ pub struct WorkBuddyCredential {
     /// once-a-day guard.
     #[serde(default)]
     pub last_checkin_date: Option<String>,
+    /// When this credential's access token was last renewed, epoch millis.
+    ///
+    /// Needed because most imported login states carry **no `expiresAt`**: the
+    /// desktop file often omits it, so [`Self::needs_refresh`] has nothing to
+    /// compare against and proactive renewal can never fire for exactly the
+    /// accounts that need it most. This is the timestamp the conservative
+    /// [`UNKNOWN_EXPIRY_REFRESH_AFTER_MS`] backstop measures from.
+    #[serde(default)]
+    pub last_refresh_at_ms: Option<i64>,
 }
 
 /// Persisted pool-wide preferences: which credential is the default and the
@@ -286,25 +295,52 @@ pub struct WorkBuddyAccount {
     pub nickname: String,
 }
 
+/// How long an access token with **unknown** expiry is trusted before the
+/// proactive path renews it anyway.
+///
+/// Chosen from the observed shape of real logins rather than from the vendor's
+/// documented lifetime: WorkBuddy login states are issued for hours, not
+/// minutes, so six hours is comfortably inside a token's life and still makes a
+/// long-running app renew well before it would otherwise eat a 401. Raising this
+/// reduces refresh traffic at the cost of a later first-401; lowering it does the
+/// reverse. It never overrides a *known* `expiresAt`.
+pub const UNKNOWN_EXPIRY_REFRESH_AFTER_MS: i64 = 6 * 60 * 60 * 1000;
+
 impl WorkBuddyCredential {
     /// Whether the credential is in a rate-limit cooldown right now.
     pub fn is_cooling_down(&self, now_ms: i64) -> bool {
         matches!(self.cooldown_until_ms, Some(until) if now_ms < until)
     }
 
-    /// Whether the access token has expired (or is within the renewal margin)
-    /// and a refresh token is available to renew it.
+    /// Whether the access token should be renewed *before* spending a request on
+    /// it.
     ///
-    /// A token with an *unknown* expiry is never refreshed proactively — only a
-    /// reactive 401 can justify that — because guessing here would burn a
-    /// refresh round-trip on every healthy request.
+    /// Two independent triggers:
+    ///
+    /// 1. **Known expiry** — within the 60 s renewal margin, matching the
+    ///    reference client's threshold. Exact, so it costs nothing extra.
+    /// 2. **Unknown expiry backstop** — most imported login states carry no
+    ///    `expiresAt` at all, and a token whose expiry we cannot see is not a
+    ///    token that never expires. Without this branch those accounts could only
+    ///    ever be renewed *after* a 401 had already failed a user request.
+    ///    [`UNKNOWN_EXPIRY_REFRESH_AFTER_MS`] is deliberately conservative (only
+    ///    once the last renewal is old enough that the token is very likely
+    ///    stale), because guessing too eagerly would spend a refresh round-trip
+    ///    per request.
+    ///
+    /// A credential that has never been refreshed and has no known expiry is
+    /// *not* refreshed here: nothing says a freshly imported token is stale, and
+    /// the reactive 401 path already covers it.
     pub fn needs_refresh(&self, now_ms: i64) -> bool {
         if !self.enabled || self.refresh_token.is_none() {
             return false;
         }
         match self.expires_at_ms {
             Some(exp) => now_ms >= exp - 60_000,
-            None => false,
+            None => match self.last_refresh_at_ms {
+                Some(last) => now_ms.saturating_sub(last) >= UNKNOWN_EXPIRY_REFRESH_AFTER_MS,
+                None => false,
+            },
         }
     }
 
@@ -358,14 +394,61 @@ fn mask_secret(secret: &str) -> String {
 
 /// Derive a stable short credential id from the token material.
 ///
+/// **Superseded by [`credential_id_for`]** and kept only as the fallback for a
+/// login state that carries no account identity (see below). Prefer
+/// [`identity_key`] for anything that must survive a token refresh.
+///
 /// The desktop token is opaque, so the id is a content hash: the same login
 /// state imported twice collapses to one id, and the id stays stable across
 /// restarts without a counter file. Six hex characters is enough to avoid
 /// collisions at any realistic pool size and short enough for log lines.
+///
+/// The flaw this cannot avoid: the *token* rotates on every refresh, so a hash
+/// of it is not a stable identity. A credential that has been refreshed once no
+/// longer hashes to its stored id, which is why re-logging in the same account
+/// used to add a second row instead of replacing the first.
 pub fn credential_id(access_token: &str) -> String {
+    short_id("wb", access_token.as_bytes())
+}
+
+/// The stable identity of an account: `uid` + `enterpriseId`.
+///
+/// This — not the access token — is what identifies a WorkBuddy account across
+/// its lifetime. A token refresh rotates `accessToken` but leaves the account
+/// untouched, so an id derived from this pair survives every renewal and makes
+/// re-login an *update* of the existing entry rather than a new one.
+///
+/// `enterpriseId` is part of the key because the same `uid` can exist in
+/// different enterprises (a personal and a company login), and collapsing those
+/// onto one id would silently merge two accounts.
+///
+/// Returns `None` for a login state with no `uid` — some imported fixtures carry
+/// none — and the caller falls back to the token hash.
+pub fn identity_key(account: &WorkBuddyAccount) -> Option<String> {
+    let uid = account.uid.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    let enterprise = account.enterprise_id.trim();
+    Some(format!("{uid}\u{1f}{enterprise}"))
+}
+
+/// The id for a login state, preferring the stable account identity and falling
+/// back to the token hash only when the account carries no `uid`.
+pub fn credential_id_for(account: &WorkBuddyAccount, access_token: &str) -> String {
+    match identity_key(account) {
+        Some(key) => short_id("wb", key.as_bytes()),
+        None => credential_id(access_token),
+    }
+}
+
+/// `prefix-<6 hex>` over arbitrary bytes, the one place the id shape is defined.
+fn short_id(prefix: &str, material: &[u8]) -> String {
     use std::fmt::Write;
-    let digest = md5_hex(access_token.as_bytes());
-    let mut out = String::from("wb-");
+    let digest = md5_hex(material);
+    let mut out = String::with_capacity(prefix.len() + 7);
+    out.push_str(prefix);
+    out.push('-');
     for byte in &digest[..3] {
         let _ = write!(out, "{byte:02x}");
     }
@@ -564,7 +647,7 @@ pub fn parse_login_state(raw: &str) -> Result<WorkBuddyCredential> {
         .to_string();
 
     Ok(WorkBuddyCredential {
-        id: credential_id(access),
+        id: credential_id_for(&account, access),
         label: account.nickname.clone(),
         access_token: access.to_string(),
         refresh_token: auth
@@ -587,6 +670,9 @@ pub fn parse_login_state(raw: &str) -> Result<WorkBuddyCredential> {
         points: None,
         points_fetched_at_ms: None,
         last_checkin_date: None,
+        // A freshly imported token has just been minted by the client, so the
+        // unknown-expiry backstop starts counting now rather than from zero.
+        last_refresh_at_ms: Some(crate::util::unix_millis()),
     })
 }
 
@@ -981,17 +1067,143 @@ pub fn save_credentials(items: &[WorkBuddyCredential]) -> Result<()> {
     Ok(())
 }
 
-/// Upsert one credential (matched by [`WorkBuddyCredential::id`]).
+/// True when two credentials describe the same account.
+///
+/// The id is the primary key, but it is not sufficient on its own: an entry
+/// stored before the stable-identity change carries a token-hash id, and a
+/// freshly parsed login state for that same account now derives an id from
+/// `uid`. Matching on the account identity as well is what makes re-login an
+/// update of the old row instead of a second row beside it.
+///
+/// `pub(crate)` because the import path needs the same notion of "same account"
+/// when folding a bundle into the local store.
+pub(crate) fn same_account(a: &WorkBuddyCredential, b: &WorkBuddyCredential) -> bool {
+    if a.id == b.id {
+        return true;
+    }
+    match (identity_key(&a.account), identity_key(&b.account)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Find the index of the entry for an account, by id then by account identity.
+pub(crate) fn find_index(
+    items: &[WorkBuddyCredential],
+    item: &WorkBuddyCredential,
+) -> Option<usize> {
+    if let Some(i) = items.iter().position(|c| c.id == item.id) {
+        return Some(i);
+    }
+    items.iter().position(|c| same_account(c, item))
+}
+
+/// Upsert one credential, matched by id and then by account identity.
+///
+/// Replacing an entry found by identity keeps its id: the id is what request
+/// logs, override attribution and the configured default already refer to, so
+/// re-pointing it at a new value would strand all three (see
+/// [`reconcile_ids_after_import`], which exists for the same reason).
 pub fn upsert_credential(item: WorkBuddyCredential) -> Result<WorkBuddyCredential> {
     let mut items = load_credentials();
-    let id = item.id.clone();
-    if let Some(slot) = items.iter_mut().find(|c| c.id == id) {
-        *slot = item.clone();
-    } else {
-        items.push(item.clone());
+    match find_index(&items, &item) {
+        Some(i) => {
+            let mut merged = item;
+            // The stored id wins, so a stale pointer keeps resolving.
+            merged.id = items[i].id.clone();
+            items[i] = merged.clone();
+            save_credentials(&items)?;
+            Ok(merged)
+        }
+        None => {
+            items.push(item.clone());
+            save_credentials(&items)?;
+            Ok(item)
+        }
     }
-    save_credentials(&items)?;
-    Ok(item)
+}
+
+/// Re-key every stored credential to the stable identity, once.
+///
+/// Ids created before the stable-identity change are token hashes. Any account
+/// that has since been refreshed no longer matches its own id, so re-login would
+/// duplicate it and an imported bundle would rewrite it (see
+/// [`crate::pool_transfer`]). Re-keying to `uid`-based ids fixes that going
+/// forward, and this pass migrates what is already on disk.
+///
+/// It also rewrites any reference to a changed id, so the configured default
+/// identity keeps naming the same account instead of being cleared.
+///
+/// Returns the number of credentials re-keyed. Idempotent: a second call finds
+/// nothing to change. Entries without a `uid` are left alone.
+pub fn migrate_credential_ids() -> Result<usize> {
+    let mut items = load_credentials();
+    if items.is_empty() {
+        return Ok(0);
+    }
+
+    // Collect the id renames first, so every reference can be rewritten from one
+    // consistent map rather than from the partially-mutated vec.
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for c in items.iter() {
+        let stable = credential_id_for(&c.account, &c.access_token);
+        if stable != c.id {
+            renames.push((c.id.clone(), stable));
+        }
+    }
+    if renames.is_empty() {
+        return Ok(0);
+    }
+
+    for (old, new) in &renames {
+        for c in items.iter_mut() {
+            if c.id == *old {
+                c.id = new.clone();
+            }
+        }
+    }
+
+    // Two entries can collapse onto one stable id when the same account was
+    // imported twice under different tokens (exactly the duplicate this change
+    // prevents). Keep the most recently used one.
+    let mut seen: Vec<WorkBuddyCredential> = Vec::with_capacity(items.len());
+    for c in items.into_iter() {
+        match seen.iter().position(|e| e.id == c.id) {
+            Some(i) => {
+                if c.last_checkin_date > seen[i].last_checkin_date
+                    || (c.last_checkin_date == seen[i].last_checkin_date
+                        && c.points_fetched_at_ms > seen[i].points_fetched_at_ms)
+                {
+                    seen[i] = c;
+                }
+            }
+            None => seen.push(c),
+        }
+    }
+
+    save_credentials(&seen)?;
+
+    let mut prefs = load_preferences();
+    let mut prefs_changed = false;
+    if let Some((_, new)) = renames
+        .iter()
+        .find(|(old, _)| *old == prefs.default_identity_id)
+    {
+        prefs.default_identity_id = new.clone();
+        prefs_changed = true;
+    }
+    if let Some((_, new)) = renames
+        .iter()
+        .find(|(old, _)| *old == prefs.default_credential_id)
+    {
+        prefs.default_credential_id = new.clone();
+        prefs_changed = true;
+    }
+    if prefs_changed {
+        save_preferences(&prefs)?;
+    }
+
+    Ok(renames.len())
 }
 
 /// The default WorkBuddy auth endpoint prefix (`/v2/plugin` on the domestic
@@ -1075,6 +1287,10 @@ pub async fn refresh_credential(
         credential.domain = domain.to_string();
     }
     credential.last_error.clear();
+    // Stamp the renewal: this is what the unknown-expiry backstop measures from,
+    // so a credential whose token has no `expiresAt` still gets renewed again
+    // later instead of looking permanently fresh.
+    credential.last_refresh_at_ms = Some(crate::util::unix_millis());
     upsert_credential(credential.clone())?;
     Ok(())
 }
@@ -1321,7 +1537,7 @@ pub async fn poll_oauth_token(
     };
 
     let cred = WorkBuddyCredential {
-        id: credential_id(&access_token),
+        id: credential_id_for(&account, &access_token),
         label,
         access_token,
         refresh_token,
@@ -1335,6 +1551,9 @@ pub async fn poll_oauth_token(
         points: None,
         points_fetched_at_ms: None,
         last_checkin_date: None,
+        // Just minted by the OAuth flow, so the unknown-expiry backstop starts
+        // counting from now.
+        last_refresh_at_ms: Some(crate::util::unix_millis()),
     };
 
     upsert_credential(cred.clone())?;
@@ -1589,6 +1808,162 @@ pub struct PointsResult {
     pub label: String,
     /// `None` when the upstream could not be read.
     pub points: Option<f64>,
+}
+
+/// One account's token refresh attempt, as reported to the GUI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshResult {
+    pub id: String,
+    pub label: String,
+    /// True when the access token was renewed and written back.
+    pub refreshed: bool,
+    /// Why it failed, when it did. Empty on success.
+    #[serde(default)]
+    pub error: String,
+    /// True when the account cannot self-heal and needs a fresh login: no
+    /// refresh token at all, or the refresh endpoint rejected it.
+    ///
+    /// This is what drives the GUI's "需要重新绑定" marker, so the user is told
+    /// *which* account to re-scan instead of being left to guess.
+    #[serde(default)]
+    pub needs_relogin: bool,
+}
+
+/// Result of a pool-wide login-state refresh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshReport {
+    pub total: usize,
+    pub refreshed: usize,
+    pub failed: usize,
+    /// Accounts that need the user to log in again.
+    pub needs_relogin: usize,
+    pub details: Vec<RefreshResult>,
+}
+
+/// Renew every enabled account's access token, once.
+///
+/// The GUI's 全量刷新登录态 button, and what the background scanner calls when it
+/// finds credentials due for renewal. Sequential on purpose: a handful of
+/// accounts, and hammering the refresh endpoint in parallel is exactly the
+/// pattern that gets a session flagged.
+///
+/// A failure never aborts the run — each account is independent, and one dead
+/// refresh token must not stop the others from being renewed.
+pub async fn refresh_all_credentials(client: &reqwest::Client) -> RefreshReport {
+    let items = load_credentials();
+    let mut details = Vec::new();
+
+    for cred in items.iter().filter(|c| c.enabled) {
+        let endpoint = auth_endpoint_for(cred);
+        let mut fresh = cred.clone();
+        let result = match refresh_credential(client, &endpoint, &mut fresh).await {
+            Ok(()) => RefreshResult {
+                id: fresh.id.clone(),
+                label: display_label(&fresh),
+                refreshed: true,
+                error: String::new(),
+                needs_relogin: false,
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                // A missing refresh token, or the endpoint refusing ours, are
+                // both "only a new login fixes this". Anything else (network
+                // blip, 5xx) is retryable and must not be labelled relogin.
+                let needs_relogin = cred.refresh_token.is_none()
+                    || msg.contains("refreshToken")
+                    || msg.contains("401")
+                    || msg.contains("403");
+                // Persist the reason so the list can show it without re-probing.
+                let mut marked = cred.clone();
+                marked.last_error = msg.clone();
+                let _ = upsert_credential(marked);
+                RefreshResult {
+                    id: cred.id.clone(),
+                    label: display_label(cred),
+                    refreshed: false,
+                    error: msg,
+                    needs_relogin,
+                }
+            }
+        };
+        details.push(result);
+    }
+
+    let refreshed = details.iter().filter(|d| d.refreshed).count();
+    let needs_relogin = details.iter().filter(|d| d.needs_relogin).count();
+    RefreshReport {
+        total: details.len(),
+        refreshed,
+        failed: details.len() - refreshed,
+        needs_relogin,
+        details,
+    }
+}
+
+/// Renew only the accounts whose token is due, and report what happened.
+///
+/// Used by the background scanner. Returns an empty report when nothing needed
+/// attention, so an idle app performs no requests at all.
+pub async fn refresh_due_credentials(client: &reqwest::Client) -> RefreshReport {
+    let now = crate::util::unix_millis();
+    let items = load_credentials();
+    let due: Vec<WorkBuddyCredential> = items
+        .into_iter()
+        .filter(|c| c.enabled && c.needs_refresh(now))
+        .collect();
+
+    if due.is_empty() {
+        return RefreshReport {
+            total: 0,
+            refreshed: 0,
+            failed: 0,
+            needs_relogin: 0,
+            details: Vec::new(),
+        };
+    }
+
+    let mut details = Vec::new();
+    for cred in &due {
+        let endpoint = auth_endpoint_for(cred);
+        let mut fresh = cred.clone();
+        let result = match refresh_credential(client, &endpoint, &mut fresh).await {
+            Ok(()) => RefreshResult {
+                id: fresh.id.clone(),
+                label: display_label(&fresh),
+                refreshed: true,
+                error: String::new(),
+                needs_relogin: false,
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                let needs_relogin = cred.refresh_token.is_none()
+                    || msg.contains("refreshToken")
+                    || msg.contains("401")
+                    || msg.contains("403");
+                let mut marked = cred.clone();
+                marked.last_error = msg.clone();
+                let _ = upsert_credential(marked);
+                RefreshResult {
+                    id: cred.id.clone(),
+                    label: display_label(cred),
+                    refreshed: false,
+                    error: msg,
+                    needs_relogin,
+                }
+            }
+        };
+        details.push(result);
+    }
+
+    let refreshed = details.iter().filter(|d| d.refreshed).count();
+    let needs_relogin = details.iter().filter(|d| d.needs_relogin).count();
+    RefreshReport {
+        total: details.len(),
+        refreshed,
+        failed: details.len() - refreshed,
+        needs_relogin,
+        details,
+    }
 }
 
 /// Result of a pool-wide points refresh.
@@ -2204,6 +2579,109 @@ mod tests {
         c.refresh_token = Some("r".to_string());
         c.enabled = false;
         assert!(!c.needs_refresh(1_000_000));
+    }
+
+    /// The backstop that makes an imported login state *ever* renew itself.
+    ///
+    /// Real WorkBuddy login states routinely carry no `expiresAt`, and
+    /// `needs_refresh` used to answer "never" for exactly those — leaving the
+    /// reactive 401 path as the only way to renew, i.e. the user's request had
+    /// to fail first. These assertions pin the behaviour that fixes it.
+    #[test]
+    fn unknown_expiry_is_renewed_after_the_backstop_window() {
+        let mut c = WorkBuddyCredential {
+            access_token: "tok".to_string(),
+            refresh_token: Some("ref".to_string()),
+            enabled: true,
+            ..Default::default()
+        };
+
+        // Never refreshed and no known expiry: nothing says the freshly imported
+        // token is stale, so stay quiet and let the reactive path handle it.
+        c.last_refresh_at_ms = None;
+        c.expires_at_ms = None;
+        assert!(!c.needs_refresh(9_999_999_999));
+
+        // Refreshed recently: still fresh, no need to spend a round-trip.
+        c.last_refresh_at_ms = Some(1_000_000);
+        assert!(!c.needs_refresh(1_000_000));
+        assert!(!c.needs_refresh(1_000_000 + UNKNOWN_EXPIRY_REFRESH_AFTER_MS - 1));
+
+        // Past the window: renew proactively rather than wait for a 401.
+        assert!(c.needs_refresh(1_000_000 + UNKNOWN_EXPIRY_REFRESH_AFTER_MS));
+
+        // A known expiry always wins over the backstop, in both directions.
+        c.expires_at_ms = Some(1_000_000 + UNKNOWN_EXPIRY_REFRESH_AFTER_MS + 10_000_000);
+        assert!(
+            !c.needs_refresh(1_000_000 + UNKNOWN_EXPIRY_REFRESH_AFTER_MS),
+            "a known-fresh expiry must not be overridden by the backstop"
+        );
+    }
+
+    /// Identity is the account, not the token.
+    #[test]
+    fn id_is_derived_from_the_account_not_the_token() {
+        let account = WorkBuddyAccount {
+            uid: "uid-1".to_string(),
+            enterprise_id: "ent-1".to_string(),
+            nickname: "甲".to_string(),
+        };
+
+        // The same account with a rotated token keeps its id — this is what makes
+        // a refresh (and a re-login) an update instead of a duplicate row.
+        let before = credential_id_for(&account, "token-before-refresh");
+        let after = credential_id_for(&account, "token-after-refresh");
+        assert_eq!(before, after);
+        assert_ne!(before, credential_id("token-before-refresh"));
+
+        // A different account is a different id, and the same uid in another
+        // enterprise is deliberately *not* collapsed onto it.
+        let other_uid = WorkBuddyAccount {
+            uid: "uid-2".to_string(),
+            ..account.clone()
+        };
+        assert_ne!(
+            credential_id_for(&other_uid, "token-before-refresh"),
+            before
+        );
+        let other_ent = WorkBuddyAccount {
+            enterprise_id: "ent-2".to_string(),
+            ..account.clone()
+        };
+        assert_ne!(
+            credential_id_for(&other_ent, "token-before-refresh"),
+            before
+        );
+
+        // No uid (some imported fixtures): fall back to the token hash, so such
+        // an entry still gets a usable id.
+        let anonymous = WorkBuddyAccount::default();
+        assert_eq!(
+            credential_id_for(&anonymous, "some-token"),
+            credential_id("some-token")
+        );
+    }
+
+    /// `parse_login_state` is what the GUI's paste and QR paths both go through,
+    /// so the stable id has to be established there.
+    #[test]
+    fn parsing_a_login_state_yields_the_stable_id() {
+        let raw = r#"{"auth":{"accessToken":"tok-1","refreshToken":"ref-1"},
+                       "account":{"uid":"uid-9","enterpriseId":"ent-9","nickname":"甲"}}"#;
+        let c = parse_login_state(raw).unwrap();
+
+        assert_eq!(
+            c.id,
+            credential_id_for(&c.account, "tok-1"),
+            "the parsed credential must already carry its stable id"
+        );
+        // Re-issuing the same account with a new token must land on the same id.
+        let again = parse_login_state(
+            r#"{"auth":{"accessToken":"tok-2","refreshToken":"ref-2"},
+                "account":{"uid":"uid-9","enterpriseId":"ent-9","nickname":"甲"}}"#,
+        )
+        .unwrap();
+        assert_eq!(again.id, c.id);
     }
 
     /// The refresh endpoint follows the credential's own domain.

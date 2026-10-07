@@ -12,6 +12,7 @@ import { refreshStatus } from '../overview.js';
 import { toast } from '../../components/toast.js';
 import { formatPoints } from '../../lib/format.js';
 import { startQrCodeLogin, setOAuthPoolRefresh } from './oauth-qr.js';
+import { initRelogin, setReloginPoolRefresh } from './relogin.js';
 import { triggerBatchCheckin } from './checkin.js';
 
 /** State label → badge class, so a cooled credential reads differently. */
@@ -85,12 +86,21 @@ export async function renderIdentityPool() {
       const checkinNote = c.checked_in_today
         ? raw('<span class="wb-checkin-note">今日已打卡</span>')
         : '';
+      // No refresh token means nothing can renew this account; only a fresh
+      // login brings it back. Say so on the row, so the user knows which one to
+      // re-bind instead of retrying a refresh that cannot succeed. Its own class
+      // (not the state pill's) keeps "how healthy is it" and "does it need you"
+      // as two distinguishable things.
+      const reloginNote = c.needs_relogin
+        ? raw('<span class="badge-pill wb-relogin-pill" title="该账号没有 refreshToken，无法自动续期，请点「重新绑定」">需重新绑定</span>')
+        : '';
       return html`<div class="wb-credential-row${raw(isDefault ? ' wb-credential-row--default' : '')}">
         <div class="wb-credential-main">
           ${typePill}
           <span class="wb-credential-label">${c.label || c.nickname || c.id}</span>
           ${defaultBadge}
           <span class="badge-pill wb-state-pill ${stateClass}">${stateLabel}</span>
+          ${reloginNote}
           ${pointsChip}
           ${checkinNote}
           ${stickyNote}
@@ -100,6 +110,8 @@ export async function renderIdentityPool() {
           <button type="button" class="btn btn-small${raw(isDefault ? ' btn-active' : '')}"
             data-default="${c.id}" data-is-default="${isDefault ? '1' : '0'}"
             title="设为默认使用的身份">${isDefault ? '默认身份' : '设为默认'}</button>
+          <button type="button" class="btn btn-small" data-relogin="${c.id}"
+            title="重新扫码或粘贴登录态，覆盖此账号（保留标签、积分与默认身份）">重新绑定</button>
           <button type="button" class="btn btn-small" data-points="${c.id}"
             title="刷新此账号的剩余积分">刷新积分</button>
           <button type="button" class="btn btn-small" data-checkin="${c.id}" title="为此账号每日打卡领积分">打卡</button>
@@ -292,10 +304,55 @@ export async function loadSchedule() {
 
 /** Wire the credential-pool controls and paint the initial list. */
 export function initCredentialPool() {
-  // The QR flow repaints the list through this hook (see oauth-qr.js).
+  // The QR flow repaints the list through this hook (see oauth-qr.js), and the
+  // re-bind dialog does the same through its own (see relogin.js). Both are
+  // injected rather than imported back, so neither module has to depend on this
+  // one — importing this file from them would close a cycle.
   setOAuthPoolRefresh(renderIdentityPool);
+  setReloginPoolRefresh(renderIdentityPool);
+  initRelogin();
   $('#btn-wb-qrcode')?.addEventListener('click', startQrCodeLogin);
   $('#btn-wb-checkin-all')?.addEventListener('click', triggerBatchCheckin);
+
+  // Renew every account's login state now. This is the recovery path for a 401
+  // that a single-account setup cannot fail over from: without it, the only way
+  // back from an expired session is to notice and re-scan.
+  $('#btn-wb-refresh-logins')?.addEventListener('click', async () => {
+    const btn = $('#btn-wb-refresh-logins');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ 刷新中...';
+    }
+    try {
+      const report = await invoke('wb_refresh_logins');
+      await renderIdentityPool();
+      if (!report || report.total === 0) {
+        showWbStatus('账号池中没有已启用的账号可刷新');
+      } else if (report.needs_relogin > 0) {
+        // Name the accounts rather than only counting them: a fresh login is a
+        // manual step, and the user needs to know which row to act on.
+        const names = (report.details || [])
+          .filter((d) => d.needs_relogin)
+          .map((d) => d.label || d.id)
+          .join('、');
+        showWbStatus(
+          `登录态刷新：成功 ${report.refreshed} 个，失败 ${report.failed} 个；`
+          + `${report.needs_relogin} 个需要重新绑定（${names}）`,
+          true,
+        );
+        toast(`${report.needs_relogin} 个账号需重新登录，请点对应行的「重新绑定」`, 'error');
+      } else {
+        showWbStatus(`登录态刷新完成：成功 ${report.refreshed} 个，失败 ${report.failed} 个`);
+      }
+    } catch (e) {
+      showWbStatus('刷新登录态失败: ' + e, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '🔁 全量刷新登录态';
+      }
+    }
+  });
 
   $('#btn-wb-refresh-points')?.addEventListener('click', async () => {
     const btn = $('#btn-wb-refresh-points');

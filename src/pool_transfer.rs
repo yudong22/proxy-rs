@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::workbuddy_auth::{
-    self, api_key_id, credential_id, md5_hex, ApiKeyEntry, PoolPreferences, WorkBuddyCredential,
+    self, api_key_id, md5_hex, ApiKeyEntry, PoolPreferences, WorkBuddyCredential,
 };
 
 /// Magic value in every bundle. Checked on import so a random JSON file fails
@@ -633,26 +633,60 @@ fn decode(text: &str, passphrase: Option<&str>) -> Result<Decoded> {
     })
 }
 
-/// Enforce the invariant the id derivation promises: an id *is* the content
-/// hash of the secret it names.
+/// Re-key imported credentials to the stable account identity, and repair every
+/// reference to a re-keyed id.
 ///
-/// A mismatch means the file was edited by hand (or by a tool that does not know
-/// the rule). Recomputing rather than rejecting keeps a usable account usable,
-/// while the warning makes the edit visible; silently trusting the stored id
-/// would be worse, because two different tokens could then collide onto one
-/// entry and one of them would vanish.
+/// History: this used to force `id == credential_id(access_token)`. That rule
+/// is wrong for any account that has ever been refreshed — the token rotates,
+/// the hash changes, but the account does not — so the function rewrote the ids
+/// of perfectly good credentials *and* left `default_identity_id` pointing at
+/// the old value, silently clearing the user's chosen default.
+///
+/// Now it re-keys to [`credential_id_for`] (uid-based when available) and:
+///
+/// * remaps `preferences.default_identity_id` (and the legacy per-type pointer)
+///   through the same rename table, so the default survives the import;
+/// * keeps the stored id when the account is already keyed correctly, so a
+///   round trip is a no-op rather than a rewrite;
+/// * warns only when it actually changed something.
 fn reconcile_ids(payload: &mut BundlePayload, warnings: &mut Vec<String>) {
-    for c in payload.credentials.iter_mut() {
-        let expected = credential_id(&c.access_token);
-        if c.id != expected {
-            warnings.push(format!(
-                "账号 {} 的 id 与 token 不一致，已按 token 重新计算为 {}",
-                if c.id.is_empty() { "(空)" } else { &c.id },
-                expected
-            ));
-            c.id = expected;
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for c in payload.credentials.iter() {
+        let stable = crate::workbuddy_auth::credential_id_for(&c.account, &c.access_token);
+        if stable != c.id {
+            renames.push((c.id.clone(), stable));
         }
     }
+
+    for (old, new) in &renames {
+        for c in payload.credentials.iter_mut() {
+            if c.id == *old {
+                c.id = new.clone();
+            }
+        }
+    }
+    if !renames.is_empty() {
+        warnings.push(format!(
+            "已按账号身份（uid）重新计算 {} 个账号的 id，并同步更新默认身份引用",
+            renames.len()
+        ));
+    }
+
+    // Rewrite the default pointer through the rename table instead of letting it
+    // dangle. Without this the account keeps existing but stops being the
+    // default — a silent, confusing side effect of importing your own export.
+    let remap = |id: &str| -> Option<String> {
+        renames
+            .iter()
+            .find(|(old, _)| old == id)
+            .map(|(_, new)| new.clone())
+    };
+    if let Some(id) = payload.preferences.default_identity_id.clone() {
+        if let Some(new) = remap(&id) {
+            payload.preferences.default_identity_id = Some(new);
+        }
+    }
+
     for k in payload.api_keys.iter_mut() {
         let expected = api_key_id(&k.key);
         if k.id != expected {
@@ -762,21 +796,31 @@ fn plan(decoded: &Decoded, mode: ImportMode) -> Result<(ImportPreview, PlannedSt
     let mut credentials_updated = 0;
     let mut credentials_unchanged = 0;
     for incoming in &payload.credentials {
+        // Match by account identity, not just id. A LOCAL entry written before
+        // the stable-identity change still carries a token-hash id, while the
+        // bundle's entry for the same account is keyed by uid; comparing ids
+        // alone would import it as a second row. The stored id is kept on a
+        // match (see `find_index`) so existing references keep resolving.
+        let existing = workbuddy_auth::find_index(&credentials, incoming);
         // Existing entries keep their refresh material when the bundle does not
         // carry any: this machine may hold a fresher refresh token than the
         // bundle, and dropping it would force a re-login for no reason.
-        let merged = match credentials.iter().find(|c| c.id == incoming.id) {
-            Some(local) => preserve_local_secrets(incoming, local),
+        let merged = match existing {
+            Some(i) => {
+                let mut m = preserve_local_secrets(incoming, &credentials[i]);
+                m.id = credentials[i].id.clone();
+                m
+            }
             None => incoming.clone(),
         };
-        match credentials.iter_mut().find(|c| c.id == merged.id) {
-            Some(slot) => {
-                if records_equal(slot, &merged) {
+        match existing {
+            Some(i) => {
+                if records_equal(&credentials[i], &merged) {
                     credentials_unchanged += 1;
                 } else {
                     credentials_updated += 1;
                 }
-                *slot = merged;
+                credentials[i] = merged;
             }
             None => {
                 credentials.push(merged);
@@ -1053,6 +1097,7 @@ pub fn write_bundle(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workbuddy_auth::credential_id;
     use std::ffi::OsString;
 
     /// Every test here relocates `PROXY_DATA_DIR`, which is process-global. The
@@ -1381,6 +1426,130 @@ mod tests {
         .unwrap();
         let err = preview_import(&sealed, None, ImportMode::Merge).unwrap_err();
         assert!(err.to_string().contains("请输入口令"), "unexpected: {err}");
+    }
+
+    /// Regression: importing your own export used to silently clear the default
+    /// identity.
+    ///
+    /// `reconcile_ids` forced `id == hash(access_token)` and rewrote any entry
+    /// that disagreed. An account that had been *refreshed* genuinely disagrees
+    /// (the token rotated, the account did not), so its id was rewritten and the
+    /// `default_identity_id` pointing at the old value stopped resolving — the
+    /// account survived but quietly stopped being the default.
+    #[test]
+    fn importing_an_export_keeps_a_refreshed_account_as_the_default() {
+        let _dir = TempDataDir::new("refreshed-default");
+
+        // An account whose token has already been rotated once: the stored id
+        // predates the current access token, exactly like a live install.
+        let account = crate::workbuddy_auth::WorkBuddyAccount {
+            uid: "uid-keep".to_string(),
+            enterprise_id: "ent-1".to_string(),
+            nickname: "甲".to_string(),
+        };
+        let stable_id = crate::workbuddy_auth::credential_id_for(&account, "original-token");
+        let cred = WorkBuddyCredential {
+            id: stable_id.clone(),
+            label: "工作号".to_string(),
+            access_token: "rotated-by-refresh".to_string(),
+            refresh_token: Some("ref-1".to_string()),
+            account: account.clone(),
+            machine_id: "m1".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        workbuddy_auth::save_credentials(std::slice::from_ref(&cred)).unwrap();
+        workbuddy_auth::save_preferences(&PoolPreferences {
+            default_identity_id: stable_id.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let (text, _) = export_text(&ExportOptions::default()).unwrap();
+        let preview = apply_import(&text, None, ImportMode::Replace).unwrap();
+
+        // The id must survive the round trip...
+        let after = workbuddy_auth::load_credentials();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].id, stable_id,
+            "the stable account id must not be rewritten on import"
+        );
+        // ...and the default must still name it.
+        assert_eq!(
+            workbuddy_auth::load_preferences().default_identity_id,
+            stable_id,
+            "the default identity must survive importing your own export"
+        );
+        assert!(
+            !preview.default_identity_dropped,
+            "importing a valid export must never drop the default: {:?}",
+            preview.warnings
+        );
+        assert_eq!(
+            workbuddy_auth::effective_default_identity(),
+            stable_id,
+            "the account is still the identity in force"
+        );
+    }
+
+    /// A local entry keyed by the *legacy* token hash must be recognized as the
+    /// same account as a bundle entry keyed by uid, or a merge would import it
+    /// twice.
+    #[test]
+    fn merge_matches_a_legacy_token_hash_id_to_the_same_account() {
+        let _dir = TempDataDir::new("legacy-id-merge");
+
+        let account = crate::workbuddy_auth::WorkBuddyAccount {
+            uid: "uid-legacy".to_string(),
+            enterprise_id: "ent-1".to_string(),
+            nickname: "甲".to_string(),
+        };
+        // What an install that predates the stable-identity change has on disk:
+        // the id is a hash of the token it had at import time.
+        let legacy = WorkBuddyCredential {
+            id: credential_id("token-at-import-time"),
+            label: "旧记录".to_string(),
+            access_token: "rotated-token".to_string(),
+            refresh_token: Some("ref-local".to_string()),
+            account: account.clone(),
+            machine_id: "m1".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        workbuddy_auth::save_credentials(std::slice::from_ref(&legacy)).unwrap();
+
+        // The bundle carries the same account, keyed by uid.
+        let stable_id = crate::workbuddy_auth::credential_id_for(&account, "rotated-token");
+        let incoming = WorkBuddyCredential {
+            id: stable_id.clone(),
+            label: "新标签".to_string(),
+            access_token: "rotated-token".to_string(),
+            refresh_token: Some("ref-incoming".to_string()),
+            account,
+            machine_id: "m1".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        let bundle = BundlePayload {
+            preferences: BundlePreferences::default(),
+            credentials: vec![incoming],
+            api_keys: Vec::new(),
+        };
+
+        let preview = apply_import(&plain_bundle(&bundle), None, ImportMode::Merge).unwrap();
+
+        assert_eq!(
+            preview.credentials_added, 0,
+            "the same account must not be imported as a second row"
+        );
+        assert_eq!(preview.credentials_updated, 1);
+        let after = workbuddy_auth::load_credentials();
+        assert_eq!(after.len(), 1);
+        // The stored (legacy) id stays, so anything already pointing at it keeps
+        // working; the label comes from the bundle.
+        assert_eq!(after[0].id, legacy.id);
+        assert_eq!(after[0].label, "新标签");
     }
 
     #[test]

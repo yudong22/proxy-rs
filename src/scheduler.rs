@@ -87,6 +87,71 @@ pub async fn run_daily_checkin(
     }
 }
 
+/// How often the login-state scanner wakes.
+///
+/// Five minutes rather than the check-in tick's 60 s: this loop can perform a
+/// network call per due account, and the thing it protects against (a token
+/// silently aging out) is measured in hours. A cheap `load_credentials()` +
+/// `needs_refresh()` comparison runs each tick; only accounts actually due cost
+/// a request, so an idle app still makes none.
+const SCAN_TICK_SECS: u64 = 300;
+
+/// Keep login states fresh in the background.
+///
+/// Renews any enabled credential whose token is due (known expiry inside the
+/// margin, or the unknown-expiry backstop). Runs until `shutdown` fires.
+///
+/// Why this exists: without it, an account whose `expiresAt` is absent — which is
+/// most imported login states — is only ever renewed *reactively*, after a 401
+/// has already failed a user's request. A scheduled pass turns that into a
+/// renewal that happens while the app is idle.
+///
+/// Like [`run_daily_checkin`], this is an `async fn` the caller must spawn onto a
+/// runtime, because Tauri's `.setup()` closure has no Tokio reactor.
+pub async fn run_login_state_scanner(
+    client: reqwest::Client,
+    logs: Arc<crate::settings::LogBuffer>,
+    shutdown: CancellationToken,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(SCAN_TICK_SECS));
+    // Skip the immediate first tick: startup already runs a proactive renewal on
+    // the request path, and firing a scan before the app has settled would race
+    // the first user request for the same credential.
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+
+        let report = workbuddy_auth::refresh_due_credentials(&client).await;
+        if report.total == 0 {
+            continue;
+        }
+
+        logs.push(
+            "INFO",
+            format!(
+                "登录态巡检完成: 到期 {} 个，续期成功 {} 个，失败 {} 个，需重新登录 {} 个",
+                report.total, report.refreshed, report.failed, report.needs_relogin
+            ),
+        )
+        .await;
+
+        for d in report.details.iter().filter(|d| d.needs_relogin) {
+            logs.push(
+                "WARN",
+                format!(
+                    "账号 {} ({}) 无法自动续期，需要重新登录: {}",
+                    d.label, d.id, d.error
+                ),
+            )
+            .await;
+        }
+    }
+}
+
 /// Whether the configured time has arrived on the local clock.
 ///
 /// True once the wall clock is at or past `HH:MM` today (which covers the

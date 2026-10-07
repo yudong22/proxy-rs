@@ -571,6 +571,10 @@ fn mask_credential(
     } else {
         "ok"
     };
+    // Whether a fresh login is the only way back. A credential with no refresh
+    // token cannot renew itself, so the GUI marks it as needing a re-bind rather
+    // than offering a refresh that is guaranteed to fail.
+    let needs_relogin = c.enabled && c.refresh_token.is_none();
     json!({
         "id": c.id,
         "label": c.label,
@@ -586,6 +590,9 @@ fn mask_credential(
         // `null` means "not queried yet" — distinct from a real 0 balance.
         "points": c.points,
         "points_fetched_at_ms": c.points_fetched_at_ms,
+        "last_refresh_at_ms": c.last_refresh_at_ms,
+        "has_refresh_token": c.refresh_token.is_some(),
+        "needs_relogin": needs_relogin,
         "checked_in_today": proxy_rs::workbuddy_auth::checked_in_today(
             c,
             &proxy_rs::workbuddy_auth::local_day(now),
@@ -651,6 +658,101 @@ async fn wb_credentials_add(
         )
         .await;
     Ok(mask_credential(&credential, 0, false))
+}
+
+/// Renew every enabled account's login state, now.
+///
+/// The GUI's 全量刷新登录态 button. Reports per-account outcomes so the list can
+/// mark exactly the accounts that need a fresh login instead of telling the user
+/// only that "some" failed.
+#[tauri::command]
+async fn wb_refresh_logins(
+    app: tauri::AppHandle,
+    ctx: State<'_, Arc<AppContext>>,
+) -> Result<Value, String> {
+    let report = proxy_rs::workbuddy_auth::refresh_all_credentials(&ctx.client).await;
+
+    // Refresh writes new tokens to disk; rebuild the running pool so the next
+    // request uses them without waiting for a restart.
+    reload_pool(&ctx).await;
+    if ctx.service_ctrl.is_running() {
+        start_proxy_server(app, ctx.inner().clone());
+    }
+
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "手动刷新登录态完成: 共 {} 个，成功 {} 个，失败 {} 个，需重新登录 {} 个",
+                report.total, report.refreshed, report.failed, report.needs_relogin
+            ),
+        )
+        .await;
+
+    Ok(json!(report))
+}
+
+#[derive(Deserialize)]
+struct WbReloginBody {
+    /// The account being re-bound, so its label / points / enabled state can be
+    /// carried over to the replacement login state.
+    id: String,
+    /// A fresh login state (pasted JSON, or the OAuth result).
+    login_state: String,
+}
+
+/// Re-bind an existing account to a fresh login state.
+///
+/// This is the fix for a credential whose refresh token is gone or rejected:
+/// nothing can be renewed, and the only way back is a new login. Matching is by
+/// **account identity** (uid), not by id, so re-logging into the same account
+/// updates the existing row — the old entry keeps its id and thus keeps being
+/// the configured default, keeps its request-log history, and cannot turn into a
+/// second row for the same account.
+#[tauri::command]
+async fn wb_relogin(
+    app: tauri::AppHandle,
+    ctx: State<'_, Arc<AppContext>>,
+    body: WbReloginBody,
+) -> Result<Value, String> {
+    let mut fresh = proxy_rs::workbuddy_auth::parse_login_state(&body.login_state)
+        .map_err(|e| e.to_string())?;
+
+    // Carry the user's own settings across the re-login. Points are deliberately
+    // *not* carried: they belong to the account and will be re-read.
+    let existing = proxy_rs::workbuddy_auth::load_credentials()
+        .into_iter()
+        .find(|c| c.id == body.id);
+    if let Some(old) = existing {
+        // Keep a custom label the user typed; a nickname from the new login
+        // state would otherwise overwrite it.
+        if !old.label.trim().is_empty() && old.label != old.account.nickname {
+            fresh.label = old.label.clone();
+        }
+        fresh.enabled = old.enabled;
+        fresh.last_checkin_date = old.last_checkin_date.clone();
+        fresh.cooldown_until_ms = None;
+        fresh.last_error.clear();
+        // The stored id wins so references from the request log and the default
+        // identity keep resolving to this account.
+        fresh.id = old.id.clone();
+    }
+
+    let saved =
+        proxy_rs::workbuddy_auth::upsert_credential(fresh.clone()).map_err(|e| e.to_string())?;
+    reload_pool(&ctx).await;
+    if ctx.service_ctrl.is_running() {
+        start_proxy_server(app, ctx.inner().clone());
+    }
+
+    ctx.logs
+        .push(
+            "INFO",
+            format!("账号 {} 已重新绑定登录态（id={}）", saved.label, saved.id),
+        )
+        .await;
+
+    Ok(mask_credential(&saved, 0, false))
 }
 
 #[tauri::command]
@@ -1928,6 +2030,16 @@ fn main() {
     // key that already exists in the pool (same material) is deduped by id and
     // simply re-enables/re-labels the existing entry.
     migrate_legacy_api_key(&settings);
+    // Re-key credentials to the stable account identity (uid) before anything
+    // reads them. Runs here, ahead of the pool build below, so the ids the pool
+    // and the GUI see are already stable. Idempotent and silent when there is
+    // nothing to change; a failure must not stop the app from starting, because
+    // the old token-hash ids remain usable — they just cannot survive a refresh.
+    match proxy_rs::workbuddy_auth::migrate_credential_ids() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("proxy-rs: re-keyed {n} credential(s) to stable account ids"),
+        Err(e) => eprintln!("proxy-rs: credential id migration failed (continuing): {e}"),
+    }
     // No port fallback. Every client CLI is configured against one fixed
     // gateway URL, so silently binding a different port breaks them with no
     // visible cause — the busy port is surfaced as an error instead, and the
@@ -2066,6 +2178,20 @@ fn main() {
                 ),
             );
 
+            // Login-state scanner: renews access tokens before they age out, so
+            // an account whose login state has no `expiresAt` (most imported
+            // ones) is not left to fail a user request with a 401 first. Same
+            // runtime requirement as the check-in scheduler above.
+            spawn_supervised(
+                ctx_for_scheduler.clone(),
+                "登录态巡检",
+                proxy_rs::scheduler::run_login_state_scanner(
+                    ctx_for_scheduler.client.clone(),
+                    ctx_for_scheduler.logs.clone(),
+                    tokio_util::sync::CancellationToken::new(),
+                ),
+            );
+
             // Build Tray Menu
             let status_i =
                 MenuItem::with_id(app, "status_label", "🟢 状态: 运行中", false, None::<&str>)?;
@@ -2160,6 +2286,8 @@ fn main() {
             open_logs_dir,
             wb_credentials_list,
             wb_credentials_add,
+            wb_relogin,
+            wb_refresh_logins,
             wb_credentials_delete,
             wb_credentials_toggle,
             wb_sticky_reset,

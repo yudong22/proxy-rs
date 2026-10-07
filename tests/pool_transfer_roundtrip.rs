@@ -14,7 +14,7 @@
 
 use proxy_rs::pool_transfer::{apply_import, export_text, ExportOptions, ImportMode};
 use proxy_rs::workbuddy_auth::{
-    self, api_key_id, credential_id, ApiKeyEntry, PoolPreferences, WorkBuddyAccount,
+    self, api_key_id, credential_id_for, ApiKeyEntry, PoolPreferences, WorkBuddyAccount,
     WorkBuddyCredential,
 };
 use std::path::PathBuf;
@@ -79,18 +79,21 @@ impl Drop for TempDataDir {
 }
 
 fn credential(token: &str, label: &str, uid: &str) -> WorkBuddyCredential {
+    let account = WorkBuddyAccount {
+        uid: uid.to_string(),
+        enterprise_id: "ent-1".to_string(),
+        nickname: format!("{label}-nick"),
+    };
     WorkBuddyCredential {
-        id: credential_id(token),
+        // The stable identity, exactly as `parse_login_state` derives it: the id
+        // must follow the *account*, not the token, or a refresh would strand it.
+        id: credential_id_for(&account, token),
         label: label.to_string(),
         access_token: token.to_string(),
         refresh_token: Some(format!("{token}-refresh")),
         expires_at_ms: Some(4_000_000_000_000),
         domain: "copilot.tencent.com".to_string(),
-        account: WorkBuddyAccount {
-            uid: uid.to_string(),
-            enterprise_id: "ent-1".to_string(),
-            nickname: format!("{label}-nick"),
-        },
+        account,
         machine_id: "machine-ported".to_string(),
         enabled: true,
         ..Default::default()
@@ -221,4 +224,91 @@ fn an_encrypted_bundle_reconstitutes_the_pool_too() {
 
     apply_import(&text, Some(passphrase), ImportMode::Merge).unwrap();
     assert_eq!(effective_state(), before);
+}
+
+/// The recovery path for an account whose token has been rotated, and the reason
+/// the id had to change from a token hash to an account identity.
+///
+/// This models the real lifecycle: log in → the access token expires and the
+/// proxy refreshes it → the stored id no longer equals a hash of the current
+/// token. Before the stable-identity change, that state broke two things at once:
+/// importing your own export rewrote the id (dropping the default), and logging
+/// in again added a duplicate row instead of updating the account.
+#[test]
+fn a_refreshed_account_survives_export_import_and_relogin() {
+    let _dir = TempDataDir::new("refreshed-lifecycle");
+
+    // 1. Log in.
+    let account = WorkBuddyAccount {
+        uid: "uid-lifecycle".to_string(),
+        enterprise_id: "ent-1".to_string(),
+        nickname: "甲".to_string(),
+    };
+    let original = credential("original-token", "工作号", "uid-lifecycle");
+    let stable_id = original.id.clone();
+    assert_eq!(
+        stable_id,
+        credential_id_for(&account, "original-token"),
+        "fixture sanity: id comes from the account"
+    );
+    workbuddy_auth::save_credentials(std::slice::from_ref(&original)).unwrap();
+    workbuddy_auth::save_preferences(&PoolPreferences {
+        default_identity_id: stable_id.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // 2. A refresh rotates the token. The id must NOT move.
+    let rotated = WorkBuddyCredential {
+        access_token: "rotated-token".to_string(),
+        refresh_token: Some("ref-2".to_string()),
+        last_refresh_at_ms: Some(1_790_000_000_000),
+        ..original.clone()
+    };
+    workbuddy_auth::upsert_credential(rotated.clone()).unwrap();
+
+    let after_refresh = workbuddy_auth::load_credentials();
+    assert_eq!(
+        after_refresh.len(),
+        1,
+        "a refresh must update, never duplicate"
+    );
+    assert_eq!(
+        after_refresh[0].id, stable_id,
+        "the id must survive a token rotation"
+    );
+    assert_eq!(after_refresh[0].access_token, "rotated-token");
+
+    // 3. Export → import on a fresh machine. The id and the default must hold.
+    let (text, _) = export_text(&ExportOptions::default()).unwrap();
+
+    workbuddy_auth::save_credentials(&[]).unwrap();
+    workbuddy_auth::save_preferences(&PoolPreferences::default()).unwrap();
+
+    let preview = apply_import(&text, None, ImportMode::Merge).unwrap();
+    assert_eq!(preview.credentials_added, 1);
+    assert_eq!(
+        workbuddy_auth::effective_default_identity(),
+        stable_id,
+        "the account is still the default after the round trip"
+    );
+
+    // 4. Re-login (the 401-that-cannot-self-heal path): same account, brand-new
+    //    login state. It must update the existing row, not add one.
+    let relogged = credential("brand-new-token", "工作号", "uid-lifecycle");
+    workbuddy_auth::upsert_credential(relogged).unwrap();
+
+    let final_state = workbuddy_auth::load_credentials();
+    assert_eq!(
+        final_state.len(),
+        1,
+        "re-logging into the same account must not create a second row"
+    );
+    assert_eq!(final_state[0].id, stable_id);
+    assert_eq!(final_state[0].access_token, "brand-new-token");
+    assert_eq!(
+        workbuddy_auth::effective_default_identity(),
+        stable_id,
+        "the default still names the same account after a re-login"
+    );
 }
