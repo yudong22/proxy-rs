@@ -102,6 +102,10 @@ const MOCK = {
     ],
   },
   wb_relogin: { id: 'cred-3', label: '需重登账号', enabled: true, masked_token: 'sk-***3' },
+  wb_refresh_points_single: {
+    result: { id: 'cred-1', label: '测试账号一', points: 1234.5 },
+    current_identity: { id: 'cred-1', label: '测试账号一', points: 1234.5 },
+  },
   api_keys_list: {
     keys: [{ id: 'key-1', label: '备用密钥', enabled: true, points: 88, masked: 'sk-***k' }],
     default_identity_id: 'cred-1',
@@ -575,6 +579,21 @@ try {
     expression: `(async () => {
       const t = (s) => (document.querySelector(s)?.textContent || '').replace(/\\s+/g, ' ').trim();
       const refreshStatus = t('#wb-status');
+
+      // The per-row 刷新积分 button must refresh ONLY its own row. It used to
+      // ignore its data-points id and call the pool-wide command, so this
+      // asserts the id actually reaches the backend.
+      const pointsRow = [...document.querySelectorAll('#wb-identity-list .wb-credential-row')]
+        .find((r) => r.textContent.includes('测试账号二'));
+      pointsRow.querySelector('[data-points]').click();
+      await new Promise((r) => setTimeout(r, 300));
+      const rowPoints = {
+        called: window.__CALLS__.includes('wb_refresh_points_single'),
+        id: window.__INVOKE_ARGS__?.wb_refresh_points_single?.id,
+        calledPoolWide: window.__CALLS__.includes('wb_refresh_points'),
+        status: t('#wb-status'),
+      };
+
       const row = [...document.querySelectorAll('#wb-identity-list .wb-credential-row')]
         .find((r) => r.textContent.includes('需重登账号'));
       const badge = row?.querySelector('.wb-relogin-pill')?.textContent?.trim() || '';
@@ -592,6 +611,7 @@ try {
         reloginBadge: badge,
         dialogOpen,
         targetShown,
+        rowPoints,
         refreshCalled: window.__CALLS__.includes('wb_refresh_logins'),
         reloginCalled: window.__CALLS__.includes('wb_relogin'),
         reloginBody: window.__INVOKE_ARGS__?.wb_relogin?.body?.id,
@@ -609,6 +629,11 @@ try {
   check('relogin targets the row it was opened from', rc.reloginBody, 'cred-3');
   check('relogin repaints the pool', rc.poolRepainted, true);
   check('relogin closes the dialog', rc.dialogClosed, true);
+  // The per-row points button must target its own row and must NOT fall back to
+  // the pool-wide command.
+  check('row 刷新积分 calls the single-identity command', rc.rowPoints.called, true);
+  check('row 刷新积分 passes its own id', rc.rowPoints.id, 'cred-2');
+  check('row 刷新积分 does not refresh the whole pool', rc.rowPoints.calledPoolWide, false);
   for (const needle of EXPECTED.refreshStatusContains) {
     if (!rc.refreshStatus.includes(needle)) {
       failures.push(`batch refresh status is missing ${JSON.stringify(needle)}\n      actual: ${rc.refreshStatus}`);

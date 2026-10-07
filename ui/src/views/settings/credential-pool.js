@@ -178,13 +178,17 @@ export async function renderIdentityPool() {
     }
     for (const btn of listEl.querySelectorAll('[data-points]')) {
       btn.addEventListener('click', async () => {
+        // Refresh only this row. It used to call the pool-wide command and
+        // ignore `data-points` entirely, so the button did something other than
+        // what its own tooltip promised.
         const id = btn.dataset.points;
         btn.disabled = true;
         btn.textContent = '...';
         try {
-          await invoke('wb_refresh_points');
+          await invoke('wb_refresh_points_single', { id });
           await renderIdentityPool();
-          showWbStatus('已刷新账号池积分');
+          await refreshStatus();
+          showWbStatus(`已刷新 ${id} 的积分`);
         } catch (e) {
           showWbStatus('刷新积分失败: ' + e, true);
           btn.disabled = false;
@@ -363,13 +367,13 @@ export function initCredentialPool() {
     try {
       await invoke('wb_refresh_points');
       await renderIdentityPool();
-      showWbStatus('已刷新账号池剩余积分');
+      showWbStatus('已刷新全部身份的剩余积分（账号 + 密钥）');
     } catch (e) {
       showWbStatus('刷新积分失败: ' + e, true);
     } finally {
       if (btn) {
         btn.disabled = false;
-        btn.textContent = '💎 刷新积分';
+        btn.textContent = '💎 刷新全部积分';
       }
     }
   });

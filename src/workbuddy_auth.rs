@@ -1810,6 +1810,48 @@ pub struct PointsResult {
     pub points: Option<f64>,
 }
 
+/// Refresh the point balance of a **single** identity, by id.
+///
+/// The per-row 刷新积分 button: without this it called the pool-wide refresh and
+/// silently updated every account, so the button did not do what its own tooltip
+/// said — and a single unreachable account could not be retried on its own.
+///
+/// Resolves the id against the credential pool first, then the key pool: the two
+/// pools are one list in the GUI, and their ids are already disjoint (`wb-…` vs
+/// `k-…`). Same persist-on-failure rule as the pool-wide path: a failed read
+/// clears the stale figure rather than leaving a number the account no longer
+/// has.
+///
+/// Returns `None` when no identity with that id exists, so the caller can say
+/// "账号不存在" instead of reporting a fictional success.
+pub async fn refresh_one_points(client: &reqwest::Client, id: &str) -> Option<PointsResult> {
+    if let Some(cred) = load_credentials().into_iter().find(|c| c.id == id) {
+        let points = fetch_points(client, &cred).await;
+        let _ = set_points(&cred.id, points);
+        return Some(PointsResult {
+            id: cred.id.clone(),
+            label: display_label(&cred),
+            points,
+        });
+    }
+
+    if let Some(key) = load_api_keys().into_iter().find(|k| k.id == id) {
+        let points = fetch_points_for_key(client, &key).await;
+        let _ = set_api_key_points(&key.id, points);
+        return Some(PointsResult {
+            id: key.id.clone(),
+            label: if key.label.is_empty() {
+                key.id.clone()
+            } else {
+                key.label.clone()
+            },
+            points,
+        });
+    }
+
+    None
+}
+
 /// One account's token refresh attempt, as reported to the GUI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshResult {
@@ -2616,6 +2658,81 @@ mod tests {
             !c.needs_refresh(1_000_000 + UNKNOWN_EXPIRY_REFRESH_AFTER_MS),
             "a known-fresh expiry must not be overridden by the backstop"
         );
+    }
+
+    /// The per-row 刷新积分 button must not perturb any other identity.
+    ///
+    /// Regression: the button called the pool-wide refresh and ignored its own
+    /// `data-points` id, so opening one row's button updated every account —
+    /// and a single unreachable account could not be retried on its own. These
+    /// setters are what the single-identity path writes through, so the isolation
+    /// property belongs here.
+    #[test]
+    fn setting_points_touches_only_the_named_identity() {
+        let dir = std::env::temp_dir().join(format!("proxy-rs-points-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The data dir is process-global; serialise against the other tests that
+        // relocate it rather than racing them.
+        let _guard = crate::settings::data_dir_test_lock();
+        let previous = std::env::var_os(crate::settings::DATA_DIR_ENV);
+        std::env::set_var(crate::settings::DATA_DIR_ENV, &dir);
+
+        let a = WorkBuddyCredential {
+            id: "wb-aaa".to_string(),
+            label: "甲".to_string(),
+            access_token: "t-a".to_string(),
+            points: Some(1.0),
+            ..Default::default()
+        };
+        let b = WorkBuddyCredential {
+            id: "wb-bbb".to_string(),
+            label: "乙".to_string(),
+            access_token: "t-b".to_string(),
+            points: Some(2.0),
+            ..Default::default()
+        };
+        save_credentials(&[a, b]).unwrap();
+        save_api_keys(&[ApiKeyEntry {
+            id: "k-ccc".to_string(),
+            label: "密钥".to_string(),
+            key: "sk-c".to_string(),
+            points: Some(3.0),
+            ..Default::default()
+        }])
+        .unwrap();
+
+        set_points("wb-aaa", Some(99.5)).unwrap();
+        set_api_key_points("k-ccc", Some(88.5)).unwrap();
+
+        let creds = load_credentials();
+        assert_eq!(
+            creds.iter().find(|c| c.id == "wb-aaa").unwrap().points,
+            Some(99.5),
+            "the named credential is updated"
+        );
+        assert_eq!(
+            creds.iter().find(|c| c.id == "wb-bbb").unwrap().points,
+            Some(2.0),
+            "a sibling credential must be untouched"
+        );
+        assert_eq!(
+            load_api_keys()[0].points,
+            Some(88.5),
+            "the named key is updated independently of the credential pool"
+        );
+
+        // An unknown id is a silent no-op (the caller resolves the id first), and
+        // must not clear or create anything.
+        set_points("wb-nonexistent", Some(0.0)).unwrap();
+        assert_eq!(load_credentials().len(), 2);
+        assert_eq!(load_api_keys().len(), 1);
+
+        match previous {
+            Some(v) => std::env::set_var(crate::settings::DATA_DIR_ENV, v),
+            None => std::env::remove_var(crate::settings::DATA_DIR_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Identity is the account, not the token.

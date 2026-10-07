@@ -922,6 +922,44 @@ async fn wb_refresh_points(ctx: State<'_, Arc<AppContext>>) -> Result<Value, Str
     }))
 }
 
+/// Refresh one identity's point balance, for the per-row 刷新积分 button.
+///
+/// Distinct from [`wb_refresh_points`] (pool-wide, used by the toolbar): the row
+/// button must touch only the row it belongs to. A missing id is an error rather
+/// than a silent no-op, so the UI cannot report success for an account that was
+/// deleted in another window.
+#[tauri::command]
+async fn wb_refresh_points_single(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<Value, String> {
+    let Some(result) = proxy_rs::workbuddy_auth::refresh_one_points(&ctx.client, &id).await else {
+        return Err(format!("身份不存在: {id}"));
+    };
+
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "已刷新积分: {} ({}) → {}",
+                result.label,
+                result.id,
+                match result.points {
+                    Some(p) => format!("{p:.2}"),
+                    None => "读取失败".to_string(),
+                }
+            ),
+        )
+        .await;
+
+    // The identity in force may be the one just refreshed, so hand back the same
+    // summary the overview card consumes — mirroring `wb_refresh_points`.
+    Ok(json!({
+        "result": result,
+        "current_identity": current_identity_summary(),
+    }))
+}
+
 #[tauri::command]
 async fn wb_checkin_all(
     ctx: State<'_, Arc<AppContext>>,
@@ -2299,6 +2337,7 @@ fn main() {
             wb_preferences,
             wb_set_schedule,
             wb_refresh_points,
+            wb_refresh_points_single,
             wb_set_default_identity,
             api_keys_list,
             api_keys_add,

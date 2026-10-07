@@ -154,8 +154,9 @@ export function renderSettings() {
       <button type="button" class="btn btn-small" id="btn-wb-checkin-all">
         🎁 账号池一键打卡
       </button>
-      <button type="button" class="btn btn-small" id="btn-wb-refresh-points">
-        💎 刷新积分
+      <button type="button" class="btn btn-small" id="btn-wb-refresh-points"
+        title="刷新账号与密钥的剩余积分（全部身份）；只想刷某一个请用该行的「刷新积分」">
+        💎 刷新全部积分
       </button>
       <button type="button" class="btn btn-small" id="btn-wb-refresh-logins"
         title="立即续期所有账号的登录态；无法自动续期的账号会在列表中标为「需重新绑定」">
