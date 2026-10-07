@@ -5,6 +5,7 @@
 //! into a client stream while recording one accurate request-log row.
 
 use super::*;
+use crate::error::{describe_error_chain, is_transport_body_error};
 
 /// Serialize one SSE event in the `event:`/`data:` framing both APIs use.
 pub(crate) fn serialize_sse_event<T: serde::Serialize>(event_type: &str, event: &T) -> String {
@@ -190,6 +191,27 @@ impl TimingTracker {
 /// the whole life of a stream (see `create_flavor_sse_stream`).
 pub(crate) const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Describe a mid-stream upstream read failure for the log and the request row.
+///
+/// A reqwest body failure prints only as `error decoding response body`, which
+/// says nothing about what happened; the cause chain carries the diagnosis
+/// (`Connection reset by peer`, `end of file before message length reached`,
+/// `operation timed out`). For transport failures the wording names the shape —
+/// a stalled upstream versus a truncated body — because those point at
+/// different causes and the distinction is the actionable part.
+///
+/// Shares [`ProxyError::diagnostic`]'s wording (via the same
+/// `describe_transport_failure`) with the non-streaming path, so one failure
+/// cannot be described two ways depending on which path met it.
+pub(crate) fn upstream_read_error(error: &(dyn std::error::Error + 'static)) -> String {
+    match error.downcast_ref::<reqwest::Error>() {
+        Some(reqwest) if is_transport_body_error(reqwest) => {
+            crate::error::describe_transport_failure(reqwest)
+        }
+        _ => describe_error_chain(error),
+    }
+}
+
 /// Shared SSE framer for all three API flavors.
 ///
 /// All three read the upstream's OpenAI-style `data: {...}` stream and differ
@@ -197,7 +219,7 @@ pub(crate) const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 /// `[DONE]` handling, business-error detection and stats capture live here once.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_flavor_sse_stream(
-    upstream: impl Stream<Item = Result<Bytes, impl std::fmt::Display + Send + 'static>>
+    upstream: impl Stream<Item = Result<Bytes, impl std::error::Error + Send + Sync + 'static>>
         + Send
         + 'static,
     flavor: ApiFlavor,
@@ -465,20 +487,28 @@ pub(super) fn create_flavor_sse_stream(
                     }
                 }
                 Err(e) => {
-                    ledger.error = Some(format!("{}", e));
+                    // The recorded reason must name the real failure. reqwest
+                    // prints every body failure as "error decoding response
+                    // body" (the phrase on the 2026-10-07 500 row), so a
+                    // truncated stream reached the user with nothing to act on.
+                    // `upstream_read_error` keeps the cause chain and, for a
+                    // transport failure, says whether the upstream stalled or
+                    // the body was cut short.
+                    let summary = upstream_read_error(&e);
+                    ledger.error = Some(summary.clone());
                     match flavor {
                         ApiFlavor::Anthropic => {
-                            tracing::error!("Stream error: {}", e);
-                            for event in stream::translate_error(format!("Stream error: {}", e)) {
+                            tracing::error!("Stream error: {}", summary);
+                            for event in stream::translate_error(format!("Stream error: {}", summary)) {
                                 yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
                             }
                         }
                         ApiFlavor::Responses => {
-                            tracing::error!("Stream error: {}", e);
+                            tracing::error!("Stream error: {}", summary);
                             if let Some(state) = responses_state.as_mut() {
                                 for event in responses_pipeline::translate_stream_error(
                                     state,
-                                    format!("Stream error: {}", e),
+                                    format!("Stream error: {}", summary),
                                 ) {
                                     yield Ok(Bytes::from(serialize_sse_event(event.event_type(), &event)));
                                 }
@@ -486,9 +516,26 @@ pub(super) fn create_flavor_sse_stream(
                         }
                         ApiFlavor::Chat => {
                             let msg =
-                                format!("STREAM READ ERROR model={} {} | {}", client_model, tag, e);
+                                format!("STREAM READ ERROR model={} {} | {}", client_model, tag, summary);
                             gui_logs.push("ERROR", msg.clone()).await;
                             tracing::warn!("{}", msg);
+                            // Chat Completions has no dedicated stream-error event,
+                            // but its schema carries failures as a `data:` frame
+                            // with an `error` object — which is exactly what the
+                            // openai SDKs look for (`data.error` throws). Emitting
+                            // it turns a truncated stream from a silently
+                            // half-finished answer into an error the client can
+                            // surface (and retry), instead of an HTTP 200 whose
+                            // body merely stops.
+                            yield Ok(Bytes::from(format!(
+                                "data: {}\n\n",
+                                serde_json::json!({
+                                    "error": {
+                                        "type": "upstream_error",
+                                        "message": summary,
+                                    }
+                                })
+                            )));
                         }
                     }
                     break;
@@ -528,7 +575,7 @@ pub(super) fn create_flavor_sse_stream(
 /// Test-only aliases preserving the historical per-flavor entry points.
 #[cfg(test)]
 pub(crate) fn create_sse_stream(
-    upstream: impl Stream<Item = Result<Bytes, impl std::fmt::Display + Send + 'static>>
+    upstream: impl Stream<Item = Result<Bytes, impl std::error::Error + Send + Sync + 'static>>
         + Send
         + 'static,
     fallback_model: String,
@@ -552,7 +599,7 @@ pub(crate) fn create_sse_stream(
 
 #[cfg(test)]
 pub(crate) fn create_responses_sse_stream(
-    upstream: impl Stream<Item = Result<Bytes, impl std::fmt::Display + Send + 'static>>
+    upstream: impl Stream<Item = Result<Bytes, impl std::error::Error + Send + Sync + 'static>>
         + Send
         + 'static,
     fallback_model: String,

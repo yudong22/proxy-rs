@@ -1675,14 +1675,56 @@ async fn forward_request(
                     // every chunk, so it is also the one that can report TTFT and
                     // the model's generation span. A plain JSON response exposes
                     // neither, so its timings stay at zero ("unknown").
-                    let (resp, timing) = if upstream_streaming {
-                        collect_stream_into_response(response, upstream_start).await?
+                    //
+                    // Reading the body happens *here* rather than through `?`
+                    // because it can fail mid-transfer: reqwest reports a
+                    // truncated body as `Decode`/“error decoding response body”,
+                    // which the `?` turned into a 502/500 the client could not
+                    // act on even though the next attempt normally succeeds.
+                    let materialized = if upstream_streaming {
+                        collect_stream_into_response(response, upstream_start).await
                     } else {
-                        (
-                            response.json::<openai::OpenAIResponse>().await?,
-                            UpstreamTiming::default(),
-                        )
+                        response
+                            .json::<openai::OpenAIResponse>()
+                            .await
+                            .map(|resp| (resp, UpstreamTiming::default()))
+                            .map_err(ProxyError::Http)
                     };
+
+                    let (resp, timing) = match materialized {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            // A body cut short mid-transfer is the upstream or
+                            // the network, not this request — retry on the next
+                            // URL (and, if none is left, the next credential)
+                            // instead of failing the client outright. A body
+                            // that arrived whole but could not be deserialized
+                            // will fail identically everywhere, so it is
+                            // reported rather than retried.
+                            if !err.is_transient_transport_error() {
+                                return Err(err);
+                            }
+                            let message = err.diagnostic();
+                            metrics::upstream_error("chat_completions");
+                            gui_logs
+                                .push(
+                                    "WARN",
+                                    format!(
+                                        "UPSTREAM BODY FAILED MID-TRANSFER url={} model={} {}ms {} | {} (retrying next upstream)",
+                                        url,
+                                        openai_req.model,
+                                        upstream_start.elapsed().as_millis(),
+                                        tag,
+                                        message
+                                    ),
+                                )
+                                .await;
+                            tracing::warn!("Upstream body failed mid-transfer: {}", message);
+                            last_err = Some(err);
+                            continue 'url; // try the next upstream URL
+                        }
+                    };
+
                     non_streaming_response(
                         resp,
                         flavor,

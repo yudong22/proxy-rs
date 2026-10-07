@@ -478,6 +478,10 @@ impl fmt::Display for TestError {
         write!(f, "test error")
     }
 }
+// The SSE framer takes `std::error::Error` items so it can walk a real cause
+// chain (`describe_error_chain`); the fake stream error has to satisfy the same
+// bound.
+impl std::error::Error for TestError {}
 
 fn openai_chunk(
     id: &str,
@@ -2138,4 +2142,461 @@ async fn non_streaming_request_is_upgraded_when_provider_requires_stream() {
     let (stream, has_opts) = seen.lock().unwrap().unwrap();
     assert_eq!(stream, Some(true), "must upgrade to stream upstream");
     assert!(has_opts, "must request usage in the stream");
+}
+
+// ── Truncated upstream body: the 2026-10-07 "error decoding response body" 500 ──
+
+/// Serve one HTTP response whose `Content-Length` promises `declared` bytes
+/// while only `body` is sent, then drop the socket.
+///
+/// This is the real shape of the failure recorded on 2026-10-07 14:59:47: the
+/// upstream declared a length it never finished sending, so the client read the
+/// frames that did arrive and then hit EOF early.
+async fn serve_truncated(body: &'static str, declared: usize) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let payload = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n{body}"
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = sock.write_all(payload.as_bytes()).await;
+            let _ = sock.flush().await;
+            drop(sock);
+        }
+    });
+    format!("http://{addr}/")
+}
+
+/// Drive one flavor's framer to exhaustion over a real socket, returning every
+/// byte a client would have received.
+async fn drain_flavor(
+    flavor: super::ApiFlavor,
+    route: &'static str,
+    url: String,
+    logs: std::sync::Arc<crate::settings::LogBuffer>,
+    stats: std::sync::Arc<crate::stats::StatsDb>,
+) -> String {
+    let response = reqwest::get(url).await.expect("upstream reachable");
+    let sse = super::create_flavor_sse_stream(
+        response.bytes_stream(),
+        flavor,
+        "deepseek-v4.1-flash".to_string(),
+        route,
+        Instant::now(),
+        Instant::now(),
+        logs,
+        stats,
+        SessionInfo::unknown(),
+        "client=unknown".to_string(),
+        Default::default(),
+    );
+    tokio::pin!(sse);
+
+    let mut out = String::new();
+    while let Some(item) = sse.next().await {
+        match item {
+            Ok(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+            Err(err) => panic!("the framer must not propagate transport errors: {err}"),
+        }
+    }
+    out
+}
+
+/// A truncated Chat stream must end with a parseable `error` frame.
+///
+/// Before this, the `ApiFlavor::Chat` arm only logged: the client received HTTP
+/// 200 and a body that simply stopped, which looks like a half-finished answer
+/// rather than a failure. Chat's schema carries errors as a `data:` frame with
+/// an `error` object — what the OpenAI SDKs throw on — so that is what is sent.
+#[tokio::test]
+async fn a_truncated_chat_stream_reports_an_error_frame() {
+    let good =
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+    let url = serve_truncated(good, 100_000).await;
+
+    let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(100));
+    let stats = mock_stats();
+    let out = drain_flavor(
+        super::ApiFlavor::Chat,
+        "/v1/chat/completions",
+        url,
+        logs,
+        stats,
+    )
+    .await;
+
+    assert!(
+        out.contains("\"content\":\"partial\""),
+        "the chunks that arrived must still be forwarded: {out}"
+    );
+    assert!(
+        out.contains("\"error\""),
+        "a truncated Chat stream must end with an error frame, got: {out}"
+    );
+    assert!(
+        out.contains("truncated"),
+        "the frame must say what happened, got: {out}"
+    );
+}
+
+/// The request row and the GUI log must name the truncation instead of
+/// repeating reqwest's opaque `error decoding response body`.
+#[tokio::test]
+async fn a_truncated_stream_records_the_real_cause() {
+    let good =
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+    let url = serve_truncated(good, 100_000).await;
+
+    let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(100));
+    let stats = mock_stats();
+    let out = drain_flavor(
+        super::ApiFlavor::Chat,
+        "/v1/chat/completions",
+        url,
+        logs.clone(),
+        stats.clone(),
+    )
+    .await;
+    assert!(
+        out.contains("\"error\""),
+        "the stream ends in an error: {out}"
+    );
+
+    let rows = stats
+        .query_request_logs(&crate::stats::RequestLogFilter::default())
+        .unwrap()
+        .items;
+    assert_eq!(rows.len(), 1, "one truncated stream is one row: {rows:?}");
+    assert_eq!(rows[0].status, 500, "a failed stream row is a 500");
+
+    let error = rows[0].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("truncated"),
+        "the row must name the failure, got: {error:?}"
+    );
+    // The cause chain is the actionable part; the opaque outer message alone is
+    // exactly what made the original row useless.
+    assert!(
+        error.len() > "error decoding response body".len(),
+        "the row must carry the cause chain, got: {error:?}"
+    );
+
+    let logged = logs
+        .snapshot()
+        .await
+        .iter()
+        .map(|e| e.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        logged.contains("truncated"),
+        "the GUI log must name the failure, got: {logged}"
+    );
+}
+
+/// The control: a stream that ends normally keeps `[DONE]` and records a 200, so
+/// the new error path did not disturb the healthy case.
+#[tokio::test]
+async fn a_complete_chat_stream_is_unaffected() {
+    let body = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let payload_len = body.len();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let payload = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {payload_len}\r\nConnection: close\r\n\r\n{body}"
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = sock.write_all(payload.as_bytes()).await;
+            let _ = sock.flush().await;
+            drop(sock);
+        }
+    });
+
+    let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(100));
+    let stats = mock_stats();
+    let out = drain_flavor(
+        super::ApiFlavor::Chat,
+        "/v1/chat/completions",
+        format!("http://{addr}/"),
+        logs,
+        stats.clone(),
+    )
+    .await;
+
+    assert!(
+        out.contains("[DONE]"),
+        "a healthy stream keeps its terminator"
+    );
+    assert!(
+        !out.contains("\"error\""),
+        "no error frame when nothing failed"
+    );
+
+    let rows = stats
+        .query_request_logs(&crate::stats::RequestLogFilter::default())
+        .unwrap()
+        .items;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, 200, "a complete stream is a success row");
+    assert_eq!(rows[0].error, None);
+}
+
+/// A truncated *non-streaming* upstream body is retried on the next URL instead
+/// of being reported to the client.
+///
+/// The original failure was a stream, but the same reqwest error surfaces on the
+/// aggregation path: a provider that only serves streams is asked for one and
+/// the answer is cut short. That is a transport failure worth a second attempt,
+/// whereas a body that arrived whole and failed to deserialize would fail
+/// identically everywhere.
+#[tokio::test]
+async fn a_truncated_body_is_retried_on_the_next_url() {
+    // First upstream: declares more than it sends, so the body is cut short.
+    let truncating = "{\"id\":\"x\",\"choices\":[";
+    let bad_url = serve_truncated(truncating, 100_000).await;
+
+    // Second upstream: a complete, valid non-streaming response.
+    let upstream = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(
+            |axum::Json(_req): axum::Json<openai::OpenAIRequest>| async move {
+                axum::Json(json!({
+                    "id": "chatcmpl-recovered",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "recovered"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                }))
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let config = std::sync::Arc::new(Config {
+        // The bad URL is tried first, so only the retry can produce a 200.
+        upstream_urls: vec![bad_url, format!("http://127.0.0.1:{port}")],
+        ..Default::default()
+    });
+    let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(50));
+
+    let req = openai::OpenAIRequest {
+        model: "gpt-4o".to_string(),
+        messages: vec![openai::Message {
+            role: "user".to_string(),
+            content: Some(openai::MessageContent::Text("hi".to_string())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }],
+        max_tokens: None,
+        max_completion_tokens: None,
+        temperature: None,
+        top_p: None,
+        stop: None,
+        stream: Some(false),
+        stream_options: None,
+        tools: None,
+        tool_choice: None,
+        extra: serde_json::Map::new(),
+    };
+
+    let resp = super::forward_request(
+        config,
+        reqwest::Client::new(),
+        req,
+        None,
+        logs.clone(),
+        "gpt-4o".to_string(),
+        mock_stats(),
+        super::ApiFlavor::Chat,
+        false,
+        "/v1/chat/completions",
+        std::time::Instant::now(),
+        SessionInfo::unknown(),
+        "client=unknown".to_string(),
+        Default::default(),
+        std::sync::Arc::new(crate::session_pool::CredentialPool::empty()),
+        None,
+    )
+    .await
+    .expect("a truncated body must not fail the request while a retry can succeed");
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("recovered"),
+        "the retry's answer must reach the client: {text}"
+    );
+
+    let logged = logs
+        .snapshot()
+        .await
+        .iter()
+        .map(|e| e.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        logged.contains("FAILED MID-TRANSFER") && logged.contains("truncated"),
+        "the truncated body must be named in the log: {logged}"
+    );
+}
+
+/// A body that arrived intact but is not valid JSON is *not* retried: it would
+/// fail identically on every upstream, so the error is reported directly.
+#[tokio::test]
+async fn an_unparseable_body_is_reported_rather_than_retried() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let body = "this is not json";
+            let payload = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = sock.write_all(payload.as_bytes()).await;
+            let _ = sock.flush().await;
+            drop(sock);
+        }
+    });
+
+    let config = std::sync::Arc::new(Config {
+        upstream_urls: vec![format!("http://{addr}")],
+        ..Default::default()
+    });
+    let req = openai::OpenAIRequest {
+        model: "gpt-4o".to_string(),
+        messages: vec![openai::Message {
+            role: "user".to_string(),
+            content: Some(openai::MessageContent::Text("hi".to_string())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }],
+        max_tokens: None,
+        max_completion_tokens: None,
+        temperature: None,
+        top_p: None,
+        stop: None,
+        stream: Some(false),
+        stream_options: None,
+        tools: None,
+        tool_choice: None,
+        extra: serde_json::Map::new(),
+    };
+
+    let err = super::forward_request(
+        config,
+        reqwest::Client::new(),
+        req,
+        None,
+        std::sync::Arc::new(crate::settings::LogBuffer::new(50)),
+        "gpt-4o".to_string(),
+        mock_stats(),
+        super::ApiFlavor::Chat,
+        false,
+        "/v1/chat/completions",
+        std::time::Instant::now(),
+        SessionInfo::unknown(),
+        "client=unknown".to_string(),
+        Default::default(),
+        std::sync::Arc::new(crate::session_pool::CredentialPool::empty()),
+        None,
+    )
+    .await
+    .expect_err("malformed JSON is a real failure");
+
+    // The rendered message keeps the parse detail rather than the bare reqwest
+    // phrase, so the row explains itself.
+    let text = err.to_string();
+    assert!(
+        text.contains("expected") || text.contains("line"),
+        "the parse failure must be named: {text}"
+    );
+    server.abort();
+}
+
+/// A stalled upstream must not be described as a truncated body (and vice
+/// versa): both are retriable transport failures but they point at different
+/// causes, and the log is read to decide which one to chase.
+#[tokio::test]
+async fn a_stalled_stream_is_described_as_a_timeout_not_a_truncation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            use tokio::io::AsyncWriteExt;
+            // A partial chunked body, then silence: the client's read timeout is
+            // what must fire, not an EOF.
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n8\r\ndata: {\"",
+                )
+                .await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .read_timeout(std::time::Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let response = client.get(format!("http://{addr}/")).send().await.unwrap();
+    let mut stream = response.bytes_stream();
+    let error = loop {
+        match stream.next().await {
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => break e,
+            None => panic!("the stalled stream must end in an error"),
+        }
+    };
+
+    let summary = super::upstream_read_error(&error);
+    assert!(
+        summary.contains("timed out"),
+        "a stall must be named as a stall, got: {summary}"
+    );
+    assert!(
+        summary.contains("operation timed out"),
+        "the underlying timeout cause must survive, got: {summary}"
+    );
+    assert!(
+        !summary.contains("truncated"),
+        "a stall is not a truncation, got: {summary}"
+    );
 }
