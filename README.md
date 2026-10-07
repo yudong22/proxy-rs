@@ -298,7 +298,14 @@ src/                       # 代理核心库 crate: proxy_rs（纯 Rust，无 GU
     pipeline.rs            #   Layer 2a：请求/响应体结构装配与策略执行
     stream.rs              #   Layer 2b：Anthropic SSE 状态机与事件组帧
     responses.rs           #   Layer 2b：OpenAI Responses SSE 事件转换器
-  proxy.rs                 # Layer 3：HTTP Handler、多上游故障转移、SSE 组帧
+  proxy.rs                 # Layer 3：HTTP Handler、多上游故障转移、SSE 组帧（模块根）
+  proxy/                   #   同模块按领域拆分（仅文件布局变化，路径经 re-export 保持不变）
+    auth_resolvers.rs      #     调用方身份：请求带了哪个 API Key
+    auth_headers.rs        #     上游鉴权与 CLI 指纹头（登录态绝不复用 x-api-key）
+    failover.rs            #     何时离开默认身份 + failover 短记忆
+    upstream_errors.rs     #     上游错误的分类、描述与降级重试
+    sse.rs                 #     SSE 组帧、请求日志台账与 TTFT / 速度统计
+    tests.rs               #     上述内容与 handler 的单元测试
   router.rs                # Layer 3：路由定义（系统所有路由的唯一注册点）
   service.rs               # Layer 3：后台服务控制器与启停生命周期
   config.rs                # Layer 3：配置合并与环境变数加载

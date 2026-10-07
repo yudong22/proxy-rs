@@ -1767,38 +1767,57 @@ pub async fn fetch_points_for_key(client: &reqwest::Client, key: &ApiKeyEntry) -
 /// which is why the overview's 剩余积分 card showed "—" whenever the identity in
 /// force was a key: the value was never fetched, not genuinely unknown.
 pub async fn refresh_all_points(client: &reqwest::Client) -> PointsReport {
-    let items = load_credentials();
     let mut results = Vec::new();
-    for cred in items.iter().filter(|c| c.enabled) {
-        let points = fetch_points(client, cred).await;
-        // Persist even on failure: a failed refresh clears a stale figure
-        // rather than leaving a number the account no longer has.
-        let _ = set_points(&cred.id, points);
-        results.push(PointsResult {
-            id: cred.id.clone(),
-            label: display_label(cred),
-            points,
-        });
+
+    for cred in load_credentials().into_iter().filter(|c| c.enabled) {
+        results.push(refresh_one_credential_points(client, &cred).await);
     }
 
-    // API keys hit the same billing endpoint with the raw key material, so
-    // their balances are readable too — previously they were skipped entirely,
-    // which is why the overview card read "—" whenever the identity in force
-    // was a key. Same persist-on-failure rule: a dead key clears its figure.
+    // API keys hit the same billing endpoint with the raw key material, so their
+    // balances are readable too — previously they were skipped entirely, which is
+    // why the overview card read "—" whenever the identity in force was a key.
+    // Same persist-on-failure rule: a dead key clears its figure.
     for key in load_api_keys().into_iter().filter(|k| k.enabled) {
-        let points = fetch_points_for_key(client, &key).await;
-        let _ = set_api_key_points(&key.id, points);
-        results.push(PointsResult {
-            id: key.id.clone(),
-            label: if key.label.is_empty() {
-                key.id.clone()
-            } else {
-                key.label
-            },
-            points,
-        });
+        results.push(refresh_one_key_points(client, &key).await);
     }
+
     PointsReport { results }
+}
+
+/// Query and persist one credential's balance.
+async fn refresh_one_credential_points(
+    client: &reqwest::Client,
+    cred: &WorkBuddyCredential,
+) -> PointsResult {
+    let points = fetch_points(client, cred).await;
+    // Persist even on failure: a failed refresh clears a stale figure rather than
+    // leaving a number the account no longer has.
+    let _ = set_points(&cred.id, points);
+    PointsResult {
+        id: cred.id.clone(),
+        label: display_label(cred),
+        points,
+    }
+}
+
+/// Query and persist one API key's balance. Same rule as above.
+async fn refresh_one_key_points(client: &reqwest::Client, key: &ApiKeyEntry) -> PointsResult {
+    let points = fetch_points_for_key(client, key).await;
+    let _ = set_api_key_points(&key.id, points);
+    PointsResult {
+        id: key.id.clone(),
+        label: key_display_label(key),
+        points,
+    }
+}
+
+/// The name to show for an API key: its label, or the id when unlabelled.
+fn key_display_label(key: &ApiKeyEntry) -> String {
+    if key.label.is_empty() {
+        key.id.clone()
+    } else {
+        key.label.clone()
+    }
 }
 
 /// One account's refreshed point balance.
@@ -1826,27 +1845,11 @@ pub struct PointsResult {
 /// "账号不存在" instead of reporting a fictional success.
 pub async fn refresh_one_points(client: &reqwest::Client, id: &str) -> Option<PointsResult> {
     if let Some(cred) = load_credentials().into_iter().find(|c| c.id == id) {
-        let points = fetch_points(client, &cred).await;
-        let _ = set_points(&cred.id, points);
-        return Some(PointsResult {
-            id: cred.id.clone(),
-            label: display_label(&cred),
-            points,
-        });
+        return Some(refresh_one_credential_points(client, &cred).await);
     }
 
     if let Some(key) = load_api_keys().into_iter().find(|k| k.id == id) {
-        let points = fetch_points_for_key(client, &key).await;
-        let _ = set_api_key_points(&key.id, points);
-        return Some(PointsResult {
-            id: key.id.clone(),
-            label: if key.label.is_empty() {
-                key.id.clone()
-            } else {
-                key.label.clone()
-            },
-            points,
-        });
+        return Some(refresh_one_key_points(client, &key).await);
     }
 
     None
@@ -1882,53 +1885,68 @@ pub struct RefreshReport {
     pub details: Vec<RefreshResult>,
 }
 
-/// Renew every enabled account's access token, once.
+/// Renew the access token of one credential and describe the outcome.
 ///
-/// The GUI's 全量刷新登录态 button, and what the background scanner calls when it
-/// finds credentials due for renewal. Sequential on purpose: a handful of
-/// accounts, and hammering the refresh endpoint in parallel is exactly the
-/// pattern that gets a session flagged.
+/// The single place the per-account refresh is performed, shared by the manual
+/// pool-wide refresh and the background scanner. They differ only in *which*
+/// credentials they consider, and keeping the outcome logic (including the
+/// `needs_relogin` classification, which the GUI shows to the user) in one
+/// function is what stops the two paths from disagreeing about which accounts
+/// need a fresh login.
 ///
-/// A failure never aborts the run — each account is independent, and one dead
-/// refresh token must not stop the others from being renewed.
-pub async fn refresh_all_credentials(client: &reqwest::Client) -> RefreshReport {
-    let items = load_credentials();
-    let mut details = Vec::new();
-
-    for cred in items.iter().filter(|c| c.enabled) {
-        let endpoint = auth_endpoint_for(cred);
-        let mut fresh = cred.clone();
-        let result = match refresh_credential(client, &endpoint, &mut fresh).await {
-            Ok(()) => RefreshResult {
-                id: fresh.id.clone(),
-                label: display_label(&fresh),
-                refreshed: true,
-                error: String::new(),
-                needs_relogin: false,
-            },
-            Err(e) => {
-                let msg = e.to_string();
-                // A missing refresh token, or the endpoint refusing ours, are
-                // both "only a new login fixes this". Anything else (network
-                // blip, 5xx) is retryable and must not be labelled relogin.
-                let needs_relogin = cred.refresh_token.is_none()
-                    || msg.contains("refreshToken")
-                    || msg.contains("401")
-                    || msg.contains("403");
-                // Persist the reason so the list can show it without re-probing.
-                let mut marked = cred.clone();
-                marked.last_error = msg.clone();
-                let _ = upsert_credential(marked);
-                RefreshResult {
-                    id: cred.id.clone(),
-                    label: display_label(cred),
-                    refreshed: false,
-                    error: msg,
-                    needs_relogin,
-                }
+/// On success the renewed credential has already been written back to the store
+/// by [`refresh_credential`]. On failure the reason is persisted so the list can
+/// show it without re-probing.
+async fn refresh_one_credential(
+    client: &reqwest::Client,
+    cred: &WorkBuddyCredential,
+) -> RefreshResult {
+    let endpoint = auth_endpoint_for(cred);
+    let mut fresh = cred.clone();
+    match refresh_credential(client, &endpoint, &mut fresh).await {
+        Ok(()) => RefreshResult {
+            id: fresh.id.clone(),
+            label: display_label(&fresh),
+            refreshed: true,
+            error: String::new(),
+            needs_relogin: false,
+        },
+        Err(e) => {
+            let msg = e.to_string();
+            // A missing refresh token, or the endpoint refusing ours, are both
+            // "only a new login fixes this". Anything else (network blip, 5xx)
+            // is retryable and must not be labelled relogin.
+            let needs_relogin = cred.refresh_token.is_none()
+                || msg.contains("refreshToken")
+                || msg.contains("401")
+                || msg.contains("403");
+            let mut marked = cred.clone();
+            marked.last_error = msg.clone();
+            let _ = upsert_credential(marked);
+            RefreshResult {
+                id: cred.id.clone(),
+                label: display_label(cred),
+                refreshed: false,
+                error: msg,
+                needs_relogin,
             }
-        };
-        details.push(result);
+        }
+    }
+}
+
+/// Renew every credential in `candidates`, sequentially, and summarise.
+///
+/// Sequential on purpose: a handful of accounts, and hammering the refresh
+/// endpoint in parallel is exactly the pattern that gets a session flagged. A
+/// failure never aborts the run — each account is independent, and one dead
+/// refresh token must not stop the others from being renewed.
+async fn refresh_candidates(
+    client: &reqwest::Client,
+    candidates: Vec<WorkBuddyCredential>,
+) -> RefreshReport {
+    let mut details = Vec::with_capacity(candidates.len());
+    for cred in &candidates {
+        details.push(refresh_one_credential(client, cred).await);
     }
 
     let refreshed = details.iter().filter(|d| d.refreshed).count();
@@ -1942,70 +1960,28 @@ pub async fn refresh_all_credentials(client: &reqwest::Client) -> RefreshReport 
     }
 }
 
+/// Renew every enabled account's access token, once.
+///
+/// The GUI's 全量刷新登录态 button.
+pub async fn refresh_all_credentials(client: &reqwest::Client) -> RefreshReport {
+    let candidates: Vec<WorkBuddyCredential> = load_credentials()
+        .into_iter()
+        .filter(|c| c.enabled)
+        .collect();
+    refresh_candidates(client, candidates).await
+}
+
 /// Renew only the accounts whose token is due, and report what happened.
 ///
-/// Used by the background scanner. Returns an empty report when nothing needed
-/// attention, so an idle app performs no requests at all.
+/// Used by the background scanner. Performs no requests at all when nothing is
+/// due, which is what keeps an idle app silent.
 pub async fn refresh_due_credentials(client: &reqwest::Client) -> RefreshReport {
     let now = crate::util::unix_millis();
-    let items = load_credentials();
-    let due: Vec<WorkBuddyCredential> = items
+    let candidates: Vec<WorkBuddyCredential> = load_credentials()
         .into_iter()
         .filter(|c| c.enabled && c.needs_refresh(now))
         .collect();
-
-    if due.is_empty() {
-        return RefreshReport {
-            total: 0,
-            refreshed: 0,
-            failed: 0,
-            needs_relogin: 0,
-            details: Vec::new(),
-        };
-    }
-
-    let mut details = Vec::new();
-    for cred in &due {
-        let endpoint = auth_endpoint_for(cred);
-        let mut fresh = cred.clone();
-        let result = match refresh_credential(client, &endpoint, &mut fresh).await {
-            Ok(()) => RefreshResult {
-                id: fresh.id.clone(),
-                label: display_label(&fresh),
-                refreshed: true,
-                error: String::new(),
-                needs_relogin: false,
-            },
-            Err(e) => {
-                let msg = e.to_string();
-                let needs_relogin = cred.refresh_token.is_none()
-                    || msg.contains("refreshToken")
-                    || msg.contains("401")
-                    || msg.contains("403");
-                let mut marked = cred.clone();
-                marked.last_error = msg.clone();
-                let _ = upsert_credential(marked);
-                RefreshResult {
-                    id: cred.id.clone(),
-                    label: display_label(cred),
-                    refreshed: false,
-                    error: msg,
-                    needs_relogin,
-                }
-            }
-        };
-        details.push(result);
-    }
-
-    let refreshed = details.iter().filter(|d| d.refreshed).count();
-    let needs_relogin = details.iter().filter(|d| d.needs_relogin).count();
-    RefreshReport {
-        total: details.len(),
-        refreshed,
-        failed: details.len() - refreshed,
-        needs_relogin,
-        details,
-    }
+    refresh_candidates(client, candidates).await
 }
 
 /// Result of a pool-wide points refresh.

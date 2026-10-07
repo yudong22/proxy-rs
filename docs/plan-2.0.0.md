@@ -398,7 +398,49 @@ pub fn write_bundle(path: &Path, text: &str) -> Result<()>;
 
 ### 已知问题（与本次改动无关，但值得另行处理）
 
-`cargo metadata` 显示 workspace 的 `workspace_default_members` **只含根 crate `proxy-rs`**，因此仓库根执行的 `cargo clippy --all-targets` / `cargo test`（也就是 CI 的 `.github/workflows/ci.yml`）**不会编译 `src-tauri`**。这意味着本次新增的 GUI 侧代码在 CI 上不会被检查——本地是靠显式 `cargo clippy -p proxy-rs-gui` 才发现的。修法是在根 `Cargo.toml` 的 `[workspace]` 里显式声明 `default-members = [".", "src-tauri"]`，或在 CI 中加一条 `-p proxy-rs-gui` 的命令；这会改变 CI 的构建范围与耗时，故未擅自改动。
+`cargo metadata` 显示 workspace 的 `workspace_default_members` **只含根 crate `proxy-rs`**，因此仓库根执行的 `cargo clippy --all-targets` / `cargo test`（也就是 CI 的 `.github/workflows/ci.yml`）**不会编译 `src-tauri`**。这意味着新增的 GUI 侧代码在 CI 上不会被检查——本地是靠显式 `cargo clippy -p proxy-rs-gui` 才发现的。修法是在根 `Cargo.toml` 的 `[workspace]` 里显式声明 `default-members = [".", "src-tauri"]`，或在 CI 中加一条 `-p proxy-rs-gui` 的命令；这会改变 CI 的构建范围与耗时，故未擅自改动。
+
+---
+
+## 12. 2.0.2：去重与 `proxy.rs` 拆分
+
+两件事，都不改变行为。
+
+### 12.1 消掉重复逻辑（`workbuddy_auth.rs`）
+
+`refresh_all_credentials` 与 `refresh_due_credentials` 有 **75% 逐行重复**（58 行里 44 行相同）：整段 `refresh_credential` 的 match、`needs_relogin` 判定、`upsert_credential(marked)` 与计数全被抄了两遍，两者只差**候选集**。风险不在行数，而在分叉：以后改 `needs_relogin` 的语义（例如区分 401 与 403）很可能只改一处，而两处都在向用户展示"哪些账号需要重新绑定"。
+
+现在抽出 `refresh_one_credential`（单账号结果）与 `refresh_candidates`（遍历 + 汇总），两个公开函数各自只负责选集合：50+61 行 → 7+8 行。
+
+同时发现积分路径同样重复（`refresh_all_points` / `refresh_one_points` 25/27 行里 12 行重合），一并抽成 `refresh_one_credential_points` / `refresh_one_key_points`，并把出现三次的密钥显示名逻辑收成 `key_display_label`。
+
+### 12.2 `proxy.rs` 按领域拆分
+
+`proxy.rs` 是仓库最大的文件（3306 行生产代码 + 2212 行测试，合计 5518）。Rust 的编译单元是 **crate 而非文件**（实测：`touch` 任一文件都会重编整个 crate），所以拆分**不改进编译速度**；拆它的唯一理由是**内聚性**——一个文件里同时装着三个 flavor 的 handler、多上游 failover、SSE 组帧、凭据切换与错误分类，改 A 领域要读 B 领域。
+
+拆成模块根 + 5 个领域文件：
+
+| 文件 | 生产行数 | 职责 |
+|---|---|---|
+| `proxy.rs`（模块根） | 2199 | 三个协议 handler、`forward_request`、统计落库 |
+| `proxy/auth_resolvers.rs` | 57 | 调用方身份（请求带的是哪个 key） |
+| `proxy/auth_headers.rs` | 140 | 上游鉴权 + CLI 指纹头 |
+| `proxy/failover.rs` | 191 | 何时离开默认身份 + failover 短记忆 |
+| `proxy/upstream_errors.rs` | 279 | 错误分类、描述、降级重试 |
+| `proxy/sse.rs` | 576 | SSE 组帧、请求日志台账、TTFT/速度 |
+| `proxy/tests.rs` | 2142（测试） | 全部既有单测 |
+
+**不改 API**：模块根 `pub(crate) use` 把拆分项按原名导出，因此既有的 `crate::proxy::X` 与测试里的 `super::X` 路径全部照旧解析。拆分是**文件布局变化**，不是接口变化。
+
+**正确性验证**（这一步比拆分本身更重要）：按拆分时施加的两个机械变换（生产区加 `pub(crate)`/`pub(super)` 前缀；测试区去掉 `mod tests {` 带来的 4 空格缩进）逐区还原后，与拆分前的 `HEAD` 版本比对：
+
+- `auth_resolvers` / `auth_headers` / `upstream_errors`：**逐字节相同**；
+- `failover` / `sse`：仅差 2 个为测试可读而加的 `pub(crate)` 字段标记；
+- `tests`：去掉空白与 rustfmt 合并行导致的尾逗号后**完全一致**；
+- 测试数量 18 `#[test]` + 30 `#[tokio::test]` = **48**，拆分前后一致；`cargo test` 428 通过，与拆分前同数。
+
+拆分过程中被编译器与 clippy 各拦下一次真实问题，值得记录：`blocking_save_file` 式的隐藏坑没有出现，但（a）`tests.rs` 起初仍包着 `mod tests { … }`，使它变成 `proxy::tests::tests`、`super::` 指向错层（44 个错误），（b）两个 `pub(crate)` 函数暴露了私有 `ApiFlavor`，clippy 直接拦下——后者正是"拆分时顺手放宽可见性"的典型代价，最终把这两个函数收窄为 `pub(super)`。
+
 
 
 
