@@ -703,6 +703,16 @@ fn switchable_error_covers_401_402_403_429_and_quota_codes() {
         200,
         r#"{"code":11105,"message":"quota exhausted"}"#
     ));
+    // The CodeBuddy envelope the gateway actually used on 2026-10-08, where the
+    // code is nested under `error.data` instead of the top level.
+    assert!(super::is_switchable_error(
+        200,
+        r#"{"error":{"data":{"code":14018,"msg":"额度已用尽"}}}"#
+    ));
+    assert!(super::is_switchable_error(
+        429,
+        r#"{"error":{"data":{"code":14018,"msg":"额度已用尽"}}}"#
+    ));
 
     assert!(!super::is_switchable_error(500, "internal server error"));
     assert!(!super::is_switchable_error(400, "bad request"));
@@ -2273,7 +2283,11 @@ async fn a_truncated_stream_records_the_real_cause() {
         .unwrap()
         .items;
     assert_eq!(rows.len(), 1, "one truncated stream is one row: {rows:?}");
-    assert_eq!(rows[0].status, 500, "a failed stream row is a 500");
+    assert_eq!(
+        rows[0].status, 502,
+        "a failed stream row records the upstream fault as 502, not 500: the \
+         client already received HTTP 200 plus an error frame"
+    );
 
     let error = rows[0].error.as_deref().unwrap_or_default();
     assert!(

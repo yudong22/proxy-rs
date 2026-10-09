@@ -179,10 +179,24 @@ pub(crate) fn is_switchable_error(status: u16, body: &str) -> bool {
 }
 
 /// WorkBuddy business codes that signal quota/rate exhaustion for this account.
+///
+/// Matched as bare substrings because the gateway wraps them inconsistently
+/// (`{"code":14018,…}` on the top level, `{"error":{"data":{"code":14018,…}}}`
+/// for the CodeBuddy-flavored envelope), and decoding the envelope here would
+/// duplicate knowledge the caller already has as raw text.
+///
+/// `14018` is the quota-exhausted code the gateway actually returned on
+/// 2026-10-08 (`额度已用尽`). It arrives wrapped in a 429 whose plain status is
+/// also switchable, so this does not change whether a switch happens — it makes
+/// the quota signal itself legible, instead of an exhausted account reading as a
+/// generic rate limit.
 pub(crate) fn is_quota_business_code(body: &str) -> bool {
-    // 11105: quota exhausted; 11106: rate/frequency limited. Kept alongside
-    // the status classes so a 200-wrapped business error still switches.
-    body.contains("11105") || body.contains("11106")
+    // 11105: quota exhausted; 11106: rate/frequency limited; 14018: 额度已用尽.
+    // Kept alongside the status classes so a 200-wrapped business error still
+    // switches. 6004 (frequency limit with a reset timestamp) is deliberately
+    // NOT listed: it is the same rate-limit class as 11106 and already covered
+    // by the 429 status.
+    body.contains("11105") || body.contains("11106") || body.contains("14018")
 }
 
 pub(crate) fn is_retriable_status(status: u16) -> bool {

@@ -39,7 +39,7 @@ pub(crate) struct StreamLedger {
     tokens: TokenRecord,
     /// TTFT / model span / tool-turn facts, folded from parsed chunks.
     timing: TimingTracker,
-    /// Set when the upstream stream failed; turns the row's status into a 500.
+    /// Set when the upstream stream failed; turns the row's status into a 502.
     error: Option<String>,
     /// Exception-override fields for the row (see [`OverrideTrace`]).
     override_key: String,
@@ -87,7 +87,16 @@ impl StreamLedger {
 
 impl Drop for StreamLedger {
     fn drop(&mut self) {
-        let status = if self.error.is_some() { 500 } else { 200 };
+        // A failed stream is an **upstream** fault, so the row records the same
+        // 502 `ProxyError::Http`/`ProxyError::Upstream` map to (see
+        // `ProxyError::status`). It used to record 500, which said "this server
+        // broke" about a truncation or reset that happened upstream — and since
+        // the client had already received HTTP 200 plus an error frame, the 500
+        // was never the status of a real response either. That left the GUI's
+        // error filter showing red 5xx rows whose cause the row itself named as
+        // upstream, which is exactly what sent the 2026-10-07 investigation to
+        // the wrong place.
+        let status = if self.error.is_some() { 502 } else { 200 };
         record_stats_row(
             &self.stats,
             RequestOutcome {
