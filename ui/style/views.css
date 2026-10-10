@@ -233,6 +233,23 @@ details.form-section[open] > summary {
   color: var(--accent);
 }
 
+/* Per-model 积分 ratio and free badge rendered next to the model id in the
+   picker. The ratio is dimmed so the id stays the focal point; the badge is
+   tinted to read as "free". */
+.model-chip small {
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.model-chip small.ratio {
+  color: var(--accent);
+}
+
+.model-chip small.badge {
+  color: var(--ok, #2fae66);
+  font-weight: 600;
+}
+
 .settings-save-bar {
   display: flex;
   align-items: center;

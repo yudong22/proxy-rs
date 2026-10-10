@@ -1372,9 +1372,22 @@ async fn forward_request(
                             };
                             match replacement {
                                 Some(next) => {
-                                    // Park the failing credential for the full
-                                    // cooldown — we have somewhere else to go.
-                                    pool.mark_limited(&from, 60_000).await;
+                                    // Park the failing credential while the
+                                    // session moves to a replacement. A daily
+                                    // quota-exhausted account (WorkBuddy business
+                                    // codes 14018/11105/11106) is sidelined until
+                                    // the next local midnight — its quota window
+                                    // resets then, not in 60 s — so the pool
+                                    // round-robins to the next healthy account
+                                    // instead of re-picking the exhausted one
+                                    // every minute. Any other switchable error
+                                    // keeps the ordinary 60 s cooldown.
+                                    let cooldown = if is_quota_business_code(&body) {
+                                        crate::util::ms_until_local_midnight(60_000)
+                                    } else {
+                                        60_000
+                                    };
+                                    pool.mark_limited(&from, cooldown).await;
                                     gui_logs
                                         .push(
                                             "WARN",
@@ -2204,17 +2217,31 @@ async fn list_models_via_config(
         .await
         .map_err(|e| ProxyError::Upstream(e.to_string()))?;
 
+    let mut data: Vec<_> = models
+        .into_iter()
+        .map(|m| openai::ModelInfo {
+            id: m.id,
+            object: Some("model".to_string()),
+            created: None,
+            owned_by: None,
+        })
+        .collect();
+
+    // Advertise the virtual `free` model so clients can pin to it. It is not a
+    // real upstream id (the gateway resolves it per request), so expose it only
+    // once and only when the catalog would not already contain it.
+    if !data.iter().any(|m| m.id == pipeline::FREE_MODEL_NAME) {
+        data.push(openai::ModelInfo {
+            id: pipeline::FREE_MODEL_NAME.to_string(),
+            object: Some("model".to_string()),
+            created: None,
+            owned_by: Some("proxy-free".to_string()),
+        });
+    }
+
     let openai_resp = openai::ModelsListResponse {
         object: Some("list".to_string()),
-        data: models
-            .into_iter()
-            .map(|m| openai::ModelInfo {
-                id: m.id,
-                object: Some("model".to_string()),
-                created: None,
-                owned_by: None,
-            })
-            .collect(),
+        data,
     };
 
     gui_logs

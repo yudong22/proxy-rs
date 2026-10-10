@@ -190,7 +190,7 @@ pub fn translate_response(
 }
 
 pub fn translate_models_list(resp: openai::ModelsListResponse) -> anthropic::ModelsListResponse {
-    let data: Vec<_> = resp
+    let mut data: Vec<_> = resp
         .data
         .into_iter()
         .map(|model| anthropic::ModelInfo {
@@ -200,6 +200,18 @@ pub fn translate_models_list(resp: openai::ModelsListResponse) -> anthropic::Mod
             model_type: "model".to_string(),
         })
         .collect();
+
+    // Advertise the virtual `free` model so clients can pin to it. It is not a
+    // real upstream id (the gateway resolves it per request), so expose it only
+    // once and only when the catalog would not already contain it.
+    if !data.iter().any(|m| m.id == FREE_MODEL_NAME) {
+        data.push(anthropic::ModelInfo {
+            created_at: "1970-01-01T00:00:00Z".to_string(),
+            display_name: FREE_MODEL_NAME.to_string(),
+            id: FREE_MODEL_NAME.to_string(),
+            model_type: "model".to_string(),
+        });
+    }
 
     let first_id = data.first().map(|m| m.id.clone());
     let last_id = data.last().map(|m| m.id.clone());
@@ -227,11 +239,83 @@ pub fn translate_models_list(resp: openai::ModelsListResponse) -> anthropic::Mod
 /// to override what the client sends. Note `model_map` is consulted *after*
 /// that override, so a mapping keyed on the client's model name does not apply
 /// once a configured model has taken its place.
+/// The virtual model name that the gateway routes to a free upstream node.
+///
+/// Clients ask for `free`; the gateway resolves it to `hy3` during the day and
+/// `hy4-preview` at night (local 23:00–08:00, when `hy4-preview` is free), and
+/// lets the existing credential pool round-robin accounts when one is
+/// daily-exhausted. This is the single name clients should pin to.
+pub const FREE_MODEL_NAME: &str = "free";
+
+/// Resolve the virtual `free` model to its concrete upstream node.
+///
+/// Daytime (local hour 08:00–22:59) → the day free node (`hy3`); night
+/// (local 23:00–07:59) → the night free node (`hy4-preview`). The night window
+/// and node names are overridable through the env vars below so the schedule or
+/// nodes can be retuned without a rebuild:
+///
+/// * `PROXY_FREE_DAY_MODEL`   (default `hy3`)
+/// * `PROXY_FREE_NIGHT_MODEL` (default `hy4-preview`)
+/// * `PROXY_FREE_NIGHT_START` (default `23`, inclusive)
+/// * `PROXY_FREE_NIGHT_END`   (default `8`, exclusive)
+pub(crate) fn resolve_free_model() -> String {
+    let day_model =
+        std::env::var("PROXY_FREE_DAY_MODEL").unwrap_or_else(|_| "hy3".to_string());
+    let night_model =
+        std::env::var("PROXY_FREE_NIGHT_MODEL").unwrap_or_else(|_| "hy4-preview".to_string());
+    let start: i32 = std::env::var("PROXY_FREE_NIGHT_START")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(23);
+    let end: i32 = std::env::var("PROXY_FREE_NIGHT_END")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(8);
+
+    if is_night(start, end) {
+        night_model
+    } else {
+        day_model
+    }
+}
+
+/// Whether a given local `hour` (0–23) falls inside the night window
+/// `[start, end)`, wrapping past midnight when `start > end`.
+///
+/// Kept pure (no clock access) so it can be unit-tested deterministically.
+/// `resolve_free_model` feeds it the current local hour.
+pub(crate) fn is_night_hour(hour: i32, start: i32, end: i32) -> bool {
+    if start <= end {
+        // Non-wrapping window, e.g. 0–8.
+        hour >= start && hour < end
+    } else {
+        // Wrapping window, e.g. 23–8 → night if hour >= 23 OR hour < 8.
+        hour >= start || hour < end
+    }
+}
+
+/// Whether the local clock is currently inside the night window
+/// `[start, end)` expressed in local hours (0–23), wrapping past midnight.
+fn is_night(start: i32, end: i32) -> bool {
+    let offset_secs = crate::util::local_utc_offset_secs();
+    let local_ms = crate::util::unix_millis() + offset_secs * 1_000;
+    let secs_of_day = ((local_ms / 1_000) % 86_400 + 86_400) % 86_400;
+    let hour = (secs_of_day / 3_600) as i32;
+    is_night_hour(hour, start, end)
+}
+
 pub(crate) fn resolve_upstream_model(
     client_model: &str,
     configured_model: Option<&String>,
     policy: &TranslationPolicy,
 ) -> String {
+    // Virtual `free` model: routed by the local clock before any configured
+    // override or `model_map`, so a request for `free` always lands on the
+    // current free node regardless of the configured reasoning/completion model.
+    if client_model == FREE_MODEL_NAME {
+        return resolve_free_model();
+    }
+
     let model = configured_model
         .cloned()
         .unwrap_or_else(|| client_model.to_string());
@@ -562,6 +646,37 @@ mod tests {
 
         let on = policy_with(None, None, &[], true);
         assert_eq!(resolve_upstream_model("m[1M]", None, &on), "m");
+    }
+
+    // ---- virtual `free` model -------------------------------------------------
+
+    #[test]
+    fn free_model_resolves_to_a_concrete_node_never_itself() {
+        // `free` is virtual: it must be rewritten to a real upstream node
+        // (hy3 by day, hy4-preview by night) and must never reach upstream
+        // verbatim, regardless of any configured override.
+        let p = default_policy();
+        let resolved = resolve_upstream_model(FREE_MODEL_NAME, Some(&"override".to_string()), &p);
+        assert_ne!(resolved, FREE_MODEL_NAME);
+        assert_eq!(resolved, resolve_free_model());
+    }
+
+    #[test]
+    fn night_window_wraps_past_midnight() {
+        // Default free schedule: local 23:00–08:00.
+        assert!(is_night_hour(23, 23, 8));
+        assert!(is_night_hour(0, 23, 8));
+        assert!(is_night_hour(7, 23, 8));
+        assert!(!is_night_hour(8, 23, 8));
+        assert!(!is_night_hour(22, 23, 8));
+        assert!(!is_night_hour(12, 23, 8));
+    }
+
+    #[test]
+    fn non_wrapping_window() {
+        assert!(is_night_hour(2, 0, 8));
+        assert!(!is_night_hour(8, 0, 8));
+        assert!(!is_night_hour(23, 0, 8));
     }
 
     fn req_with_model(model: &str, extra: Value) -> anthropic::AnthropicRequest {
@@ -1337,7 +1452,8 @@ mod tests {
 
         let result = translate_models_list(response);
         assert_eq!(result.first_id.as_deref(), Some("gpt-4o-mini"));
-        assert_eq!(result.last_id.as_deref(), Some("gpt-5-chat"));
+        // The virtual `free` model is appended after the upstream catalog.
+        assert_eq!(result.last_id.as_deref(), Some(FREE_MODEL_NAME));
         assert!(!result.has_more);
     }
 
@@ -1348,7 +1464,9 @@ mod tests {
             data: vec![],
         };
         let result = translate_models_list(response);
-        assert!(result.data.is_empty());
-        assert!(result.first_id.is_none());
+        // Even an empty upstream catalog advertises the virtual `free` model.
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].id, FREE_MODEL_NAME);
+        assert_eq!(result.first_id.as_deref(), Some(FREE_MODEL_NAME));
     }
 }

@@ -47,6 +47,22 @@ export async function saveSettings() {
   }
 }
 
+/**
+ * Build a model chip's inner label: id, optional name, the per-model 积分 ratio
+ * (e.g. `×0.29`) and an upstream free badge (e.g. `夜间免费`). Free / zero-ratio
+ * models read as `×0` so the cost is obvious at a glance.
+ *
+ * `html`/`raw` are the caller-provided render helpers (imported from their
+ * module); passing them in keeps this pure rather than reaching into globals.
+ */
+export function modelChipLabel(m, { html, raw }) {
+  const ratio = m.points_ratio;
+  const ratioTxt = ratio == null ? '' : ` <small class="ratio">×${Number(ratio).toFixed(2)}</small>`;
+  const badge = m.free_badge ? ` <small class="badge">${m.free_badge}</small>` : '';
+  const nameTxt = m.name && m.name !== m.id ? ` <small>(${m.name})</small>` : '';
+  return raw(`${m.id}${nameTxt}${ratioTxt}${badge}`);
+}
+
 /** Fetch the provider's model list and offer each as a clickable chip. */
 export async function fetchModels() {
   const container = $('#models-container');
@@ -56,7 +72,7 @@ export async function fetchModels() {
     if (res?.models?.length) {
       container.innerHTML = res.models.map(m => html`
         <span class="model-chip" title="点击填入主模型" data-model="${m.id}">${
-          raw(`${m.id}${m.name ? ` <small>(${m.name})</small>` : ''}`)
+          modelChipLabel(m, { html, raw })
         }</span>`).join('');
 
       for (const chip of container.querySelectorAll('.model-chip')) {

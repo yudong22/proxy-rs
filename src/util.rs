@@ -419,6 +419,22 @@ pub fn unix_millis() -> i64 {
         .as_millis() as i64
 }
 
+/// Milliseconds remaining until the next local midnight, in the machine's
+/// timezone (or `PROXY_TZ_OFFSET_HOURS`).
+///
+/// Used to park a credential whose *daily* quota is exhausted: rather than a
+/// short cooldown that lets the pool re-pick it a minute later, it is sidelined
+/// until the quota window resets. Always at least `min_ms` so a call right at
+/// midnight does not park for a negative/zero duration.
+pub fn ms_until_local_midnight(min_ms: i64) -> i64 {
+    let offset_secs = local_utc_offset_secs();
+    let local_ms = unix_millis() + offset_secs * 1_000;
+    // Milliseconds into the current local day.
+    let into_day = ((local_ms % 86_400_000) + 86_400_000) % 86_400_000;
+    let remaining = 86_400_000 - into_day;
+    remaining.max(min_ms)
+}
+
 /// Format the current instant as a local `YYYY-MM-DD HH:MM:SS.mmm` string.
 ///
 /// This is the single timestamp source for log lines and stats rows, so both
@@ -680,5 +696,16 @@ mod tests {
 
         assert_eq!(peeked.error, Some(BodyError::TooLarge { limit: 128 }));
         assert!(peeked.json.is_none(), "an unbuffered body cannot be parsed");
+    }
+
+    #[test]
+    fn ms_until_local_midnight_is_positive_and_bounded_by_a_day() {
+        // Whatever the local clock says, the wait to the next local midnight is
+        // strictly positive and never more than a day. The floor keeps a call at
+        // exactly midnight from parking for a non-positive duration.
+        let wait = ms_until_local_midnight(1_000);
+        assert!(wait > 0, "must be positive: {wait}");
+        assert!(wait <= 86_400_000, "cannot exceed a day: {wait}");
+        assert!(wait >= 1_000, "honours the floor");
     }
 }

@@ -183,7 +183,7 @@ pub fn credentials_path() -> Option<PathBuf> {
 }
 
 /// One model entry to write.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DshModel {
     pub id: String,
     pub name: Option<String>,
@@ -195,6 +195,11 @@ pub struct DshModel {
     /// `true` declares reasoning levels; `None` omits the key, which leaves the
     /// model without an Effort menu rather than inventing capability.
     pub supports_reasoning: Option<bool>,
+    /// Per-model 积分 consumption ratio (`×0.29`). `None` omits it; `Some(0.0)`
+    /// is a free model.
+    pub points_ratio: Option<f64>,
+    /// Upstream free badge (e.g. `夜间免费`); `None` when not free.
+    pub free_badge: Option<String>,
 }
 
 /// What the UI reports about the current wiring.
@@ -216,13 +221,24 @@ pub struct DshState {
 /// pi-ai's profile uses `camelCase` — so the mapping is explicit here rather
 /// than delegated to a rename attribute on either side.
 pub fn to_dsh_model(m: &crate::providers::GuiModel) -> DshModel {
+    // DSH shows the model by its `name`; append the 积分 ratio and free badge so
+    // the user sees the relative cost next to the model in the DSH picker.
+    let name = match (&m.name, m.points_ratio, &m.free_badge) {
+        (Some(n), Some(r), Some(b)) => Some(format!("{} (×{:.2} {})", n, r, b)),
+        (Some(n), Some(r), None) => Some(format!("{} (×{:.2})", n, r)),
+        (Some(n), None, Some(b)) => Some(format!("{} ({})", n, b)),
+        (Some(n), None, None) => Some(n.clone()),
+        (None, _, _) => None,
+    };
     DshModel {
         id: m.id.clone(),
-        name: m.name.clone(),
+        name,
         context_window: m.context_window,
         max_tokens: m.max_output_tokens,
         supports_images: m.supports_images,
         supports_reasoning: m.supports_reasoning,
+        points_ratio: m.points_ratio,
+        free_badge: m.free_badge.clone(),
     }
 }
 
@@ -1070,6 +1086,8 @@ agent-default-model:
             max_tokens: None,
             supports_images: None,
             supports_reasoning: None,
+            points_ratio: None,
+            free_badge: None,
         }
     }
 
@@ -1174,6 +1192,8 @@ agent-default-model:
             max_tokens: Some(128_000),
             supports_images: Some(true),
             supports_reasoning: Some(true),
+            points_ratio: None,
+            free_badge: None,
         };
         let out = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[m]).unwrap();
         assert!(out.contains("- id: deepseek-v4.1-flash"));
@@ -1196,6 +1216,37 @@ agent-default-model:
     #[test]
     fn upsert_refuses_an_empty_model_list() {
         assert!(upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[]).is_err());
+    }
+
+    #[test]
+    fn to_dsh_model_appends_ratio_and_badge_to_name() {
+        // Free node with a badge: `Hy3 (×0.00 限时免费)`.
+        let free = crate::providers::GuiModel {
+            id: "hy3".into(),
+            name: Some("Hy3".into()),
+            context_window: Some(200_000),
+            max_output_tokens: Some(8_192),
+            supports_images: Some(true),
+            supports_reasoning: None,
+            points_ratio: Some(0.0),
+            free_badge: Some("限时免费".into()),
+        };
+        let d = to_dsh_model(&free);
+        assert_eq!(d.name.as_deref(), Some("Hy3 (×0.00 限时免费)"));
+
+        // Paid model: `Hy4 preview (×0.29)`.
+        let paid = crate::providers::GuiModel {
+            id: "hy4-preview".into(),
+            name: Some("Hy4 preview".into()),
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_768),
+            supports_images: Some(true),
+            supports_reasoning: Some(true),
+            points_ratio: Some(0.29),
+            free_badge: None,
+        };
+        let d2 = to_dsh_model(&paid);
+        assert_eq!(d2.name.as_deref(), Some("Hy4 preview (×0.29)"));
     }
 
     #[test]

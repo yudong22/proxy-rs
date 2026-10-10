@@ -112,13 +112,58 @@ const REASONING_LEVELS: [(&str, &str); 4] = [
     ("xhigh", "Extra high reasoning depth for complex problems"),
 ];
 
+/// Human label for a model: `name (id) ×ratio badge` when extras are present,
+/// otherwise just the id. The ratio is the upstream 积分 consumption multiplier
+/// (`points_ratio`); `Some(0.0)` means free. Used by `build_model` so the Codex
+/// picker shows the relative cost next to the model name. The id is wrapped in
+/// parentheses only when a distinct display name is present, and that paren is
+/// always closed before the ratio/badge are appended.
+fn model_label(id: &str, name: Option<&str>, points_ratio: Option<f64>, free_badge: Option<&str>) -> String {
+    let mut label = String::new();
+    let mut paren_open = false;
+    match name {
+        Some(n) if !n.is_empty() && n != id => {
+            label.push_str(n);
+            label.push_str(" (");
+            label.push_str(id);
+            paren_open = true;
+        }
+        _ => label.push_str(id),
+    }
+    let close_paren = |label: &mut String, paren_open: &mut bool| {
+        if *paren_open {
+            label.push(')');
+            *paren_open = false;
+        }
+    };
+    if let Some(r) = points_ratio {
+        close_paren(&mut label, &mut paren_open);
+        label.push_str(&format!(" ×{:.2}", r));
+    }
+    if let Some(b) = free_badge {
+        if !b.is_empty() {
+            close_paren(&mut label, &mut paren_open);
+            label.push_str(&format!(" {}", b));
+        }
+    }
+    close_paren(&mut label, &mut paren_open);
+    label
+}
+
 /// Build one catalog entry for a provider model id.
-fn build_model(id: &str, name: Option<&str>, context_window: Option<u64>) -> CatalogModel {
+fn build_model(
+    id: &str,
+    name: Option<&str>,
+    context_window: Option<u64>,
+    points_ratio: Option<f64>,
+    free_badge: Option<&str>,
+) -> CatalogModel {
     let ctx = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW).max(1);
+    let display_name = model_label(id, name, points_ratio, free_badge);
     CatalogModel {
         slug: id.to_string(),
-        display_name: name.unwrap_or(id).to_string(),
-        description: format!("{} via proxy-rs", name.unwrap_or(id)),
+        display_name: display_name.clone(),
+        description: format!("{} via proxy-rs", display_name),
         // Codex requires instructions per model; the generic Codex prompt is the
         // safe default for third-party models.
         base_instructions: "You are Codex, a coding agent. You and the user share the same \
@@ -172,7 +217,15 @@ fn build_model(id: &str, name: Option<&str>, context_window: Option<u64>) -> Cat
 pub fn render_catalog(models: &[crate::providers::GuiModel]) -> Result<String> {
     let entries = models
         .iter()
-        .map(|m| build_model(&m.id, m.name.as_deref(), m.context_window))
+        .map(|m| {
+            build_model(
+                &m.id,
+                m.name.as_deref(),
+                m.context_window,
+                m.points_ratio,
+                m.free_badge.as_deref(),
+            )
+        })
         .collect();
     serde_json::to_string_pretty(&Catalog { models: entries })
         .context("failed to serialize Codex model catalog")
@@ -346,6 +399,8 @@ mod tests {
             max_output_tokens: None,
             supports_images: None,
             supports_reasoning: None,
+            points_ratio: None,
+            free_badge: None,
         }
     }
 
@@ -400,6 +455,29 @@ mod tests {
     fn display_name_falls_back_to_id() {
         let json = render_catalog(&[model("hy3")]).unwrap();
         assert!(json.contains("\"display_name\": \"hy3\""));
+    }
+
+    #[test]
+    fn display_name_carries_ratio_and_badge() {
+        let mut m = model("hy4-preview");
+        m.name = Some("Hy4 preview".into());
+        m.points_ratio = Some(0.29);
+        m.free_badge = Some("夜间免费".into());
+        let json = render_catalog(&[m]).unwrap();
+        // `Hy4 preview (hy4-preview ×0.29 夜间免费)` — cost shows next to name.
+        assert!(json.contains("×0.29"));
+        assert!(json.contains("夜间免费"));
+        assert!(json.contains("Hy4 preview (hy4-preview"));
+    }
+
+    #[test]
+    fn free_model_renders_as_zero_ratio() {
+        let mut m = model("free");
+        m.name = None;
+        m.points_ratio = Some(0.0);
+        m.free_badge = Some("免费".into());
+        let json = render_catalog(&[m]).unwrap();
+        assert!(json.contains("\"display_name\": \"free ×0.00 免费\""));
     }
 
     #[test]
