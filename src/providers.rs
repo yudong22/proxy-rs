@@ -235,10 +235,14 @@ pub async fn fetch_models(
         models.push(GuiModel {
             id: crate::translate::pipeline::FREE_MODEL_NAME.to_string(),
             name: None,
-            context_window: None,
-            max_output_tokens: None,
-            supports_images: None,
-            supports_reasoning: None,
+            // Serve conservative defaults that hold for either upstream the
+            // gateway may resolve `free` to at request time: the day node `hy3`
+            // is the smaller of the two (192K in / 64K out, reasoning-only, image
+            // capable), so picking it keeps the model usable around the clock.
+            context_window: Some(192_000),
+            max_output_tokens: Some(64_000),
+            supports_images: Some(true),
+            supports_reasoning: Some(true),
             points_ratio: Some(0.0),
             free_badge: Some("免费".to_string()),
         });
@@ -482,10 +486,12 @@ mod tests {
             models.push(GuiModel {
                 id: crate::translate::pipeline::FREE_MODEL_NAME.to_string(),
                 name: None,
-                context_window: None,
-                max_output_tokens: None,
-                supports_images: None,
-                supports_reasoning: None,
+                // Defaults must hold for either upstream (hy3 day / hy4-preview
+                // night); hy3 is the smaller, so it is the safe conservative set.
+                context_window: Some(192_000),
+                max_output_tokens: Some(64_000),
+                supports_images: Some(true),
+                supports_reasoning: Some(true),
                 points_ratio: Some(0.0),
                 free_badge: Some("免费".into()),
             });
@@ -494,6 +500,10 @@ mod tests {
         let free = models.iter().find(|m| m.id == "free").unwrap();
         assert_eq!(free.points_ratio, Some(0.0));
         assert_eq!(free.free_badge.as_deref(), Some("免费"));
+        assert_eq!(free.context_window, Some(192_000));
+        assert_eq!(free.max_output_tokens, Some(64_000));
+        assert_eq!(free.supports_images, Some(true));
+        assert_eq!(free.supports_reasoning, Some(true));
         // Only one `free` entry even if the list already had one.
         assert_eq!(models.iter().filter(|m| m.id == "free").count(), 1);
     }
