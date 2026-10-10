@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-rs"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3168,7 +3168,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-rs-gui"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "axum",
