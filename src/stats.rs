@@ -64,8 +64,16 @@ impl UpstreamTiming {
 /// Everything captured about one completed request for the stats DB.
 #[derive(Debug, Clone)]
 pub struct RequestOutcome<'a> {
-    /// Client-facing model name (before upstream mapping).
+    /// Served upstream model name (after virtual `free` resolution and any
+    /// `model_map`). This is the model that actually generated the tokens, so
+    /// usage accounting groups by it — a `free` request lands under `hy3` or
+    /// `hy4-preview`, never under `free`.
     pub model: &'a str,
+    /// Client-facing model name as requested (before upstream mapping). For a
+    /// virtual `free` request this is `free`, while `model` is the resolved
+    /// `hy3`/`hy4-preview`; the two differ only on the virtual node, which is
+    /// exactly why both are kept.
+    pub client_model: &'a str,
     /// Route that served the request, e.g. `/v1/messages`.
     pub route: &'a str,
     pub tokens: &'a TokenRecord,
@@ -101,6 +109,7 @@ impl RequestOutcome<'_> {
             date: date.to_string(),
             created_at: created_at.to_string(),
             model: self.model.to_string(),
+            client_model: self.client_model.to_string(),
             route: self.route.to_string(),
             input_tokens: self.tokens.input,
             output_tokens: self.tokens.output,
@@ -128,6 +137,7 @@ struct RequestRow {
     date: String,
     created_at: String,
     model: String,
+    client_model: String,
     route: String,
     input_tokens: i64,
     output_tokens: i64,
@@ -153,12 +163,12 @@ struct RequestRow {
 impl RequestRow {
     fn insert_sql() -> &'static str {
         "INSERT INTO request_logs (
-            date, created_at, model, route,
+            date, created_at, model, client_model, route,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
             duration_ms, ttft_ms, model_ms, ended_with_tool_call,
             streamed, status, error, session_id, client,
             override_key, override_model, override_reason
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
     }
 
     fn bind_to(&self, stmt: &mut rusqlite::Statement<'_>) -> rusqlite::Result<()> {
@@ -166,6 +176,7 @@ impl RequestRow {
             self.date,
             self.created_at,
             self.model,
+            self.client_model,
             self.route,
             self.input_tokens,
             self.output_tokens,
@@ -194,6 +205,7 @@ pub struct RequestLogItem {
     pub id: i64,
     pub created_at: String,
     pub model: String,
+    pub client_model: String,
     pub route: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -228,6 +240,10 @@ pub struct RequestLogItem {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestLogFilter {
     pub model: Option<String>,
+    /// Restrict to the model the client asked for (before virtual `free`
+    /// resolution). Lets the GUI filter `free` requests even though their
+    /// `model` column holds the resolved `hy3`/`hy4-preview`.
+    pub client_model: Option<String>,
     /// Restrict to one client dialect: `codex` / `claude` / `dsh` / `unknown`.
     pub client: Option<String>,
     /// Restrict to one exact session id (`codex:01a0cc30-…`).
@@ -254,6 +270,10 @@ pub struct RequestLogsResult {
     pub items: Vec<RequestLogItem>,
     pub total: i64,
     pub models: Vec<String>,
+    /// Distinct *requested* models (before virtual `free` resolution), for the
+    /// filter UI. Lets the GUI offer `free` even though its `model` column holds
+    /// the resolved `hy3`/`hy4-preview`.
+    pub client_models: Vec<String>,
     /// Distinct client dialects present in the database, for the filter UI.
     pub clients: Vec<String>,
     /// Distinct conversations, newest first. Queried over the whole table rather
@@ -749,6 +769,7 @@ impl StatsDb {
                 date                TEXT NOT NULL DEFAULT '',
                 created_at          TEXT NOT NULL,
                 model               TEXT NOT NULL,
+                client_model        TEXT NOT NULL DEFAULT '',
                 route               TEXT NOT NULL,
                 input_tokens        INTEGER NOT NULL DEFAULT 0,
                 output_tokens       INTEGER NOT NULL DEFAULT 0,
@@ -807,6 +828,7 @@ impl StatsDb {
             "override_key",
             "override_model",
             "override_reason",
+            "client_model",
         ] {
             let exists = conn
                 .prepare("PRAGMA table_info(request_logs)")?
@@ -864,6 +886,13 @@ impl StatsDb {
             }
         }
 
+        // The `client_model` lookups back the new "requested model" filter; the
+        // index is created here (after the column exists) so it is added on both
+        // fresh installs and upgraded databases without racing `init_schema`.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_request_logs_client_model ON request_logs(client_model);",
+        )?;
+
         // daily_stats is now derived from request_logs on demand.
         conn.execute_batch("DROP TABLE IF EXISTS daily_stats;")?;
 
@@ -908,6 +937,17 @@ impl StatsDb {
             }
         }
 
+        // 1a. Distinct requested models for the filter dropdown.
+        let mut client_model_stmt = conn
+            .prepare("SELECT DISTINCT client_model FROM request_logs ORDER BY client_model ASC")?;
+        let client_models_iter = client_model_stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut client_models = Vec::new();
+        for cm in client_models_iter.flatten() {
+            if !cm.is_empty() {
+                client_models.push(cm);
+            }
+        }
+
         // 1b. Data-driven client list, so the dropdown only offers dialects
         //     that actually appear in this database.
         let mut client_stmt = conn.prepare(
@@ -948,6 +988,14 @@ impl StatsDb {
             let m_trimmed = m.trim();
             if !m_trimmed.is_empty() && m_trimmed != "all" {
                 where_clauses.push("model = ?".to_string());
+                params.push(Box::new(m_trimmed.to_string()));
+            }
+        }
+
+        if let Some(ref m) = filter.client_model {
+            let m_trimmed = m.trim();
+            if !m_trimmed.is_empty() && m_trimmed != "all" {
+                where_clauses.push("client_model = ?".to_string());
                 params.push(Box::new(m_trimmed.to_string()));
             }
         }
@@ -1023,7 +1071,7 @@ impl StatsDb {
         let limit = filter.limit.unwrap_or(50).clamp(1, 500);
         let offset = filter.offset.unwrap_or(0);
         let query_sql = format!(
-            "SELECT id, created_at, model, route,
+            "SELECT id, created_at, model, client_model, route,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                     duration_ms, ttft_ms, model_ms, ended_with_tool_call,
                     streamed, status, error, session_id, client,
@@ -1043,30 +1091,31 @@ impl StatsDb {
 
         let mut stmt = conn.prepare(&query_sql)?;
         let items_iter = stmt.query_map(rusqlite::params_from_iter(query_params), |row| {
-            let streamed_int: i64 = row.get(12)?;
-            let status_int: i64 = row.get(13)?;
-            let tool_int: i64 = row.get(11)?;
+            let tool_int: i64 = row.get(12)?;
+            let streamed_int: i64 = row.get(13)?;
+            let status_int: i64 = row.get(14)?;
             Ok(RequestLogItem {
                 id: row.get(0)?,
                 created_at: row.get(1)?,
                 model: row.get(2)?,
-                route: row.get(3)?,
-                input_tokens: row.get(4)?,
-                output_tokens: row.get(5)?,
-                cache_read_tokens: row.get(6)?,
-                cache_write_tokens: row.get(7)?,
-                duration_ms: row.get(8)?,
-                ttft_ms: row.get(9)?,
-                model_ms: row.get(10)?,
+                client_model: row.get(3)?,
+                route: row.get(4)?,
+                input_tokens: row.get(5)?,
+                output_tokens: row.get(6)?,
+                cache_read_tokens: row.get(7)?,
+                cache_write_tokens: row.get(8)?,
+                duration_ms: row.get(9)?,
+                ttft_ms: row.get(10)?,
+                model_ms: row.get(11)?,
                 ended_with_tool_call: tool_int != 0,
                 streamed: streamed_int != 0,
                 status: status_int as u16,
-                error: row.get(14)?,
-                session_id: row.get(15)?,
-                client: row.get(16)?,
-                override_key: row.get(17)?,
-                override_model: row.get(18)?,
-                override_reason: row.get(19)?,
+                error: row.get(15)?,
+                session_id: row.get(16)?,
+                client: row.get(17)?,
+                override_key: row.get(18)?,
+                override_model: row.get(19)?,
+                override_reason: row.get(20)?,
             })
         })?;
 
@@ -1079,6 +1128,7 @@ impl StatsDb {
             items,
             total,
             models,
+            client_models,
             clients,
             sessions,
         })
@@ -1453,8 +1503,12 @@ mod tests {
         error: Option<&'a str>,
         streamed: bool,
     ) -> RequestOutcome<'a> {
+        // In these unit tests the requested model equals the served model; the
+        // virtual `free` resolution is exercised elsewhere. Defaulting keeps the
+        // call sites terse.
         RequestOutcome {
             model,
+            client_model: model,
             route,
             tokens,
             duration_ms: 1250,

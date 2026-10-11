@@ -100,3 +100,21 @@
   font-weight: 600;
 }
 
+/* Virtual free-node chip: marks a request whose asked-for model was the
+ * virtual `free` node while the served model (hy3/hy4-preview) is recorded
+ * separately. Green so the free tier reads as "no-cost" at a glance, and it
+ * never competes with the override pill because the two sit in different
+ * cells/rows. */
+.free-request-pill {
+  background: var(--success-tint);
+  color: var(--success-ink);
+  border: 1px solid var(--success-tint-border);
+  font-size: 10px;
+  padding: 1px 6px;
+}
+
+.detail-sub {
+  color: var(--muted);
+  font-size: 11px;
+}
+

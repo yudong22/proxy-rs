@@ -27,7 +27,12 @@ pub(crate) fn serialize_sse_event<T: serde::Serialize>(event_type: &str, event: 
 /// tokens and error state had been observed by then, and a duration measured
 /// from the start of the request.
 pub(crate) struct StreamLedger {
+    /// Served upstream model (after virtual `free` resolution). The request row
+    /// is keyed/billed under this.
     model: String,
+    /// Client-requested model (`free` for the virtual node). Kept so the GUI
+    /// can tell a `free` request apart from what actually served it.
+    client_model: String,
     route: &'static str,
     start: Instant,
     /// When the winning upstream attempt was sent — the anchor for TTFT and the
@@ -50,6 +55,7 @@ pub(crate) struct StreamLedger {
 impl StreamLedger {
     fn new(
         model: String,
+        client_model: String,
         route: &'static str,
         start: Instant,
         upstream_start: Instant,
@@ -65,6 +71,7 @@ impl StreamLedger {
         };
         Self {
             model,
+            client_model,
             route,
             start,
             upstream_start,
@@ -101,6 +108,7 @@ impl Drop for StreamLedger {
             &self.stats,
             RequestOutcome {
                 model: &self.model,
+                client_model: &self.client_model,
                 route: self.route,
                 tokens: &self.tokens,
                 duration_ms: self.start.elapsed().as_millis() as i64,
@@ -232,6 +240,7 @@ pub(super) fn create_flavor_sse_stream(
         + Send
         + 'static,
     flavor: ApiFlavor,
+    upstream_model: String,
     client_model: String,
     route: &'static str,
     start: Instant,
@@ -259,6 +268,7 @@ pub(super) fn create_flavor_sse_stream(
         // Codex stall diagnostic at the end of the stream.
         let client_kind = session.client;
         let mut ledger = StreamLedger::new(
+            upstream_model.clone(),
             client_model.clone(),
             route,
             start,
@@ -287,7 +297,7 @@ pub(super) fn create_flavor_sse_stream(
                 if !usage_captured {
                     let usage = $usage;
                     if flavor == ApiFlavor::Chat {
-                        metrics::tokens(usage.prompt_tokens, usage.completion_tokens, &client_model);
+                        metrics::tokens(usage.prompt_tokens, usage.completion_tokens, &upstream_model);
                     }
                     ledger.tokens = usage.to_token_record();
                     usage_captured = true;
@@ -594,6 +604,7 @@ pub(crate) fn create_sse_stream(
     create_flavor_sse_stream(
         upstream,
         ApiFlavor::Anthropic,
+        fallback_model.clone(),
         fallback_model,
         "/v1/messages",
         Instant::now(),
@@ -618,6 +629,7 @@ pub(crate) fn create_responses_sse_stream(
     create_flavor_sse_stream(
         upstream,
         ApiFlavor::Responses,
+        fallback_model.clone(),
         fallback_model,
         "/v1/responses",
         Instant::now(),

@@ -55,11 +55,16 @@ export function showRequestModal(id) {
     ? html`输入 Tokens <span class="detail-estimated">(估算值)</span>`
     : '输入 Tokens';
 
+  const requestedRow = (item.client_model && item.client_model !== item.model)
+    ? html`<tr><td class="detail-key">请求模型</td><td class="detail-val"><span class="badge-pill free-request-pill">${item.client_model}</span> <span class="detail-sub">虚拟免费节点</span></td></tr>`
+    : '';
+
   openModal('请求详情', html`
     <table class="detail-table">
       <tr><td class="detail-key">请求 ID</td><td class="detail-val">#${item.id}</td></tr>
       <tr><td class="detail-key">时间</td><td class="detail-val">${item.created_at}</td></tr>
-      <tr><td class="detail-key">模型 ID</td><td class="detail-val"><strong>${item.model}</strong></td></tr>
+      <tr><td class="detail-key">服务模型</td><td class="detail-val"><strong>${item.model}</strong></td></tr>
+      ${raw(requestedRow)}
       <tr><td class="detail-key">请求路径</td><td class="detail-val">${item.route}</td></tr>
       ${raw(sessionRows)}
       <tr><td class="detail-key">状态</td><td class="detail-val">${raw(statusBadge(item))}</td></tr>

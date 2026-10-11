@@ -23,7 +23,8 @@ import { fetchRequestLogs, initRequestTable } from '../components/table.js';
 
 /** The table view's dropdown filter options. */
 const TABLE_FILTERS = [
-  { id: 'table-model-filter', title: '按模型筛选', options: [['all', '全部模型']] },
+  { id: 'table-model-filter', title: '按服务模型筛选', options: [['all', '全部模型']] },
+  { id: 'table-requested-model-filter', title: '按请求模型筛选 (含免费节点)', options: [['all', '全部 (请求模型)']] },
   {
     id: 'table-status-filter',
     title: '按状态筛选',

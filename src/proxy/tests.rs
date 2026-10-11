@@ -2197,6 +2197,7 @@ async fn drain_flavor(
         response.bytes_stream(),
         flavor,
         "deepseek-v4.1-flash".to_string(),
+        "deepseek-v4.1-flash".to_string(),
         route,
         Instant::now(),
         Instant::now(),

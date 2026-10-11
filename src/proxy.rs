@@ -670,6 +670,7 @@ async fn reject_request(
         stats,
         RequestOutcome {
             model: "",
+            client_model: "",
             route,
             tokens: &TokenRecord::default(),
             duration_ms,
@@ -798,6 +799,14 @@ async fn finalize_request(
         }
         Some(message) => {
             let duration_ms = start.elapsed().as_millis() as i64;
+            // A `free` request that failed before upstream mapping still gets
+            // billed under the node it would have used, so failures group with
+            // successes instead of under the virtual name.
+            let served_model = if client_model == crate::translate::pipeline::FREE_MODEL_NAME {
+                crate::translate::pipeline::resolve_free_model()
+            } else {
+                client_model.to_string()
+            };
             // Record the failed request in the stats DB with estimated input tokens.
             let failed_tokens = TokenRecord {
                 input: estimated_input_tokens,
@@ -808,7 +817,8 @@ async fn finalize_request(
             record_stats_row(
                 stats,
                 RequestOutcome {
-                    model: client_model,
+                    model: &served_model,
+                    client_model,
                     route,
                     tokens: &failed_tokens,
                     duration_ms,
@@ -1672,6 +1682,7 @@ async fn forward_request(
                     streaming_response(
                         response,
                         flavor,
+                        &openai_req.model,
                         client_model,
                         route,
                         start,
@@ -1970,14 +1981,13 @@ async fn non_streaming_response(
     tag: &str,
     overrides: &Arc<std::sync::Mutex<OverrideTrace>>,
 ) -> ProxyResult<Response> {
-    let metrics_model = match flavor {
-        ApiFlavor::Chat => &client_model,
-        _ => upstream_model,
-    };
+    // Label the Prometheus token metric with the served upstream model for
+    // every flavor (previously Chat reported the client model, which left a
+    // `free` request counted under `free` instead of the resolved node).
     metrics::tokens(
         openai_resp.usage.prompt_tokens,
         openai_resp.usage.completion_tokens,
-        metrics_model,
+        upstream_model,
     );
 
     let tokens = openai_resp.usage.to_token_record();
@@ -1993,7 +2003,8 @@ async fn non_streaming_response(
     record_stats_row(
         &stats,
         RequestOutcome {
-            model: &client_model,
+            model: upstream_model,
+            client_model: &client_model,
             route,
             tokens: &tokens,
             duration_ms,
@@ -2066,6 +2077,7 @@ async fn non_streaming_response(
 fn streaming_response(
     response: reqwest::Response,
     flavor: ApiFlavor,
+    upstream_model: &str,
     client_model: String,
     route: &'static str,
     start: Instant,
@@ -2083,6 +2095,7 @@ fn streaming_response(
     let sse_stream = create_flavor_sse_stream(
         upstream,
         flavor,
+        upstream_model.to_string(),
         client_model,
         route,
         start,

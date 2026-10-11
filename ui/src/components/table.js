@@ -63,11 +63,19 @@ function row(item) {
     ? raw(`<span class="cell-cache-hint">cache: ${item.cache_read_tokens.toLocaleString()}</span>`)
     : '';
 
+  // A virtual `free` request is served by `hy3`/`hy4-preview` (the value in
+  // `model`); surface the requested name as a chip so the two are never
+  // conflated in the table.
+  const isVirtualFree = item.client_model && item.client_model !== item.model;
+
   return html`<tr class="${isErr ? 'row-error' : ''}">
     <td class="cell-time" title="${item.created_at}">${shortTime(item.created_at)}</td>
     <td>${raw(sessionCell(item))}</td>
     <td>
       <div class="cell-model-box">
+        ${isVirtualFree
+          ? raw(`<span class="badge-pill free-request-pill" title="请求模型 (虚拟免费节点)">${item.client_model}</span>`)
+          : ''}
         <span class="cell-model" title="${item.model}">${item.model}</span>
         <span class="cell-route">${item.route}</span>
       </div>
@@ -116,7 +124,7 @@ function render() {
   if (next) next.disabled = currentPage >= totalPages;
 }
 
-/** Rebuild the model dropdown, keeping the current selection when it survives. */
+/** Rebuild the served-model dropdown, keeping the current selection when it survives. */
 function updateModelDropdown() {
   const select = $('#table-model-filter');
   if (!select) return;
@@ -124,6 +132,21 @@ function updateModelDropdown() {
   const models = appState.requestLogsModels || [];
 
   select.innerHTML = html`<option value="all">全部模型</option>`
+    + models.map(m => html`<option value="${m}">${m}</option>`).join('');
+
+  select.value = current && Array.from(select.options).some(o => o.value === current)
+    ? current
+    : 'all';
+}
+
+/** Rebuild the *requested*-model dropdown (virtual `free` lives here), keeping the selection. */
+function updateRequestedModelDropdown() {
+  const select = $('#table-requested-model-filter');
+  if (!select) return;
+  const current = select.value;
+  const models = appState.requestLogsClientModels || [];
+
+  select.innerHTML = html`<option value="all">全部 (请求模型)</option>`
     + models.map(m => html`<option value="${m}">${m}</option>`).join('');
 
   select.value = current && Array.from(select.options).some(o => o.value === current)
@@ -175,6 +198,7 @@ export async function fetchRequestLogs(resetPage = false) {
   if (resetPage) appState.requestLogsPage = 0;
 
   const model = $('#table-model-filter')?.value || 'all';
+  const requested = $('#table-requested-model-filter')?.value || 'all';
   const status = $('#table-status-filter')?.value || 'all';
   const streamed = $('#table-streamed-filter')?.value || 'all';
   const client = $('#table-client-filter')?.value || 'all';
@@ -185,6 +209,7 @@ export async function fetchRequestLogs(resetPage = false) {
     offset: appState.requestLogsPage * appState.requestLogsPageSize,
   };
   if (model !== 'all') filter.model = model;
+  if (requested !== 'all') filter.client_model = requested;
   if (status !== 'all') filter.status_group = status;
   if (streamed === 'stream') filter.streamed = true;
   else if (streamed === 'sync') filter.streamed = false;
@@ -201,9 +226,11 @@ export async function fetchRequestLogs(resetPage = false) {
     appState.requestLogs = res.items || [];
     appState.requestLogsTotal = res.total || 0;
     appState.requestLogsModels = res.models || [];
+    appState.requestLogsClientModels = res.client_models || [];
     appState.requestLogsClients = res.clients || [];
     appState.requestLogsSessions = res.sessions || [];
     updateModelDropdown();
+    updateRequestedModelDropdown();
     updateSessionDropdown();
     render();
   } catch (err) {
@@ -218,6 +245,7 @@ export function initRequestTable() {
   // Debounced: typing in the search box should not re-query per keystroke.
   $('#table-search-input')?.addEventListener('input', debounce(() => fetchRequestLogs(true), 250));
   $('#table-model-filter')?.addEventListener('change', onFilterChange);
+  $('#table-requested-model-filter')?.addEventListener('change', onFilterChange);
   $('#table-status-filter')?.addEventListener('change', onFilterChange);
   $('#table-streamed-filter')?.addEventListener('change', onFilterChange);
   $('#table-client-filter')?.addEventListener('change', onFilterChange);
