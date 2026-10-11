@@ -1100,6 +1100,15 @@ async fn forward_request(
     // from spinning on a bare 400.
     let mut degraded_attempt = false;
 
+    // `free` night-node degradation: when a virtual `free` request resolved to
+    // the night node (`hy4-preview`) and that node is exhausted across *every*
+    // account and *every* key (no switchable replacement could be found), we
+    // retry the request once against the daytime free node (`hy3`) rather than
+    // erroring. `client_model` carries the originally-requested `free`, so the
+    // stats/logs keep showing the virtual node while the served model reflects
+    // the degraded `hy3`.
+    let mut free_degraded_retried = false;
+
     // Credential attempts: the pool's pick first, then at most
     // `min(pool-1, 2)` failovers when a limit/failure exception hits. An empty
     // pool (or a static-key/passthrough configuration) yields exactly one
@@ -1553,6 +1562,56 @@ async fn forward_request(
                                 )
                                 .await;
                         }
+                    }
+
+                    // ── `free` night-node degradation ──
+                    // By now every switchable path has been exhausted for this
+                    // attempt: pool→replacement, pool→key pool, key pool→next key,
+                    // key pool→account pool. If this is a virtual `free` request
+                    // whose resolved night node (`hy4-preview`) is depleted across
+                    // the whole identity set, degrade to the daytime free node
+                    // (`hy3`) and retry exactly once. We only do this for a
+                    // quota/capacity signal (`14018`/`11105`/`11106` or a 429),
+                    // never for a hard auth/permission failure (401/403/402) where
+                    // `hy3` would fail identically. `client_model` stays `free`.
+                    if !free_degraded_retried
+                        && client_model == crate::translate::pipeline::FREE_MODEL_NAME
+                        && openai_req.model == crate::translate::pipeline::free_night_model()
+                        && (is_quota_business_code(&body) || status.as_u16() == 429)
+                    {
+                        free_degraded_retried = true;
+                        let day = crate::translate::pipeline::free_degraded_model();
+                        openai_req.model = day.clone();
+                        // Reset identity state so the degraded request probes
+                        // both the account pool and the key pool fresh.
+                        active_credential = None;
+                        current_credential = None;
+                        current_api_key = None;
+                        current_key_id = None;
+                        tried_key_ids.clear();
+                        gui_logs
+                            .push(
+                                "WARN",
+                                format!(
+                                    "free 夜间节点 {} 额度在账号池与密钥池均已耗尽，退化到 {} 重试 {} session={}",
+                                    crate::translate::pipeline::free_night_model(),
+                                    day,
+                                    tag,
+                                    session.session_id
+                                ),
+                            )
+                            .await;
+                        if let Ok(mut t) = overrides.lock() {
+                            t.set_model(
+                                &day,
+                                format!(
+                                    "free 夜间 {} 耗尽，退化到 {}",
+                                    crate::translate::pipeline::free_night_model(),
+                                    day
+                                ),
+                            );
+                        }
+                        continue 'credential; // retry the whole request on hy3
                     }
 
                     // Shape-dependent rejections (e.g. 11148 "tool calls and tool

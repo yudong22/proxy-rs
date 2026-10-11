@@ -279,6 +279,22 @@ pub(crate) fn resolve_free_model() -> String {
     }
 }
 
+/// The daytime free node (`hy3` by default). When the night free node
+/// (`hy4-preview`) is exhausted across every account and key, the virtual `free`
+/// model degrades to this node instead of erroring — it is the daytime free
+/// node, so it is still "free" to the client.
+pub(crate) fn free_degraded_model() -> String {
+    std::env::var("PROXY_FREE_DAY_MODEL").unwrap_or_else(|_| "hy3".to_string())
+}
+
+/// The night free node (`hy4-preview` by default). A `free` request is only
+/// eligible for the night→day degradation when its resolved upstream model is
+/// exactly this node; a daytime `free` request already resolves to the day node
+/// and has nothing further to degrade to.
+pub(crate) fn free_night_model() -> String {
+    std::env::var("PROXY_FREE_NIGHT_MODEL").unwrap_or_else(|_| "hy4-preview".to_string())
+}
+
 /// Whether a given local `hour` (0–23) falls inside the night window
 /// `[start, end)`, wrapping past midnight when `start > end`.
 ///
@@ -677,6 +693,28 @@ mod tests {
         assert!(is_night_hour(2, 0, 8));
         assert!(!is_night_hour(8, 0, 8));
         assert!(!is_night_hour(23, 0, 8));
+    }
+
+    #[test]
+    fn free_node_accessors_default_and_overridable() {
+        // Defaults: night node is hy4-preview, degraded (daytime) node is hy3,
+        // and the degrade target must differ from the night node so the
+        // night→day fallback actually switches models.
+        let night = free_night_model();
+        let day = free_degraded_model();
+        assert_eq!(night, "hy4-preview");
+        assert_eq!(day, "hy3");
+        assert_ne!(night, day);
+
+        // The degradation helpers read the same env knobs as resolve_free_model,
+        // so overriding the day/night nodes stays consistent end-to-end.
+        std::env::set_var("PROXY_FREE_NIGHT_MODEL", "hy4");
+        std::env::set_var("PROXY_FREE_DAY_MODEL", "hy3-pro");
+        assert_eq!(free_night_model(), "hy4");
+        assert_eq!(free_degraded_model(), "hy3-pro");
+        assert_ne!(free_night_model(), free_degraded_model());
+        std::env::remove_var("PROXY_FREE_NIGHT_MODEL");
+        std::env::remove_var("PROXY_FREE_DAY_MODEL");
     }
 
     fn req_with_model(model: &str, extra: Value) -> anthropic::AnthropicRequest {
