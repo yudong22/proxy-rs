@@ -335,7 +335,10 @@ pub async fn fetch_models(
     // DSH profile can all pin to it. It is not a real upstream id — the gateway
     // resolves it per request to the day/night free node — so expose it once
     // and only when the catalog would not already contain it.
-    if !models.iter().any(|m| m.id == crate::translate::pipeline::FREE_MODEL_NAME) {
+    if !models
+        .iter()
+        .any(|m| m.id == crate::translate::pipeline::FREE_MODEL_NAME)
+    {
         models.push(GuiModel {
             id: crate::translate::pipeline::FREE_MODEL_NAME.to_string(),
             name: None,
@@ -542,9 +545,15 @@ mod tests {
     #[test]
     fn credit_ratio_parses_known_variants() {
         // Matches the upstream `credits` field shapes observed in the wild.
-        assert_eq!(parse_credits_ratio(&Some("x0.00 credits".into())), Some(0.0));
+        assert_eq!(
+            parse_credits_ratio(&Some("x0.00 credits".into())),
+            Some(0.0)
+        );
         assert_eq!(parse_credits_ratio(&Some("x0.29".into())), Some(0.29));
-        assert_eq!(parse_credits_ratio(&Some("x2.20 credits".into())), Some(2.20));
+        assert_eq!(
+            parse_credits_ratio(&Some("x2.20 credits".into())),
+            Some(2.20)
+        );
     }
 
     #[test]
@@ -557,16 +566,10 @@ mod tests {
     #[test]
     fn free_badge_extracted_from_tags() {
         assert_eq!(
-            parse_free_badge(&Some(vec![
-                "craft".into(),
-                "badge:夜间免费:#FF0000".into()
-            ])),
+            parse_free_badge(&Some(vec!["craft".into(), "badge:夜间免费:#FF0000".into()])),
             Some("夜间免费".into())
         );
-        assert_eq!(
-            parse_free_badge(&Some(vec!["craft".into()])),
-            None
-        );
+        assert_eq!(parse_free_badge(&Some(vec!["craft".into()])), None);
         assert_eq!(parse_free_badge(&None), None);
     }
 
@@ -574,15 +577,6 @@ mod tests {
     fn fetch_models_appends_virtual_free_model() {
         // Build a tiny OpenAI-style response (no models-config url) and confirm
         // the virtual `free` model is appended once.
-        let preset = ProviderPreset {
-            id: "openai".into(),
-            name: "OpenAI".into(),
-            chat_completions_url: "https://api.openai.com/v1/chat/completions".into(),
-            models_url: Some("https://api.openai.com/v1/models".into()),
-            models_config_url: None,
-            config_headers: Default::default(),
-            force_stream: false,
-        };
         // We cannot hit the network in tests; assert the append logic directly
         // by mirroring it on an empty list, which exercises the same branch that
         // `fetch_models` runs after either backend returns.

@@ -259,8 +259,7 @@ pub const FREE_MODEL_NAME: &str = "free";
 /// * `PROXY_FREE_NIGHT_START` (default `23`, inclusive)
 /// * `PROXY_FREE_NIGHT_END`   (default `8`, exclusive)
 pub(crate) fn resolve_free_model() -> String {
-    let day_model =
-        std::env::var("PROXY_FREE_DAY_MODEL").unwrap_or_else(|_| "hy3".to_string());
+    let day_model = std::env::var("PROXY_FREE_DAY_MODEL").unwrap_or_else(|_| "hy3".to_string());
     let night_model =
         std::env::var("PROXY_FREE_NIGHT_MODEL").unwrap_or_else(|_| "hy4-preview".to_string());
     let start: i32 = std::env::var("PROXY_FREE_NIGHT_START")

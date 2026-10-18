@@ -53,6 +53,10 @@ pub(crate) struct StreamLedger {
 }
 
 impl StreamLedger {
+    /// The parameter list mirrors the facts a row needs; bundling them into a
+    /// struct would only move the same eight fields one level away. The rest of
+    /// this crate's wide row builders take the same exemption.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         model: String,
         client_model: String,
