@@ -29,6 +29,29 @@ pub enum ProxyError {
     #[error("Upstream API error: {0}")]
     Upstream(String),
 
+    /// A terminal upstream rejection, relayed with the upstream's own status.
+    ///
+    /// [`ProxyError::Upstream`] answers 502 unconditionally, which is only
+    /// honest for a gateway fault. A 400/413/422 from the upstream is the
+    /// client's request being refused — the request itself is the problem and
+    /// resending it cannot help — so flattening it to 502 told every client the
+    /// opposite, and an agent that branches on the status (Codex distinguishes
+    /// "context window exceeded" from "gateway is down") could never take the
+    /// corrective action.
+    ///
+    /// The remediation for that was visible in the logs: a 1.18M-token prompt
+    /// hit the upstream's 1.05M limit, the proxy reported 502, and Codex
+    /// retried the identical request 37 times.
+    #[error("{message}")]
+    UpstreamRejected {
+        /// The upstream's own HTTP status.
+        status: u16,
+        /// The upstream response body, passed through unchanged.
+        body: String,
+        /// Human-readable rendering for the log row.
+        message: String,
+    },
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
@@ -150,7 +173,49 @@ fn is_opaque_reqwest_phrase(text: &str) -> bool {
     )
 }
 
+/// Upstream statuses that describe the client's own request, not the gateway.
+///
+/// These are the rejections where resending the same body cannot succeed, so
+/// the status must survive to the client:
+///
+/// * **400** — a malformed or oversized request. Codex's "prompt is too long"
+///   arrives here (business code 11115), and its own error taxonomy is what
+///   tells the agent to compact or trim.
+/// * **413** — the body exceeded the upstream's limit outright.
+/// * **422** — well-formed but semantically unacceptable (shape mismatch).
+///
+/// 401/402/403/404/429 are deliberately absent. The first three are credential
+/// faults the proxy already fails over on, 429 is retriable (the pool switch
+/// happens before this point), and 404 means the route or model is wrong —
+/// reporting that as 502 keeps the gateway's misconfiguration from looking like
+/// a client mistake.
+fn is_terminal_rejection(status: u16) -> bool {
+    matches!(status, 400 | 413 | 422)
+}
+
 impl ProxyError {
+    /// Build the error for an upstream response the proxy is going to relay.
+    ///
+    /// Terminal client-error statuses (400/413/422) are relayed as-is so the
+    /// client can act on them; everything else keeps the historical 502, which
+    /// reads as "the gateway failed" — the correct meaning for a 5xx, and the
+    /// one clients already branch on.
+    ///
+    /// Retriable statuses (429, 5xx) never reach here: the caller parks them in
+    /// `last_err` and tries the next upstream URL first.
+    pub fn from_upstream(status: u16, body: String) -> Self {
+        let message = format!("Upstream returned {}: {}", status, body);
+        if is_terminal_rejection(status) {
+            ProxyError::UpstreamRejected {
+                status,
+                body,
+                message,
+            }
+        } else {
+            ProxyError::Upstream(message)
+        }
+    }
+
     /// The HTTP status this error is reported with.
     ///
     /// Single source of truth for both the response and the log row, so the two
@@ -163,6 +228,9 @@ impl ProxyError {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST)
             }
             ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            ProxyError::UpstreamRejected { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
+            }
             ProxyError::Serialization(_) => StatusCode::BAD_REQUEST,
             ProxyError::Http(_) => StatusCode::BAD_GATEWAY,
         }
@@ -200,12 +268,37 @@ impl ProxyError {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
+        // A rejected-upstream error relays the upstream's body verbatim: the
+        // client's own SDK parses it, and its error taxonomy (e.g. OpenAI's
+        // `code: "context_length_exceeded"` versus `type: "invalid_request_error"`)
+        // is the only thing that tells it what to do about the rejection.
+        // Re-wrapping it in the proxy's envelope would discard exactly that.
+        if let ProxyError::UpstreamRejected { status, body, .. } = &self {
+            let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+            return match serde_json::from_str::<serde_json::Value>(body) {
+                // Valid JSON: hand the parsed value back with a JSON content type.
+                Ok(value) => (status, Json(value)).into_response(),
+                // Not JSON (an HTML error page, a bare string): keep it as text
+                // rather than 500 on a serde error inside error rendering.
+                Err(_) if !body.trim().is_empty() => (
+                    status,
+                    [("content-type", "text/plain; charset=utf-8")],
+                    body.clone(),
+                )
+                    .into_response(),
+                Err(_) => {
+                    (status, Json(json!({ "error": { "type": "proxy_error" } }))).into_response()
+                }
+            };
+        }
+
         let status = self.status();
         let error_message = match &self {
             ProxyError::Config(msg) => msg.clone(),
             ProxyError::Transform(msg) => msg.clone(),
             ProxyError::Rejected { message, .. } => message.clone(),
             ProxyError::Upstream(msg) => msg.clone(),
+            ProxyError::UpstreamRejected { message, .. } => message.clone(),
             ProxyError::Serialization(err) => format!("JSON error: {}", err),
             // Same rendering as the `Display` impl, so the body a client sees
             // and the row the user reads cannot describe one failure two ways.
@@ -258,6 +351,63 @@ mod tests {
             status_of(ProxyError::Upstream("bad".into())),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    /// A terminal rejection relays the upstream's own status instead of reading
+    /// as a gateway fault.
+    ///
+    /// This is the whole point of the variant: a context-overflow 400 flattened
+    /// to 502 told Codex the gateway was temporarily down, so it retried the
+    /// identical 1.18M-token prompt 37 times rather than compacting.
+    #[test]
+    fn terminal_upstream_rejection_keeps_the_upstream_status() {
+        for status in [400u16, 413, 422] {
+            let err = ProxyError::from_upstream(status, "{\"error\":\"too big\"}".into());
+            assert_eq!(
+                status_of(err),
+                StatusCode::from_u16(status).unwrap(),
+                "status {status} must be relayed, not flattened to 502"
+            );
+        }
+    }
+
+    /// Everything else still reads as a gateway failure.
+    #[test]
+    fn non_terminal_upstream_status_stays_502() {
+        for status in [401u16, 403, 404, 429, 500, 502, 503] {
+            let err = ProxyError::from_upstream(status, "nope".into());
+            assert!(matches!(err, ProxyError::Upstream(_)), "status {status}");
+            assert_eq!(status_of(err), StatusCode::BAD_GATEWAY, "status {status}");
+        }
+    }
+
+    /// The relayed body must reach the client verbatim: a client's SDK branches
+    /// on the upstream's own error taxonomy (`code: "context_length_exceeded"`
+    /// against `type: "invalid_request_error"`), which re-wrapping would erase.
+    #[test]
+    fn terminal_rejection_relays_the_upstream_body_verbatim() {
+        let body = "{\"error\":{\"message\":\"prompt is too long\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}";
+        let err = ProxyError::from_upstream(400, body.into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.contains("application/json"),
+            "JSON bodies stay JSON, got {content_type}"
+        );
+    }
+
+    /// A non-JSON upstream error page must not become a 500 while rendering.
+    #[test]
+    fn terminal_rejection_tolerates_a_non_json_body() {
+        let err = ProxyError::from_upstream(413, "<html>too large</html>".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

@@ -195,6 +195,11 @@ pub struct DshModel {
     /// `true` declares reasoning levels; `None` omits the key, which leaves the
     /// model without an Effort menu rather than inventing capability.
     pub supports_reasoning: Option<bool>,
+    /// The effort tiers to advertise, in escalation order (`deepseek-*` →
+    /// `low`/`high`/`max`). Empty/`None` keeps the historical single `high`
+    /// level, so a model whose tiers the upstream does not enumerate does not
+    /// silently gain an Effort menu it never had.
+    pub reasoning_efforts: Vec<String>,
     /// Per-model 积分 consumption ratio (`×0.29`). `None` omits it; `Some(0.0)`
     /// is a free model.
     pub points_ratio: Option<f64>,
@@ -237,6 +242,7 @@ pub fn to_dsh_model(m: &crate::providers::GuiModel) -> DshModel {
         max_tokens: m.max_output_tokens,
         supports_images: m.supports_images,
         supports_reasoning: m.supports_reasoning,
+        reasoning_efforts: m.reasoning_efforts.clone().unwrap_or_default(),
         points_ratio: m.points_ratio,
         free_badge: m.free_badge.clone(),
     }
@@ -584,6 +590,37 @@ fn yaml_scalar(value: &str) -> String {
     }
 }
 
+/// Render the `reasoningEfforts` flow mapping for one model, or `None` when the
+/// model declares no reasoning at all.
+///
+/// `{ key: wire }` pairs key = selectable level, value = the `reasoning_effort`
+/// string dispatch sends; both are the same spelling here because the upstream
+/// gateway takes the level names verbatim. Declaring a level DSH's pi-ai does
+/// not offer would fail its config validation, so unknown tiers are dropped and
+/// an empty result falls back to the historical single `high` — that is what
+/// every previously written profile already says.
+fn render_reasoning_efforts(m: &DshModel) -> Option<String> {
+    if m.supports_reasoning != Some(true) {
+        return None;
+    }
+    let declared: Vec<&str> = m
+        .reasoning_efforts
+        .iter()
+        .map(String::as_str)
+        .filter(|tier| ENUMERATED_EFFORTS.contains(tier))
+        .collect();
+    if declared.is_empty() {
+        return Some("{ high: high }".to_string());
+    }
+    let pairs: Vec<String> = declared.iter().map(|t| format!("{t}: {t}")).collect();
+    Some(format!("{{ {} }}", pairs.join(", ")))
+}
+
+/// Tiers DSH's pi-ai can name, mirroring its `THINKING_LEVELS` gate (minus
+/// `off`, which means "send nothing" and is not a tier a user picks here).
+/// `max` is part of that gate, which is what lets the DeepSeek triplet through.
+const ENUMERATED_EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
 /// Render a block-style `models:` list body, indented under its key.
 ///
 /// Inline flow scalars are used for `input`/`reasoningEfforts`, which keeps each
@@ -611,8 +648,8 @@ fn render_models_block(models: &[DshModel], key_indent: usize) -> Vec<String> {
             };
             out.push(format!("{field}input: {input}"));
         }
-        if m.supports_reasoning == Some(true) {
-            out.push(format!("{field}reasoningEfforts: {{ high: high }}"));
+        if let Some(efforts) = render_reasoning_efforts(m) {
+            out.push(format!("{field}reasoningEfforts: {efforts}"));
         }
     }
     out
@@ -631,10 +668,11 @@ fn render_models_flow(models: &[DshModel], indent: usize) -> String {
         if let Some(cw) = m.context_window {
             out.push_str(&format!("{}contextWindow: {},\n", sp(indent + 8), cw));
         }
-        if m.supports_reasoning == Some(true) {
+        if let Some(efforts) = render_reasoning_efforts(m) {
             out.push_str(&format!(
-                "{}reasoningEfforts: {{ high: high }},\n",
-                sp(indent + 8)
+                "{}reasoningEfforts: {},\n",
+                sp(indent + 8),
+                efforts
             ));
         }
         if let Some(mt) = m.max_tokens {
@@ -1086,6 +1124,7 @@ agent-default-model:
             max_tokens: None,
             supports_images: None,
             supports_reasoning: None,
+            reasoning_efforts: Vec::new(),
             points_ratio: None,
             free_badge: None,
         }
@@ -1192,6 +1231,7 @@ agent-default-model:
             max_tokens: Some(128_000),
             supports_images: Some(true),
             supports_reasoning: Some(true),
+            reasoning_efforts: Vec::new(),
             points_ratio: None,
             free_badge: None,
         };
@@ -1202,6 +1242,55 @@ agent-default-model:
         assert!(out.contains("maxTokens: 128000"));
         assert!(out.contains("reasoningEfforts: { high: high }"));
         assert!(out.contains("input: [ text, image ]"));
+    }
+
+    #[test]
+    fn deepseek_tiers_are_written_as_low_high_max() {
+        // The DeepSeek family offers exactly `low`/`high`/`max`; anything else
+        // (or a single `high`) would misdescribe the model in DSH's Effort menu.
+        let mut m = model("deepseek-v4.1-flash");
+        m.supports_reasoning = Some(true);
+        m.reasoning_efforts = vec!["low".into(), "high".into(), "max".into()];
+        let out = upsert_provider(PATCH, "http://127.0.0.1:3457/v1", &[m]).unwrap();
+        assert!(
+            out.contains("reasoningEfforts: { low: low, high: high, max: max }"),
+            "got:\n{out}"
+        );
+        // `max` must reach the flow-style writer too, or a legacy profile
+        // silently keeps a one-tier menu.
+        let flow = upsert_provider(
+            FLOW,
+            "http://127.0.0.1:9999/v1",
+            &[{
+                let mut m = model("deepseek-v4.1-flash");
+                m.supports_reasoning = Some(true);
+                m.reasoning_efforts = vec!["low".into(), "high".into(), "max".into()];
+                m
+            }],
+        )
+        .unwrap();
+        // Here `reasoningEfforts` is the entry's last field, so the flow writer
+        // strips its comma; the mapping itself is what must survive.
+        assert!(flow.contains("reasoningEfforts: { low: low, high: high, max: max }"));
+    }
+
+    #[test]
+    fn unsupported_tier_falls_back_to_high() {
+        // A tier DSH cannot name must never be written: its config validator
+        // rejects the whole profile, which would take the provider out of every
+        // picker. The historical single `high` is the safe fallback.
+        let mut m = model("some-model");
+        m.supports_reasoning = Some(true);
+        m.reasoning_efforts = vec!["ultra".into()];
+        assert_eq!(
+            render_reasoning_efforts(&m).as_deref(),
+            Some("{ high: high }")
+        );
+
+        // A non-reasoning model declares nothing at all.
+        let mut plain = model("plain");
+        plain.reasoning_efforts = vec!["low".into(), "high".into()];
+        assert_eq!(render_reasoning_efforts(&plain), None);
     }
 
     #[test]
@@ -1230,6 +1319,8 @@ agent-default-model:
             supports_reasoning: None,
             points_ratio: Some(0.0),
             free_badge: Some("限时免费".into()),
+            reasoning_efforts: None,
+            default_reasoning_effort: None,
         };
         let d = to_dsh_model(&free);
         assert_eq!(d.name.as_deref(), Some("Hy3 (×0.00 限时免费)"));
@@ -1244,9 +1335,13 @@ agent-default-model:
             supports_reasoning: Some(true),
             points_ratio: Some(0.29),
             free_badge: None,
+            reasoning_efforts: Some(vec!["high".into()]),
+            default_reasoning_effort: Some("high".into()),
         };
         let d2 = to_dsh_model(&paid);
         assert_eq!(d2.name.as_deref(), Some("Hy4 preview (×0.29)"));
+        // The mapping carries the tiers through, so the writer can render them.
+        assert_eq!(d2.reasoning_efforts, vec!["high".to_string()]);
     }
 
     #[test]

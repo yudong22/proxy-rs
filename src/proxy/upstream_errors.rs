@@ -73,10 +73,9 @@ pub(super) async fn retry_as_stream(
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(ProxyError::Upstream(format!(
-            "Upstream returned {} (also as a stream): {}",
-            status, body
-        )));
+        // Same relay rule as the main path: a terminal rejection keeps the
+        // upstream's status instead of reading as a gateway fault.
+        return Err(ProxyError::from_upstream(status.as_u16(), body));
     }
 
     let (resp, timing) = collect_stream_into_response(response, retry_start).await?;

@@ -111,6 +111,81 @@ pub struct GuiModel {
     /// `夜间免费`). Rendered next to the name so a free model is obvious.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_badge: Option<String>,
+    /// Reasoning effort tiers this model actually offers, in escalation order.
+    ///
+    /// Taken from the upstream `reasoning.supportedEfforts` list (what the
+    /// gateway itself accepts), with the DeepSeek family pinned to its
+    /// documented `low`/`high`/`max` triplet. `None` means the upstream states
+    /// nothing enumerable, so the client catalogs keep their historical default
+    /// instead of inventing a capability the model does not have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
+    /// The tier the upstream itself defaults to, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<String>,
+}
+
+/// Reasoning effort tiers in escalation order, spelled the way both Codex and
+/// DSH spell them. `off` is excluded: it means "send nothing", not a tier.
+const EFFORT_ORDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The tiers the upstream DeepSeek family documents: `low`, `high` and `max`.
+///
+/// The gateway's own config lists exactly these for `deepseek-v4.1-flash`, while
+/// `deepseek-v4-pro` carries only a bare `effort: "high"` — no `supportedEfforts`
+/// list. Measuring reasoning volume per tier on the same proof prompt
+/// (low ≈1.5k chars, high ≈7k, max ≈7.6k) confirms the flagship honours all
+/// three, so the family is pinned rather than left on the generic four-level
+/// default (which would offer `medium`/`xhigh`, tiers the vendor never declared).
+const DEEPSEEK_EFFORTS: [&str; 3] = ["low", "high", "max"];
+
+/// Rank of a tier in [`EFFORT_ORDER`], or `None` when it is not a tier either
+/// client understands.
+fn effort_rank(effort: &str) -> Option<usize> {
+    EFFORT_ORDER.iter().position(|e| *e == effort)
+}
+
+/// Normalize a declared tier list: keep known tiers, sort by escalation order,
+/// de-duplicate. Returns `None` for an empty result, so callers can fall back
+/// rather than emit an empty menu (which both clients reject outright).
+fn normalize_efforts<I: IntoIterator<Item = String>>(raw: I) -> Option<Vec<String>> {
+    let mut tiers: Vec<String> = raw
+        .into_iter()
+        .filter_map(|t| {
+            let t = t.trim().to_string();
+            effort_rank(&t).map(|_| t)
+        })
+        .collect();
+    tiers.sort_by_key(|t| effort_rank(t).unwrap_or(usize::MAX));
+    tiers.dedup();
+    (!tiers.is_empty()).then_some(tiers)
+}
+
+/// The effort tiers a model offers, from the id family and the upstream config.
+///
+/// Precedence, most authoritative first:
+///
+/// 1. The DeepSeek family: its three documented tiers. The upstream entry for
+///    `deepseek-v4-pro` omits `supportedEfforts`, so keying off the id is the
+///    only way the flagship gets its real menu.
+/// 2. An explicit upstream `supportedEfforts` list (e.g. `glm-5.3` offers
+///    `low`/`high`/`max`, `hy4-preview` only `high`).
+/// 3. Nothing — the caller keeps its historical default. A bare `reasoning.effort`
+///    is deliberately *not* read as the full menu: it only says which tier the
+///    gateway runs by default, and narrowing the menu to it would take choices
+///    away from models that were selectable before.
+fn offered_efforts(id: &str, reasoning: Option<&WorkBuddyReasoning>) -> Option<Vec<String>> {
+    if id.starts_with("deepseek") {
+        return normalize_efforts(DEEPSEEK_EFFORTS.iter().map(|t| t.to_string()));
+    }
+    normalize_efforts(reasoning?.supported_efforts.clone().unwrap_or_default())
+}
+
+/// The tier the upstream names as its default, if it is one both clients know.
+fn declared_default_effort(reasoning: Option<&WorkBuddyReasoning>) -> Option<String> {
+    let effort = reasoning?.declared_default()?;
+    let effort = effort.trim();
+    effort_rank(effort).map(|_| effort.to_string())
 }
 
 /// WorkBuddy `/v3/config` response skeleton.
@@ -171,6 +246,35 @@ struct WorkBuddyModel {
     /// Upstream tags; our free models carry `badge:夜间免费` / `badge:限时免费`.
     #[serde(default)]
     tags: Option<Vec<String>>,
+    /// Upstream reasoning descriptor. Present on every reasoning-capable model,
+    /// but its shape varies: some models enumerate `supportedEfforts`, others
+    /// only pin a default `effort`.
+    #[serde(default)]
+    reasoning: Option<WorkBuddyReasoning>,
+}
+
+/// Upstream `reasoning` descriptor on a model entry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkBuddyReasoning {
+    /// Tiers the gateway accepts for this model, e.g. `["low","high","max"]`.
+    #[serde(default)]
+    supported_efforts: Option<Vec<String>>,
+    /// Tier the gateway runs when the request names none.
+    #[serde(default)]
+    default_effort: Option<String>,
+    /// Tier the entry pins directly (`reasoning.effort`, no `supportedEfforts`).
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+impl WorkBuddyReasoning {
+    /// The declared default, preferring the explicit `defaultEffort` and
+    /// falling back to the pinned `effort` — the two spellings the upstream
+    /// uses interchangeably across models.
+    fn declared_default(&self) -> Option<String> {
+        self.default_effort.clone().or_else(|| self.effort.clone())
+    }
 }
 
 /// Parse the upstream `credits` string into a numeric ratio.
@@ -245,6 +349,13 @@ pub async fn fetch_models(
             supports_reasoning: Some(true),
             points_ratio: Some(0.0),
             free_badge: Some("免费".to_string()),
+            // No tier list: the gateway resolves `free` to `hy3` by day and
+            // `hy4-preview` by night, and the night node declares only `high`.
+            // Advertising the union would offer a level half its targets never
+            // claim, so the virtual model keeps the historical single level and
+            // whatever each client defaults to instead of inventing a menu.
+            reasoning_efforts: None,
+            default_reasoning_effort: None,
         });
     }
 
@@ -305,6 +416,10 @@ async fn openai_list_models(
             supports_reasoning: None,
             points_ratio: None,
             free_badge: None,
+            // A plain `/v1/models` listing carries no capability metadata, so
+            // the clients keep their own defaults rather than a guess here.
+            reasoning_efforts: None,
+            default_reasoning_effort: None,
         })
         .collect())
 }
@@ -390,6 +505,8 @@ async fn fetch_workbuddy_models(
             supports_reasoning: m.supports_reasoning,
             points_ratio: parse_credits_ratio(&m.credits),
             free_badge: parse_free_badge(&m.tags),
+            reasoning_efforts: offered_efforts(&m.id, m.reasoning.as_ref()),
+            default_reasoning_effort: declared_default_effort(m.reasoning.as_ref()),
         });
     }
 
@@ -478,6 +595,8 @@ mod tests {
             supports_reasoning: None,
             points_ratio: None,
             free_badge: None,
+            reasoning_efforts: None,
+            default_reasoning_effort: None,
         }];
         if !models
             .iter()
@@ -494,6 +613,10 @@ mod tests {
                 supports_reasoning: Some(true),
                 points_ratio: Some(0.0),
                 free_badge: Some("免费".into()),
+                // The virtual model spans two upstreams with different
+                // declared menus, so it states none (see `fetch_models`).
+                reasoning_efforts: None,
+                default_reasoning_effort: None,
             });
         }
         assert!(models.iter().any(|m| m.id == "free"));
@@ -504,7 +627,70 @@ mod tests {
         assert_eq!(free.max_output_tokens, Some(64_000));
         assert_eq!(free.supports_images, Some(true));
         assert_eq!(free.supports_reasoning, Some(true));
+        // The virtual model spans two upstreams whose declared menus disagree,
+        // so it declares none rather than offering a level half of them reject.
+        assert_eq!(free.reasoning_efforts, None);
+        assert_eq!(free.default_reasoning_effort, None);
         // Only one `free` entry even if the list already had one.
         assert_eq!(models.iter().filter(|m| m.id == "free").count(), 1);
+    }
+
+    #[test]
+    fn deepseek_family_offers_three_tiers() {
+        for id in [
+            "deepseek-v4.1-flash",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+        ] {
+            assert_eq!(
+                offered_efforts(id, None).as_deref(),
+                Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice()),
+                "{id} must offer exactly low/high/max"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_supported_efforts_are_normalized() {
+        let reasoning = WorkBuddyReasoning {
+            supported_efforts: Some(vec!["max".into(), "low".into(), "high".into()]),
+            default_effort: Some("max".into()),
+            effort: None,
+        };
+        // Server order is not escalation order, and both clients expect the
+        // canonical one.
+        assert_eq!(
+            offered_efforts("glm-5.3", Some(&reasoning)).as_deref(),
+            Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice())
+        );
+        assert_eq!(
+            declared_default_effort(Some(&reasoning)).as_deref(),
+            Some("max")
+        );
+
+        let unknown = WorkBuddyReasoning {
+            supported_efforts: Some(vec!["off".into(), "bogus".into()]),
+            default_effort: Some("off".into()),
+            effort: None,
+        };
+        assert_eq!(offered_efforts("some-model", Some(&unknown)), None);
+        assert_eq!(declared_default_effort(Some(&unknown)), None);
+        assert_eq!(offered_efforts("some-model", None), None);
+    }
+
+    #[test]
+    fn pinned_effort_is_not_mistaken_for_the_whole_menu() {
+        // `deepseek-v4-pro` ships only `reasoning.effort: "high"`. It must not
+        // collapse a non-DeepSeek model's menu to that single tier either.
+        let pinned = WorkBuddyReasoning {
+            supported_efforts: None,
+            default_effort: None,
+            effort: Some("high".into()),
+        };
+        assert_eq!(offered_efforts("hy3", Some(&pinned)), None);
+        assert_eq!(
+            declared_default_effort(Some(&pinned)).as_deref(),
+            Some("high")
+        );
     }
 }

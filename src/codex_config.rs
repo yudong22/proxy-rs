@@ -53,12 +53,26 @@ struct CatalogModel {
     supported_in_api: bool,
     priority: i32,
     supported_reasoning_levels: Vec<ReasoningLevel>,
-    default_reasoning_level: &'static str,
+    default_reasoning_level: String,
     default_reasoning_summary: &'static str,
     truncation_policy: TruncationPolicy,
     experimental_supported_tools: Vec<String>,
     context_window: u64,
     max_context_window: u64,
+    /// Fraction of `context_window` Codex may actually fill before it is
+    /// required to compact.
+    ///
+    /// Codex defaults this to 95%, which assumes the advertised window matches
+    /// what the upstream really accepts. Ours does not always: the catalog
+    /// publishes the vendor's `maxInputTokens` (1,000,000 for the DeepSeek
+    /// family) while the gateway enforces a hard 1,048,576-token cap, so 95%
+    /// leaves only ~98k of headroom — one large tool result (a 300k-token jump
+    /// was measured) blows straight through it. Compaction then never gets a
+    /// turn, and the request fails at the upstream instead.
+    ///
+    /// Lowering the percentage makes Codex compact earlier, which is the whole
+    /// point: the fraction is a safety margin, not a measurement.
+    effective_context_window_percent: u32,
     support_verbosity: bool,
     apply_patch_tool_type: &'static str,
     web_search_tool_type: &'static str,
@@ -84,7 +98,7 @@ struct CatalogModel {
 
 #[derive(Debug, Clone, Serialize)]
 struct ReasoningLevel {
-    effort: &'static str,
+    effort: String,
     description: &'static str,
 }
 
@@ -102,6 +116,22 @@ struct Catalog {
 /// Baseline context window used when a provider does not report one.
 const DEFAULT_CONTEXT_WINDOW: u64 = 272_000;
 
+/// How much of the advertised window Codex is allowed to fill before compacting.
+///
+/// Codex's own default is 95%. That is right for a first-party model, where the
+/// advertised window *is* the enforced limit, and wrong here: the catalog
+/// republishes the vendor's advertised `maxInputTokens`, while the gateway
+/// enforces its own cap that need not match. The gap is small enough that a
+/// single large tool result can cross from "under the compaction threshold" to
+/// "over the hard limit" in one step, so the threshold has to leave real room
+/// rather than a token trim.
+///
+/// Measured on a real overflow: the last in-budget turn was 883,786 tokens and
+/// the next was 1,187,714 (+303,928 from one tool result), against a 1,048,576
+/// hard cap. 85% of the advertised 1,000,000 is 850,000 — comfortably above the
+/// last good turn, and 198,576 below the cap.
+const EFFECTIVE_CONTEXT_WINDOW_PERCENT: u32 = 85;
+
 const REASONING_LEVELS: [(&str, &str); 4] = [
     ("low", "Fast responses with lighter reasoning"),
     (
@@ -112,13 +142,95 @@ const REASONING_LEVELS: [(&str, &str); 4] = [
     ("xhigh", "Extra high reasoning depth for complex problems"),
 ];
 
+/// Codex's label for one effort tier, or `None` when Codex would not know it.
+///
+/// The effort strings are Codex's own (`minimal` … `xhigh`); `max` is accepted
+/// by the catalog parser as well (verified with `codex debug models`), but is
+/// not in the bundled four-level default, so it needs its own label here.
+fn reasoning_level_description(effort: &str) -> Option<&'static str> {
+    match effort {
+        "minimal" => Some("Minimal reasoning for the fastest responses"),
+        "low" => Some("Fast responses with lighter reasoning"),
+        "medium" => Some("Balances speed and reasoning depth for everyday tasks"),
+        "high" => Some("Greater reasoning depth for complex problems"),
+        "xhigh" => Some("Extra high reasoning depth for complex problems"),
+        "max" => Some("Maximum reasoning depth for the hardest problems"),
+        _ => None,
+    }
+}
+
+/// The reasoning menu one catalog entry advertises.
+///
+/// A model that declares its own tiers gets exactly those (`deepseek-v4.1-flash`
+/// → `low`/`high`/`max`) so the picker cannot offer a level the gateway rejects
+/// with `400 invalid_request_error`. Everything else keeps the historical
+/// four-level default, which every upstream model here accepts.
+fn reasoning_levels(declared: Option<&[String]>) -> Vec<ReasoningLevel> {
+    let tiers: Vec<&str> = declared
+        .map(|tiers| tiers.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let resolved: Vec<ReasoningLevel> = tiers
+        .iter()
+        .filter_map(|effort| {
+            reasoning_level_description(effort).map(|description| ReasoningLevel {
+                effort: (*effort).to_string(),
+                description,
+            })
+        })
+        .collect();
+    if resolved.is_empty() {
+        REASONING_LEVELS
+            .iter()
+            .map(|(effort, description)| ReasoningLevel {
+                effort: (*effort).to_string(),
+                description,
+            })
+            .collect()
+    } else {
+        resolved
+    }
+}
+
+/// Which advertised tier Codex should select by default.
+///
+/// The upstream's own default is honoured when it is one of the advertised
+/// tiers; otherwise the historical `medium` is used, except for a model that
+/// does not offer `medium` — then its highest advertised tier is picked, which
+/// is what the vendor itself runs when it names no default. Only tiers Codex can
+/// actually spell count as advertised, so a dropped vendor-only tier can never
+/// become a dangling default.
+fn default_reasoning_level<'a>(
+    declared: Option<&'a [String]>,
+    upstream: Option<&'a str>,
+) -> &'a str {
+    let advertised: Vec<&str> = declared
+        .map(|tiers| tiers.iter().map(String::as_str).collect())
+        .unwrap_or_else(|| REASONING_LEVELS.iter().map(|(e, _)| *e).collect());
+    let advertised: Vec<&str> = advertised
+        .into_iter()
+        .filter(|effort| reasoning_level_description(effort).is_some())
+        .collect();
+    if let Some(default) = upstream.filter(|d| advertised.iter().any(|a| a == d)) {
+        return default;
+    }
+    if advertised.contains(&"medium") {
+        return "medium";
+    }
+    advertised.last().copied().unwrap_or("medium")
+}
+
 /// Human label for a model: `name (id) ×ratio badge` when extras are present,
 /// otherwise just the id. The ratio is the upstream 积分 consumption multiplier
 /// (`points_ratio`); `Some(0.0)` means free. Used by `build_model` so the Codex
 /// picker shows the relative cost next to the model name. The id is wrapped in
 /// parentheses only when a distinct display name is present, and that paren is
 /// always closed before the ratio/badge are appended.
-fn model_label(id: &str, name: Option<&str>, points_ratio: Option<f64>, free_badge: Option<&str>) -> String {
+fn model_label(
+    id: &str,
+    name: Option<&str>,
+    points_ratio: Option<f64>,
+    free_badge: Option<&str>,
+) -> String {
     let mut label = String::new();
     let mut paren_open = false;
     match name {
@@ -151,15 +263,16 @@ fn model_label(id: &str, name: Option<&str>, points_ratio: Option<f64>, free_bad
 }
 
 /// Build one catalog entry for a provider model id.
-fn build_model(
-    id: &str,
-    name: Option<&str>,
-    context_window: Option<u64>,
-    points_ratio: Option<f64>,
-    free_badge: Option<&str>,
-) -> CatalogModel {
-    let ctx = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW).max(1);
-    let display_name = model_label(id, name, points_ratio, free_badge);
+fn build_model(m: &crate::providers::GuiModel) -> CatalogModel {
+    let id = m.id.as_str();
+    let ctx = m.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW).max(1);
+    let display_name = model_label(
+        id,
+        m.name.as_deref(),
+        m.points_ratio,
+        m.free_badge.as_deref(),
+    );
+    let declared = m.reasoning_efforts.as_deref();
     CatalogModel {
         slug: id.to_string(),
         display_name: display_name.clone(),
@@ -173,14 +286,12 @@ fn build_model(
         visibility: "list",
         supported_in_api: true,
         priority: 1,
-        supported_reasoning_levels: REASONING_LEVELS
-            .iter()
-            .map(|(effort, description)| ReasoningLevel {
-                effort,
-                description,
-            })
-            .collect(),
-        default_reasoning_level: "medium",
+        supported_reasoning_levels: reasoning_levels(declared),
+        default_reasoning_level: default_reasoning_level(
+            declared,
+            m.default_reasoning_effort.as_deref(),
+        )
+        .to_string(),
         default_reasoning_summary: "none",
         truncation_policy: TruncationPolicy {
             mode: "tokens",
@@ -189,6 +300,7 @@ fn build_model(
         experimental_supported_tools: Vec::new(),
         context_window: ctx,
         max_context_window: ctx,
+        effective_context_window_percent: EFFECTIVE_CONTEXT_WINDOW_PERCENT,
         support_verbosity: false,
         apply_patch_tool_type: "freeform",
         web_search_tool_type: "text",
@@ -215,18 +327,7 @@ fn build_model(
 
 /// Render a Codex catalog JSON document for the given models.
 pub fn render_catalog(models: &[crate::providers::GuiModel]) -> Result<String> {
-    let entries = models
-        .iter()
-        .map(|m| {
-            build_model(
-                &m.id,
-                m.name.as_deref(),
-                m.context_window,
-                m.points_ratio,
-                m.free_badge.as_deref(),
-            )
-        })
-        .collect();
+    let entries = models.iter().map(build_model).collect();
     serde_json::to_string_pretty(&Catalog { models: entries })
         .context("failed to serialize Codex model catalog")
 }
@@ -401,6 +502,8 @@ mod tests {
             supports_reasoning: None,
             points_ratio: None,
             free_badge: None,
+            reasoning_efforts: None,
+            default_reasoning_effort: None,
         }
     }
 
@@ -451,6 +554,46 @@ mod tests {
         assert_eq!(parsed["models"][0]["max_context_window"], 512_000);
     }
 
+    /// The advertised window gets a safety margin so Codex compacts *before* the
+    /// upstream's own hard cap, not after it.
+    ///
+    /// Codex's default is 95%. The DeepSeek family advertises 1,000,000 against
+    /// a 1,048,576 hard cap, so 95% leaves 98k of headroom — and a single tool
+    /// result was measured adding 303,928 tokens. Compaction has to be asked for
+    /// earlier than that, or it never gets a turn.
+    #[test]
+    fn catalog_narrows_the_effective_context_window() {
+        let mut m = model("deepseek-v4.1-flash");
+        m.context_window = Some(1_000_000);
+        let json = render_catalog(&[m]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entry = &parsed["models"][0];
+        assert_eq!(entry["context_window"], 1_000_000);
+        let percent = entry["effective_context_window_percent"].as_u64().unwrap();
+        assert!(
+            percent < 95,
+            "must be tighter than Codex's own default, got {percent}"
+        );
+        assert!(
+            percent >= 50,
+            "must not cripple the usable window, got {percent}"
+        );
+    }
+
+    /// The margin is emitted for every model, so a model that inherits the
+    /// default window is not left on Codex's 95%.
+    #[test]
+    fn every_entry_carries_the_effective_percent() {
+        let json = render_catalog(&[model("hy3"), model("glm-5.3")]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for entry in parsed["models"].as_array().unwrap() {
+            assert_eq!(
+                entry["effective_context_window_percent"],
+                EFFECTIVE_CONTEXT_WINDOW_PERCENT
+            );
+        }
+    }
+
     #[test]
     fn display_name_falls_back_to_id() {
         let json = render_catalog(&[model("hy3")]).unwrap();
@@ -478,6 +621,104 @@ mod tests {
         m.free_badge = Some("免费".into());
         let json = render_catalog(&[m]).unwrap();
         assert!(json.contains("\"display_name\": \"free ×0.00 免费\""));
+    }
+
+    fn efforts(tiers: &[&str]) -> Option<Vec<String>> {
+        Some(tiers.iter().map(|t| t.to_string()).collect())
+    }
+
+    #[test]
+    fn declared_tiers_replace_the_default_menu() {
+        // The DeepSeek family offers `low`/`high`/`max`; Codex must show exactly
+        // that, or the picker offers a level the gateway answers with a 400.
+        let mut m = model("deepseek-v4.1-flash");
+        m.reasoning_efforts = efforts(&["low", "high", "max"]);
+        m.default_reasoning_effort = Some("high".into());
+        let json = render_catalog(&[m]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entry = &parsed["models"][0];
+        let levels: Vec<&str> = entry["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(levels, ["low", "high", "max"]);
+        // Every level carries a description; Codex renders it in the picker.
+        assert!(entry["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|l| l["description"].as_str().is_some_and(|d| !d.is_empty())));
+        assert_eq!(entry["default_reasoning_level"], "high");
+    }
+
+    #[test]
+    fn undeclared_model_keeps_the_historical_four_levels() {
+        let json = render_catalog(&[model("hy3")]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let levels: Vec<&str> = parsed["models"][0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(levels, ["low", "medium", "high", "xhigh"]);
+        assert_eq!(parsed["models"][0]["default_reasoning_level"], "medium");
+    }
+
+    #[test]
+    fn default_level_is_honoured_only_when_advertised() {
+        // Upstream says `max`, which it also advertises: keep it.
+        let mut m = model("glm-5.3");
+        m.reasoning_efforts = efforts(&["low", "high", "max"]);
+        m.default_reasoning_effort = Some("max".into());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_catalog(&[m]).unwrap()).unwrap();
+        assert_eq!(parsed["models"][0]["default_reasoning_level"], "max");
+
+        // Upstream says `max` but the advertised menu has no `max`: the default
+        // must still be one of the advertised levels, never a dangling one.
+        let mut m = model("some-model");
+        m.reasoning_efforts = efforts(&["low", "high"]);
+        m.default_reasoning_effort = Some("max".into());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_catalog(&[m]).unwrap()).unwrap();
+        assert_eq!(parsed["models"][0]["default_reasoning_level"], "high");
+    }
+
+    #[test]
+    fn single_tier_model_defaults_to_that_tier() {
+        // `hy4-preview` only offers `high`, so `medium` would be unselectable.
+        let mut m = model("hy4-preview");
+        m.reasoning_efforts = efforts(&["high"]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_catalog(&[m]).unwrap()).unwrap();
+        assert_eq!(
+            parsed["models"][0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(parsed["models"][0]["default_reasoning_level"], "high");
+    }
+
+    #[test]
+    fn unknown_tiers_are_dropped_not_rendered() {
+        // A vendor tier Codex has no spelling for must not reach the catalog.
+        let mut m = model("x");
+        m.reasoning_efforts = efforts(&["low", "ultra"]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_catalog(&[m]).unwrap()).unwrap();
+        let levels: Vec<&str> = parsed["models"][0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(levels, ["low"]);
+        assert_eq!(parsed["models"][0]["default_reasoning_level"], "low");
     }
 
     #[test]

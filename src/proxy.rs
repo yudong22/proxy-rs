@@ -1703,21 +1703,26 @@ async fn forward_request(
                         .await;
                     }
 
-                    let err =
-                        ProxyError::Upstream(format!("Upstream returned {}: {}", status, body));
-                    if is_retriable_status(status.as_u16()) {
-                        last_err = Some(err);
-                        continue 'url; // try next upstream URL
-                    }
                     // After the degraded retry still fails, report a content_blocked
                     // error the client can understand rather than a generic upstream
-                    // one.
+                    // one. Checked before `body` is consumed below, so a rejected
+                    // body is never copied just to build the error.
                     if is_content_blocked(status.as_u16(), &body) {
                         return Err(ProxyError::Upstream(
-                        "Upstream rejected the request as content policy violation (code 11128). \
+                        "Upstream rejected the request as content policy violation (code 11-128). \
                          The degraded retry also failed."
                             .to_string(),
                     ));
+                    }
+                    // Terminal rejections (400/413/422) keep the upstream's own
+                    // status so the client can act on them; anything else stays a
+                    // 502 gateway fault. See `ProxyError::from_upstream` — a
+                    // context-overflow 400 reported as 502 made Codex retry the
+                    // identical prompt 37 times instead of compacting.
+                    let err = ProxyError::from_upstream(status.as_u16(), body);
+                    if is_retriable_status(status.as_u16()) {
+                        last_err = Some(err);
+                        continue 'url; // try next upstream URL
                     }
                     return Err(err);
                 }
@@ -2235,10 +2240,7 @@ pub async fn list_models_handler(
                     last_err = Some(format!("Upstream returned {}: {}", status, error_text));
                     continue;
                 }
-                return Err(ProxyError::Upstream(format!(
-                    "Upstream returned {}: {}",
-                    status, error_text
-                )));
+                return Err(ProxyError::from_upstream(status.as_u16(), error_text));
             }
             Err(err) => {
                 tracing::warn!("Failed to reach {}: {:?}", url, err);
