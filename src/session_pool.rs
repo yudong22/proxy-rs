@@ -13,10 +13,19 @@
 //!    stays there, so its follow-up turns rebuild and reuse the cache instead
 //!    of being scattered per request. The session is *not* bounced back when
 //!    the default recovers — that flip-flop would invalidate the cache twice.
+//!    It *is* sent home when its replacement becomes unusable without ever
+//!    being manually re-enabled — the quota reset at local midnight, or a
+//!    failed token refresh parking the account for a minute. The account is
+//!    then honestly dead, and `pick` re-homes the session through [`switch`],
+//!    which records the new sticky binding. Skipping that left the session on
+//!    the default with no binding, so it flipped back the moment the default
+//!    recovered — see [`StickySession::away_since_ms`] for the full failure.
 //!
 //! The `switched` map is the only state: sessions that never errored do not
 //! appear in it, so the hot path is one map lookup, and nothing is persisted —
 //! a restart returns to "everything on the default", costing one cache warm-up.
+//!
+//! [`switch`]: CredentialPool::switch
 
 use crate::workbuddy_auth::WorkBuddyCredential;
 use std::collections::HashMap;
@@ -36,7 +45,43 @@ pub const DEFAULT_STICKY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 struct StickySession {
     credential_id: String,
     expires_at_ms: i64,
+    /// When `pick` first found the bound credential unusable, or `None` while
+    /// it was healthy. Set only by [`CredentialPool::pick`].
+    ///
+    /// This separates the two ways a binding can go stale, which the plan's
+    /// contract treats differently:
+    ///
+    /// * **Re-enabled by hand** — the GUI clears the cooldown and reloads the
+    ///   pool. The binding is forgotten immediately, so the session rejoins
+    ///   the default-first policy from its next request.
+    /// * **Recovered on its own** — a quota cooldown runs out at local
+    ///   midnight, or a failed token refresh parks the account for 60 s. The
+    ///   session is sent back to the configured default, and the binding is
+    ///   *kept* for [`STICKY_AWAY_MS`] after it was first found dead, so a
+    ///   default that has meanwhile filled up again does not pull it into a
+    ///   failover round-trip-per-session. After that grace the binding is
+    ///   dropped like any expired one.
+    ///
+    /// The previous behaviour (always fall through to the default, keep the
+    /// binding forever) silently broke the switch in the common daily case: a
+    /// session failed over at night, `pick` saw the bound account cooling,
+    /// served the default, and when the cooldown lapsed it resumed serving the
+    /// sticky-bound default — the GUI offered no way to move the session —
+    /// instead of re-homing it onto a healthy account. [`pick`] now re-homes
+    /// through [`switch`] in that same request.
+    ///
+    /// [`pick`]: CredentialPool::pick
+    /// [`switch`]: CredentialPool::switch
+    away_since_ms: Option<i64>,
 }
+
+/// How long a session whose sticky credential went dead may head home (or be
+/// re-homed by `pick`) before its dead binding is dropped for good.
+///
+/// Covers the longest self-healing outage seen in practice (a local-midnight
+/// quota reset being the shortest, a failed-refresh park being 60 s) with room
+/// to spare, without pinning a session to a long-gone choice for its whole TTL.
+pub const STICKY_AWAY_MS: i64 = 10 * 60 * 1000;
 
 /// The pool state. Constructed once per proxy start from the credential store.
 pub struct CredentialPool {
@@ -90,31 +135,82 @@ impl CredentialPool {
 
     /// Choose the credential for one request.
     ///
-    /// Resolution order (see the module docs): a healthy sticky binding wins —
-    /// otherwise the default credential. The default is simply the first
-    /// usable entry; the "most remaining quota / rotation" preference applies
-    /// only at the moment of an actual failover (in [`Self::switch`]), never
-    /// here.
+    /// Resolution order (see the module docs):
+    ///
+    /// 1. A healthy sticky binding.
+    /// 2. A binding whose credential is gone (deleted) is dropped and the
+    ///    session revisited.
+    /// 3. A binding whose credential is merely unhealthy (cooldown, expiry)
+    ///    is remembered as dead, and the session is re-homed via [`Self::switch`]
+    ///    onto a credential other than that one — exactly as a failover would
+    ///    have done had this request hit the error instead of discovering the
+    ///    dead state up front. A dead default is left alone: the next request
+    ///    re-homes when the default recovers.
+    /// 4. The default: first usable entry.
+    ///
+    /// The "most remaining quota / rotation" preference applies only when a
+    /// failover actually picks a replacement (in [`Self::switch`]), never on the
+    /// plain default path.
     pub async fn pick(&self, session_id: &str) -> Option<WorkBuddyCredential> {
         let now = crate::util::unix_millis();
         let entries = self.entries.read().await;
 
-        // 1. Sticky: only for a session that a previous 4xx actually moved.
+        let mut revisit = false;
         if let Some(binding) = self.switched.read().await.get(session_id) {
-            if now < binding.expires_at_ms {
-                if let Some(c) = entries
-                    .iter()
-                    .find(|c| c.id == binding.credential_id && c.is_usable(now))
-                {
-                    return Some(c.clone());
+            match entries.iter().find(|c| c.id == binding.credential_id) {
+                // Healthy and within TTL: the cache is warm there, stay.
+                Some(c) if now < binding.expires_at_ms && c.is_usable(now) => {
+                    return Some(c.clone())
                 }
+                // Unhealthy, deleted, or the TTL ran out: decide in `rehome`.
+                _ => revisit = true,
             }
-            // Expired binding or its credential is gone/unhealthy: fall
-            // through to the default and let a later `switch` re-home.
         }
 
-        // 2. Default: first usable entry.
+        if revisit {
+            self.rehome(session_id).await;
+        }
+
+        // Default: first usable entry.
         entries.iter().find(|c| c.is_usable(now)).cloned()
+    }
+
+    /// Resolve the sticky binding that [`Self::pick`] found unusable.
+    ///
+    /// Drops it when its credential is gone or the grace period has run out,
+    /// otherwise records it as dead and re-homes the session with
+    /// [`Self::switch`] onto a credential other than the dead one. When the
+    /// dead credential is still the first usable entry there is nothing to
+    /// fail over to: the session heads back to the default (step 4 of
+    /// [`Self::pick`]) and is re-homed the request after that default
+    /// recovers.
+    async fn rehome(&self, session_id: &str) {
+        let now = crate::util::unix_millis();
+        let from = {
+            let mut switched = self.switched.write().await;
+            let Some(binding) = switched.get_mut(session_id) else {
+                return;
+            };
+            // Expired or past its grace: the binding is spent, go home for good.
+            let first_seen = *binding.away_since_ms.get_or_insert(now);
+            if now >= binding.expires_at_ms || now - first_seen > STICKY_AWAY_MS {
+                switched.remove(session_id);
+                return;
+            }
+            binding.credential_id.clone()
+        };
+
+        let default = self
+            .entries
+            .read()
+            .await
+            .iter()
+            .find(|c| c.is_usable(now))
+            .map(|c| c.id.clone());
+        if default.as_deref() == Some(from.as_str()) {
+            return;
+        }
+        let _ = self.switch(session_id, &from).await;
     }
 
     /// Failover: choose a replacement for `from` on behalf of one session and
@@ -159,6 +255,7 @@ impl CredentialPool {
             StickySession {
                 credential_id: chosen.id.clone(),
                 expires_at_ms: now + self.sticky_ttl_ms,
+                away_since_ms: None,
             },
         );
         Some(chosen)
@@ -245,14 +342,29 @@ impl CredentialPool {
     /// Only the bindings pointing at a credential that no longer exists are
     /// dropped; the rest keep their session on the account they were relocated
     /// to, so re-selecting a default does not invalidate everyone's cache.
+    ///
+    /// The exception is a credential that was disabled in the pool and is
+    /// enabled again: the user has just put it back into service by hand, so
+    /// the sessions bound to it rejoin the default-first policy instead of
+    /// reappearing there as if nothing happened. (A credential that comes back
+    /// healthy on its own — a cooldown running out — is *not* such a signal
+    /// and keeps its bindings; see [`StickySession::away_since_ms`].)
     pub async fn reload(&self, credentials: Vec<WorkBuddyCredential>) {
         let present: std::collections::HashSet<String> =
             credentials.iter().map(|c| c.id.clone()).collect();
+        let reenabled: std::collections::HashSet<String> = {
+            let old = self.entries.read().await;
+            credentials
+                .iter()
+                .filter(|c| c.enabled)
+                .filter(|c| old.iter().any(|o| o.id == c.id && !o.enabled))
+                .map(|c| c.id.clone())
+                .collect()
+        };
         *self.entries.write().await = credentials;
-        self.switched
-            .write()
-            .await
-            .retain(|_, s| present.contains(&s.credential_id));
+        self.switched.write().await.retain(|_, s| {
+            present.contains(&s.credential_id) && !reenabled.contains(&s.credential_id)
+        });
     }
 
     /// Reload from the credential store, honouring the selected default's
@@ -272,6 +384,16 @@ impl CredentialPool {
     /// How many sessions currently sit on a relocated credential (GUI display).
     pub async fn sticky_count(&self) -> usize {
         self.switched.read().await.len()
+    }
+
+    /// How many sessions are sticky-bound to one credential (GUI display).
+    pub async fn sticky_sessions_for(&self, id: &str) -> usize {
+        self.switched
+            .read()
+            .await
+            .values()
+            .filter(|s| s.credential_id == id)
+            .count()
     }
 
     /// A snapshot of all credentials for the GUI credential list.
@@ -406,17 +528,127 @@ mod tests {
         assert_eq!(p.pick("codex:s2").await.unwrap().id, "wb-a");
     }
 
-    /// Expired sticky bindings no longer pin the session.
+    /// An expired sticky binding is dropped and the session rejoins the
+    /// default-first policy instead of quietly resuming on whichever account is
+    /// bound in the map.
+    ///
+    /// Regression: expiry used to fall through to "first usable" with the
+    /// binding left in place, so the GUI kept reporting a session as sticky on
+    /// an account it was no longer using — and the session resumed there as
+    /// soon as that account became first-usable again.
     #[tokio::test]
-    async fn expired_sticky_binding_is_ignored() {
-        let p = CredentialPool::with_limits(
-            vec![cred("wb-a"), cred("wb-b")],
-            DEFAULT_SWITCHED_CAPACITY,
-            // TTL in the past — every binding is immediately stale.
-            -1_000,
-        );
+    async fn expired_sticky_binding_is_dropped() {
+        let p = pool(&["wb-a", "wb-b"]);
         p.switch("claude:s1", "wb-a").await.unwrap();
+        if let Some(b) = p.switched.write().await.get_mut("claude:s1") {
+            b.expires_at_ms = crate::util::unix_millis() - 1;
+        }
+
         assert_eq!(p.pick("claude:s1").await.unwrap().id, "wb-a");
+        assert_eq!(p.sticky_count().await, 0, "the stale binding is forgotten");
+        assert_eq!(p.pick("claude:s1").await.unwrap().id, "wb-a");
+    }
+
+    /// The reported bug: an account that runs out of quota is cooled down until
+    /// local midnight, the session moves to the next account, and when the
+    /// midnight reset lifts the cooldown the session must keep serving from the
+    /// replacement — not fall back to re-served default-first and re-stick to
+    /// the exhausted account.
+    #[tokio::test]
+    async fn session_does_not_return_to_an_account_that_recovers_from_quota() {
+        let p = pool(&["wb-a", "wb-b", "wb-c"]);
+        p.mark_limited("wb-a", 60_000).await;
+        p.switch("claude:s1", "wb-a").await.unwrap();
+        assert_eq!(p.pick("claude:s1").await.unwrap().id, "wb-b");
+
+        // Midnight: wb-a's quota resets and it is usable again — but nobody
+        // re-enabled it by hand.
+        p.mark_ok("wb-a").await;
+
+        assert_eq!(
+            p.pick("claude:s1").await.unwrap().id,
+            "wb-b",
+            "the relocated session must stay on its replacement"
+        );
+        // A session that never failed over still goes to the default.
+        assert_eq!(p.pick("claude:s2").await.unwrap().id, "wb-a");
+    }
+
+    /// Hand-re-enabling an account in the GUI puts its sessions back under the
+    /// default-first policy: disabling wb-b relocates them to wb-c, so enabling
+    /// it again must not silently pull them back and make wb-c look sticky.
+    #[tokio::test]
+    async fn reenabled_account_does_not_pull_sessions_back() {
+        let p = pool(&["wb-a", "wb-b", "wb-c"]);
+        p.mark_limited("wb-a", 60_000).await;
+        p.switch("claude:s1", "wb-a").await.unwrap();
+        assert_eq!(p.pick("claude:s1").await.unwrap().id, "wb-b");
+
+        let mut items = p.snapshot().await;
+        items[1].enabled = false;
+        p.reload(items).await;
+        assert_eq!(p.pick("claude:s1").await.unwrap().id, "wb-c");
+
+        // The GUI toggle reloads with wb-b enabled and its cooldown cleared;
+        // the reload itself is what notices the hand re-enable.
+        let mut items = p.snapshot().await;
+        items[1].enabled = true;
+        items[1].cooldown_until_ms = None;
+        p.reload(items).await;
+        // wb-b is enabled but wb-a is cooling and wb-c is next in line, so
+        // the session is re-homed onto wb-c again — with a fresh binding.
+        assert_eq!(p.pick("claude:s1").await.unwrap().id, "wb-c");
+        assert_eq!(p.sticky_count().await, 1, "one fresh binding, not two");
+        assert_eq!(p.pick("claude:s1").await.unwrap().id, "wb-c");
+        assert_eq!(p.sticky_count().await, 1);
+    }
+
+    /// A session bound to an account that is disabled and then deleted is
+    /// re-homed on its next request rather than riding the default until it
+    /// errors.
+    #[tokio::test]
+    async fn disabled_then_deleted_binding_rehomes_on_pick() {
+        let p = pool(&["wb-a", "wb-b", "wb-c"]);
+        p.mark_limited("wb-a", 60_000).await;
+        p.switch("claude:s1", "wb-a").await.unwrap();
+        assert_eq!(p.pick("claude:s1").await.unwrap().id, "wb-b");
+
+        // Disabled in the GUI: the binding survives the reload (it is not a
+        // re-enable), but the account can no longer serve.
+        let mut items = p.snapshot().await;
+        items[1].enabled = false;
+        p.reload(items).await;
+        assert_eq!(p.pick("claude:s1").await.unwrap().id, "wb-c");
+        assert_eq!(
+            p.pick("claude:s1").await.unwrap().id,
+            "wb-c",
+            "and it stays there"
+        );
+    }
+
+    /// Once the grace period has passed, a dead binding is dropped and the
+    /// session simply follows the default again.
+    #[tokio::test]
+    async fn stale_dead_binding_is_dropped_after_the_grace_period() {
+        let p = pool(&["wb-a", "wb-b"]);
+        p.switch("claude:s1", "wb-a").await.unwrap();
+
+        // wb-b is gone (disabled) well past the grace period: nothing to
+        // re-home onto, so `pick` waits for the default rather than writing a
+        // fresh binding every request.
+        let mut items = p.snapshot().await;
+        items[1].enabled = false;
+        p.reload(items).await;
+        if let Some(b) = p.switched.write().await.get_mut("claude:s1") {
+            b.away_since_ms = Some(crate::util::unix_millis() - STICKY_AWAY_MS - 1);
+        }
+        let picked = p.pick("claude:s1").await.unwrap();
+        assert_eq!(picked.id, "wb-a", "back to the default-first policy");
+        assert_eq!(
+            p.sticky_count().await,
+            0,
+            "the dead binding is dropped, not re-homed forever"
+        );
     }
 
     /// An empty pool reports disabled so the legacy path stays untouched.

@@ -607,7 +607,6 @@ fn mask_credential(
 #[tauri::command]
 async fn wb_credentials_list(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     let items = proxy_rs::workbuddy_auth::load_credentials();
-    let sticky = ctx.credential_pool.sticky_count().await;
     let prefs = proxy_rs::workbuddy_auth::load_preferences();
     // With no explicit default the first usable credential is the one in force,
     // so the badge follows the same rule the pool's `pick` uses.
@@ -621,10 +620,13 @@ async fn wb_credentials_list(ctx: State<'_, Arc<AppContext>>) -> Result<Value, S
     } else {
         prefs.default_credential_id.clone()
     };
-    let list: Vec<Value> = items
-        .iter()
-        .map(|c| mask_credential(c, sticky, c.id == default_id))
-        .collect();
+    let mut list: Vec<Value> = Vec::with_capacity(items.len());
+    for c in &items {
+        // Per credential, not the pool-wide total: every row used to show the
+        // *total* sticky count ("1 个会话粘滞" on every account).
+        let sessions = ctx.credential_pool.sticky_sessions_for(&c.id).await;
+        list.push(mask_credential(c, sessions, c.id == default_id));
+    }
     Ok(json!({
         "credentials": list,
         "default_credential_id": prefs.default_credential_id,

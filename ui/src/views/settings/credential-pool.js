@@ -73,7 +73,12 @@ export async function renderIdentityPool() {
     const credRows = creds.map((c) => {
       const [stateLabel, stateClass] = WB_STATE_LABELS[c.state] || ['未知', ''];
       const isDefault = effDefault === c.id;
-      const stickyNote = c.sticky_sessions > 0
+      // Only a relocated, still-healthy account is worth calling out: it is the
+      // one serving sessions that are *not* on the default. A cooled/disabled
+      // account that still holds bindings is not serving anyone, and the
+      // default account is where sessions normally live, so labelling it
+      // "sticky" read as if every account were sticky.
+      const stickyNote = c.sticky_sessions > 0 && c.state === 'ok' && !isDefault
         ? raw(`<span class="wb-sticky-note">${c.sticky_sessions} 个会话粘滞</span>`)
         : '';
       const defaultBadge = isDefault
