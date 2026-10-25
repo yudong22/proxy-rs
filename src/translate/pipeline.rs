@@ -1751,6 +1751,44 @@ mod tests {
         assert_ne!(out, DSH_OPENER, "rewrite must not be an identity mapping");
     }
 
+    /// Every entry of `rewrite_table` must actually change the text.
+    ///
+    /// A pair whose `from` and `to` are identical — including the case where a
+    /// zero-width character used to break a literal match is lost on write — is a
+    /// silent no-op: `sanitize_text` appears to run and returns the original
+    /// string, so the request is still rejected while tests pass. That exact
+    /// failure shipped once (v2.1.5, per its own commit message), which is why
+    /// this asserts on the whole table rather than one hand-picked phrase.
+    #[test]
+    fn every_rewrite_pair_actually_rewrites() {
+        for (from, to) in rewrite_table() {
+            assert_ne!(
+                from, to,
+                "no-op rewrite pair (from == to): {from:?} — it would silently match nothing"
+            );
+        }
+    }
+
+    /// The rewrite must be observable through the public path, not just the table:
+    /// `sanitize_text` on the source phrasing has to yield the target phrasing.
+    #[test]
+    fn every_rewrite_pair_is_applied_by_sanitize_text() {
+        for (from, to) in rewrite_table() {
+            // `sanitize_text` gates on `has_fingerprint` first, so a pair whose
+            // source is not a feature substring would never run. Asserting the
+            // output pins both the gate and the replacement together.
+            let out = sanitize_text(from);
+            assert_ne!(
+                out, *from,
+                "sanitize_text left {from:?} untouched — has_fingerprint may not cover it"
+            );
+            assert!(
+                out.contains(to) || *to == out.trim(),
+                "sanitize_text({from:?}) = {out:?} does not contain the target {to:?}"
+            );
+        }
+    }
+
     /// The upstream normalizes zero-width characters away, so a zero-width-based
     /// "break the literal" trick is invisible to it. This pass must not rely on
     /// invisible characters to work.
