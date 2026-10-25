@@ -121,6 +121,14 @@ const MOCK = {
   // Growth automation: the mock reports what a run would produce so the button's
   // message can be asserted. `total_claimed`/`total_credits` are what the UI reads.
   wb_growth_run: { total_accounts: 1, total_claimed: 2, total_credits: 200, accounts: [] },
+  // The mock below fires `growth-progress` events the way the real command does,
+  // so the smoke test can assert the progress box actually fills in.
+  __growth_progress_events: [
+    { phase: 'account_start', index: 1, total: 2, credential_id: 'cred-1', label: '测试账号一' },
+    { phase: 'task_claimed', credential_id: 'cred-1', code: 'chat_5', credit: 100 },
+    { phase: 'account_done', credential_id: 'cred-1', label: '测试账号一', claimed: 1, credits: 100 },
+    { phase: 'finished', accounts: 1, claimed: 1, credits: 100 },
+  ],
   wb_growth_run_single: { credential_id: 'cred-1', label: '测试账号一', claimed: [], credits_earned: 0, skipped: [], stalled: [], errors: [] },
   wb_growth_preview: { tasks: [], energy: 13, earnable: 800 },
   fetch_models: { models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }] },
@@ -354,7 +362,20 @@ try {
         window.__INVOKE_ARGS__[cmd] = args;
         return Promise.resolve(Object.prototype.hasOwnProperty.call(window.__MOCKDATA__, cmd)
           ? window.__MOCKDATA__[cmd] : null); } },
-      event: { listen: () => Promise.resolve(() => {}) },
+      // A real dispatcher: listen() records the handler and __emitTestEvent
+      // fires it. An empty stub made every event-driven feature untestable --
+      // the growth progress box could not be asserted at all, which is how a
+      // "no progress shown" regression reached the user.
+      event: {
+        __handlers: {},
+        listen: (name, handler) => {
+          (window.__TAURI__.event.__handlers[name] ||= []).push(handler);
+          return Promise.resolve(() => {});
+        },
+      },
+    };
+    window.__emitTestEvent = (name, payload) => {
+      for (const h of window.__TAURI__.event.__handlers[name] || []) h({ payload });
     };` });
 
   await send('Page.navigate', { url: `http://127.0.0.1:${PORT}/index.html` });
@@ -470,6 +491,47 @@ try {
   check('growth switch exists', b.growth.togglePresent, true);
   check('growth switch defaults to off', b.growth.toggleChecked, false);
   check('growth hint says it is off', b.growth.hint.includes('关闭中'), true);
+
+  // Cross-module integration 5: the growth-run progress stream.
+  //
+  // This is the regression the user reported: clicking 增长 gave no feedback at
+  // all. The assertion drives the real button, emits the same `growth-progress`
+  // events the backend sends, and requires the progress box to show them.
+  await send('Runtime.evaluate', { expression: `(() => {
+    window.__CALLS__ = [];
+    document.querySelector('#btn-wb-growth').click();
+  })()` });
+  // Let the click handler set up its state before the events arrive.
+  await new Promise((r) => setTimeout(r, 150));
+  await send('Runtime.evaluate', { expression: `(() => {
+    for (const p of window.__MOCKDATA__.__growth_progress_events) {
+      window.__emitTestEvent('growth-progress', p);
+    }
+  })()` });
+  await new Promise((r) => setTimeout(r, 1200));
+
+  const growthUi = await send('Runtime.evaluate', {
+    returnByValue: true,
+    expression: `(() => {
+      const el = document.querySelector('#wb-growth-progress');
+      const txt = (el?.textContent || '').trim();
+      return {
+        visible: Boolean(el) && !el.hidden,
+        text: txt,
+        called: window.__CALLS__.includes('wb_growth_run'),
+        buttonLabel: document.querySelector('#btn-wb-growth')?.textContent?.trim(),
+      };
+    })()`,
+  });
+  const g = growthUi.result.value;
+  check('growth run invoked', g.called, true);
+  check('growth progress box is visible', g.visible, true);
+  // The per-account line and the claimed-credit line must both appear: those are
+  // the two things that tell the user something is happening.
+  check('growth progress shows the account', g.text.includes('测试账号一'), true);
+  check('growth progress shows the claimed task', g.text.includes('chat_5'), true);
+  check('growth progress shows earned credits', g.text.includes('100'), true);
+  check('growth button restored after run', g.buttonLabel.includes('增长积分'), true);
   check('selectValue', b.selectValue, EXPECTED.selectValue);
   check('dsh button present', b.dshButtonPresent, EXPECTED.dshButtonPresent);
   check('dsh status', b.dshStatus, EXPECTED.dshStatus);

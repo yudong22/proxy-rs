@@ -216,16 +216,48 @@ pub async fn run_account_with_progress(
         tasks.retain(|t| only.contains(&t.code.as_str()));
     }
 
-    // ── 1. auto 类先处理 ──────────────────────────────────────────────
-    // `first_buddy` 属于这一类，且是其余任务的前置：不先领到它，后面所有
-    // single 任务接取都会失败。它们也不接受接取，直接上报即可。
+    // ── 1. auto 类先处理（含「已完成待领奖」）────────────────────────
+    //
+    // `first_buddy` 属于这一类，且是**其余全部任务的前置**：上游对未领取它的
+    // 账号会拒绝接取任何 single 任务，报
+    // `prerequisite not met: first_buddy (no buddy instance found)`。
+    //
+    // 这里必须用 `needs_work()` 而不是 `is_actionable()`：后者要求
+    // `remaining > 0`，而 `first_buddy` 的典型状态是 **`completed` 但未领奖**
+    // （remaining == 0）。用 `is_actionable` 会跳过它，于是前置永远不满足，
+    // 后面每个任务都上报一轮却"未推进"——整轮运行看起来全失败了。
     for task in tasks.iter().filter(|t| t.task_type == "auto") {
-        if dry_run || !task.is_actionable() {
+        if dry_run || !task.needs_work() {
             continue;
         }
         advance_task(&growth, cred, task, &mut run, dry_run, progress).await;
         if run.restricted {
             break;
+        }
+    }
+
+    // 前置必须真的领到了才继续：接取失败时的错误信息是
+    // `prerequisite not met: first_buddy`，与其让后面每个任务各报一次，
+    // 不如在这里一次说清。
+    if !dry_run && !run.restricted {
+        let buddy_ready = growth
+            .tasks(cred)
+            .await
+            .map(|list| {
+                list.iter()
+                    .find(|t| t.code == "first_buddy")
+                    .map(|t| t.is_claimed())
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true);
+        if !buddy_ready {
+            run.errors.push(
+                "前置任务 first_buddy 未领取，其余任务无法接取（上游返回 \
+                 prerequisite not met）"
+                    .to_string(),
+            );
+            run.energy_after = growth.energy(cred).await.ok();
+            return run;
         }
     }
 

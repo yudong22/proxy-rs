@@ -432,6 +432,12 @@ impl GrowthTask {
         if self.is_claimed() {
             return false;
         }
+        // 未接取的任务不该上报：上游还没为它建立进度记录，事件会被忽略，
+        // 表现为"上报了但进度不动"。接取是前一步，必须在 `accept` 之后才推。
+        // `auto` 类例外——它们本就不接受接取，直接上报即可。
+        if self.task_type != "auto" && self.status == "not_accepted" {
+            return false;
+        }
         matches!(self.automation, Some(Automation::Auto { .. })) && self.remaining() > 0
     }
 
@@ -555,6 +561,10 @@ impl<'a> GrowthClient<'a> {
             .into_iter()
             .map(|t| {
                 let spec = classify(&t.task_code);
+                // `progress` 缺失意味着**上游还没为这个任务建立进度记录**，
+                // 通常就是「尚未接取」。此时把 current 当 0、target 取表里的值
+                // 是对的；但如果任务尚未接取，就不该上报——那属于接取阶段的
+                // 事，上报只会换来一条无效事件。
                 let current = t.progress.as_ref().map(|p| p.current).unwrap_or(0);
                 let target = t
                     .progress

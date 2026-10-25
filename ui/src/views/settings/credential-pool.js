@@ -17,8 +17,27 @@ import { triggerBatchCheckin } from './checkin.js';
 
 /** Whether a growth run is in flight (drives the progress line). */
 let growthRunActive = false;
+/** Set once the run's summary is written, so late events cannot overwrite it. */
+let growthRunFinished = false;
 /** Recent progress lines, newest last. */
 let growthProgressLines = [];
+
+/**
+ * Paint the growth progress box.
+ *
+ * `scroll` scrolls it into view — the run button lives in the toolbar above the
+ * list, so a user who clicked there is not looking at this area yet. Only on
+ * start: scrolling on every update would fight the user scrolling the log.
+ *
+ * @param {boolean} scroll
+ */
+function paintGrowthProgress(scroll) {
+  const el = $('#wb-growth-progress');
+  if (!el) return;
+  el.hidden = false;
+  el.textContent = growthProgressLines.join('\n');
+  if (scroll) el.scrollIntoView({ block: 'nearest' });
+}
 
 /** State label → badge class, so a cooled credential reads differently. */
 const WB_STATE_LABELS = {
@@ -406,9 +425,12 @@ export function initCredentialPool() {
   // must not delay first paint of the pool.
   listen('growth-progress', (p) => {
     if (!p || !p.phase) return;
-    // Only surface while a run is actually in flight: a stray event after the
-    // run finished must not overwrite the final summary.
-    if (!growthRunActive) return;
+    // Accept events whenever a run has been started and its summary has not yet
+    // been written. Gating on a strict "still in flight" flag lost the tail of
+    // very fast runs: with the mock backend (and any run that finishes inside a
+    // single tick) `growthRunActive` was already false by the time the final
+    // events arrived, so the box showed only "开始运行成长任务…".
+    if (growthRunFinished) return;
     const lines = growthProgressLines;
     if (p.phase === 'account_start') {
       lines.push(`⏳ 第 ${p.index}/${p.total} 个账号：${p.label}`);
@@ -427,11 +449,7 @@ export function initCredentialPool() {
     }
     // Keep only the tail: a long pool run would otherwise fill the line.
     if (lines.length > 6) lines.splice(0, lines.length - 6);
-    const el = $('#wb-growth-progress');
-    if (el) {
-      el.textContent = lines.join('\n');
-      el.hidden = false;
-    }
+    paintGrowthProgress(false);
   });
 
   $('#btn-wb-growth')?.addEventListener('click', async () => {
@@ -442,12 +460,26 @@ export function initCredentialPool() {
     }
     // Progress state: the event handler appends lines while `growthRunActive`.
     growthRunActive = true;
+    growthRunFinished = false;
     growthProgressLines = ['开始运行成长任务…'];
-    const progEl = $('#wb-growth-progress');
-    if (progEl) {
-      progEl.hidden = false;
-      progEl.textContent = growthProgressLines.join('\n');
-    }
+    paintGrowthProgress(true);
+
+    // Heartbeat: a whole-pool run staggers accounts 2–5 s apart, so even with
+    // events there can be multi-second gaps with nothing new to say. Without a
+    // ticking clock the UI looks frozen exactly when the user is watching it.
+    const startedAt = Date.now();
+    const heartbeat = setInterval(() => {
+      if (!growthRunActive) return;
+      const secs = Math.floor((Date.now() - startedAt) / 1000);
+      const el = $('#wb-growth-progress');
+      if (!el) return;
+      const last = growthProgressLines[growthProgressLines.length - 1] || '';
+      el.textContent = `${growthProgressLines.join('\n')}\n… 运行中 ${secs}s`;
+      // Keep the box where the user's eye is: the button is in the toolbar above.
+      if (el.scrollIntoView && secs % 5 === 0 && last) {
+        el.scrollIntoView({ block: 'nearest' });
+      }
+    }, 1000);
     try {
       const report = await invoke('wb_growth_run', { dryRun: false });
       await renderIdentityPool();
@@ -499,6 +531,13 @@ export function initCredentialPool() {
       toast('增长任务失败: ' + e, 'error');
     } finally {
       growthRunActive = false;
+      clearInterval(heartbeat);
+      // Let the last queued events land before freezing the box; the backend
+      // emits `finished` just before the command resolves, and Tauri delivers it
+      // on the same event loop.
+      await new Promise((r) => setTimeout(r, 150));
+      growthRunFinished = true;
+      paintGrowthProgress(false);
       if (btn) {
         btn.disabled = false;
         btn.textContent = '📈 增长积分';
