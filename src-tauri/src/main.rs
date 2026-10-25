@@ -1188,18 +1188,14 @@ async fn wb_reorder_identities(
     prefs.identity_order = ids.clone();
 
     // Pin the default to the new top so the reload cannot revert the drag (see
-    // the doc comment). Only when the current default is one of the identities
-    // that moved to the top; `__none__` owns no position here.
-    let mut pinned_default = false;
-    if let Some(top) = ids.first() {
-        let current = prefs.default_identity_id.clone();
-        let pin_eligible =
-            (current.starts_with("wb-") || current.starts_with("k-")) && current != *top;
-        if pin_eligible {
-            prefs.default_identity_id = top.clone();
-            pinned_default = true;
+    // the doc comment). `__none__` and an empty selector own no position here.
+    let pinned_default = match proxy_rs::workbuddy_auth::reorder_pin_target(&prefs, &ids) {
+        Some(top) => {
+            prefs.default_identity_id = top;
+            true
         }
-    }
+        None => false,
+    };
     proxy_rs::workbuddy_auth::save_preferences(&prefs).map_err(|e| e.to_string())?;
 
     reload_pool(&ctx).await;

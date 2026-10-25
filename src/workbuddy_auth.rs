@@ -1052,6 +1052,43 @@ pub fn ordered_credentials() -> Vec<WorkBuddyCredential> {
     items
 }
 
+/// After a drag reorder, the identity the default should follow to, or `None`
+/// if the gesture should leave the default alone.
+///
+/// `ordered_credentials` hoists the pinned default to the front, so a drag that
+/// puts another identity at the top would be silently reverted on reload. The
+/// one unambiguous intent to change the default is dragging a row to the top,
+/// so this returns `top` only when:
+///
+/// * the current default is a credential pinned in the credential list, and
+/// * the drag actually put a *different* identity first — otherwise the default
+///   is already where it belongs and an unrelated drag must not move it.
+///
+/// A key default (`k-…`, or a legacy `default_key_id`) is deliberately excluded:
+/// keys are never hoisted into [`ordered_credentials`], so an account drag
+/// cannot revert it, and the key's position among *keys* comes from
+/// [`apply_identity_order`](crate::workbuddy_auth::apply_identity_order)
+/// independently.
+///
+/// The legacy `default_credential_id` counts as "current" only when the unified
+/// selector has never been set: it is what `ordered_credentials` hoists on such
+/// installs. A key (`k-…`) or `__none__` selection is authoritative and must not
+/// be shadowed by a stale legacy field — that is exactly how a key default would
+/// otherwise be silently replaced by whichever account was dragged to the top.
+pub fn reorder_pin_target(prefs: &PoolPreferences, ids: &[String]) -> Option<String> {
+    let top = ids.first()?;
+    let current = if !prefs.default_identity_id.is_empty() {
+        prefs.default_identity_id.as_str()
+    } else {
+        prefs.default_credential_id.as_str()
+    };
+    if !current.starts_with("wb-") || current == top {
+        None
+    } else {
+        Some(top.clone())
+    }
+}
+
 /// The auth endpoint to refresh this credential against.
 ///
 /// The stored `domain` is the authority the login state was issued for, so the
@@ -2517,6 +2554,71 @@ async fn batch_claim_daily_checkin_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reorder only moves the default when a *different* identity lands on
+    /// top — the gesture the UI documents as "try this one first". Regression:
+    /// the original check was "current default is not first", which fired on
+    /// any drag whenever the default was pinned further down (e.g. a key
+    /// default alongside accounts), silently replacing it with the top account.
+    #[test]
+    fn reorder_pin_follows_only_a_new_top() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Default stays on top: any other drag leaves it alone.
+        assert_eq!(
+            reorder_pin_target(&prefs("wb-a", ""), &ids(&["wb-a", "wb-c", "wb-b"])),
+            None
+        );
+        // A different identity dragged to the top takes the default.
+        assert_eq!(
+            reorder_pin_target(&prefs("wb-a", ""), &ids(&["wb-c", "wb-a", "wb-b"])).as_deref(),
+            Some("wb-c")
+        );
+        // A key default is never hoisted into credentials, so an account drag
+        // cannot revert it and must not displace it.
+        assert_eq!(
+            reorder_pin_target(&prefs("k-1", ""), &ids(&["wb-c", "wb-a", "k-1"])),
+            None
+        );
+        // A key default shadows the legacy credential default, so that must not
+        // be moved either: it would otherwise resurface once the key is removed.
+        assert_eq!(
+            reorder_pin_target(&prefs("k-1", "wb-a"), &ids(&["wb-c", "wb-a", "k-1"])),
+            None
+        );
+        // `__none__` explicitly disables the account pool, so a drag must not
+        // re-enable it by promoting an account: ordering is not consent.
+        assert_eq!(
+            reorder_pin_target(&prefs("__none__", ""), &ids(&["wb-c", "wb-a"])),
+            None
+        );
+        // ...and a stale legacy credential must not resurrect the pool either.
+        assert_eq!(
+            reorder_pin_target(&prefs("__none__", "wb-a"), &ids(&["wb-c", "wb-a"])),
+            None
+        );
+        // Legacy install: `ordered_credentials` hoists the legacy default, so a
+        // drag to the top must sync it or the drag reverts on reload.
+        assert_eq!(
+            reorder_pin_target(&prefs("", "wb-a"), &ids(&["wb-b", "wb-a"])).as_deref(),
+            Some("wb-b")
+        );
+        // ...but not when that default already sits on top.
+        assert_eq!(
+            reorder_pin_target(&prefs("", "wb-a"), &ids(&["wb-a", "wb-b"])),
+            None
+        );
+        // No identities at all: nothing to pin.
+        assert_eq!(reorder_pin_target(&prefs("wb-a", ""), &[]), None);
+    }
+
+    fn prefs(identity: &str, legacy: &str) -> PoolPreferences {
+        PoolPreferences {
+            default_identity_id: identity.to_string(),
+            default_credential_id: legacy.to_string(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn parses_full_desktop_login_state() {
