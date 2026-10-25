@@ -414,19 +414,6 @@ const FINGERPRINT_FEATURES: &[&str] = &[
     "github.com/anthropics/",
     "11128",
     "anthropics/claude-code/issues",
-    // DeepSeek Harness identifies itself to the model in its system prompt. The
-    // gateway rejects the *combination* as an unapproved channel - verified live
-    // 2026-10-25 against a real captured DSH request (1141 messages, 42 tools):
-    //   · the full system prompt                     -> 400 / 11-128
-    //   · that one paragraph removed                 -> 200
-    //   · "DeepSeek Harness Web GUI" -> "the web GUI" -> 200
-    // Individual words pass on their own, so this is a phrase-level check rather
-    // than a keyword one. Without these entries every DSH request paid a failed
-    // round-trip (and discarded its real system prompt) before the degraded
-    // retry rescued it - which is why the log looked like solid content_blocked.
-    "DeepSeek Harness",
-    "You are a helpful AI assistant",
-    "helpful AI assistant",
 ];
 
 /// `(from, to)` rewrite pairs. Each rewrites exactly one token so semantics are
@@ -448,24 +435,6 @@ fn rewrite_table() -> &'static [(&'static str, &'static str)] {
         (
             "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
             "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
-        ),
-        // DeepSeek Harness self-identification. Rewritten to neutral phrasing
-        // rather than deleted: these sentences tell the model what product it
-        // runs inside, and removing them leaves a hole in the prompt. Minimal
-        // rewording suffices because only the literal phrasing trips the
-        // gateway check (see FINGERPRINT_FEATURES for the live evidence).
-        // Longest first, so the specific phrase is not pre-empted by the shorter.
-        (
-            "DeepSeek Harness Web GUI",
-            "the web GUI",
-        ),
-        (
-            "DeepSeek Harness",
-            "the harness",
-        ),
-        (
-            "You are a helpful AI assistant",
-            "You are a helpful\u{200B} AI assistant",
         ),
         // Upstream anti-probing: any occurrence of the bare error code `11128`
         // in the body is itself a block condition. A hyphen keeps it readable
@@ -827,97 +796,6 @@ mod tests {
         let out = sanitize_text("the upstream returned code 11128");
         assert!(out.contains("11-128"));
         assert!(!out.contains("11128"));
-    }
-
-    /// `DeepSeek Harness` is the phrase the gateway treats as an unapproved
-    /// channel; it is rewritten rather than deleted.
-    ///
-    /// Verified live 2026-10-25 against a real captured DSH request: the full
-    /// system prompt returned 400/11-128, removing this one paragraph returned
-    /// 200, and replacing "DeepSeek Harness Web GUI" with "the web GUI" returned
-    /// 200. Individual words pass on their own, so the check is phrase-level.
-    #[test]
-    fn sanitize_rewrites_the_deepseek_harness_phrase() {
-        // The most specific form first: the GUI phrase must not be left half
-        // rewritten into "the harness Web GUI".
-        let gui = sanitize_text(
-            "You are interacting with the user through the DeepSeek Harness Web GUI.",
-        );
-        assert!(!gui.contains("DeepSeek"), "got: {gui}");
-        assert!(gui.contains("the web GUI"), "got: {gui}");
-
-        let plain = sanitize_text("You are an AI agent powered by DeepSeek Harness.");
-        assert!(!plain.contains("DeepSeek"), "got: {plain}");
-        assert!(plain.contains("the harness"), "got: {plain}");
-        // The sentence survives as a sentence: the model still learns what it
-        // runs inside, without the literal brand phrase the gateway rejects.
-        assert!(plain.contains("powered by"), "got: {plain}");
-    }
-
-    /// The identity opener is broken by a zero-width space, which is what makes
-    /// the literal phrase stop matching upstream while the sentence still reads
-    /// the same to the model.
-    #[test]
-    fn sanitize_rewrites_the_helpful_assistant_opener() {
-        let out = sanitize_text("You are a helpful AI assistant.");
-        assert!(
-            !out.contains("You are a helpful AI assistant."),
-            "the rejected literal must be broken: {out:?}"
-        );
-        // The words survive — only an invisible character was inserted, so the
-        // model still reads an ordinary opener.
-        let visible: String = out.chars().filter(|c| *c != '\u{200B}').collect();
-        assert_eq!(visible.trim(), "You are a helpful AI assistant.");
-    }
-
-    /// Product-name text in ordinary prose is rewritten too — the gateway does
-    /// not care which message it appears in, so limiting the rewrite to the
-    /// opener would leave the very case that broke DSH (a later system
-    /// paragraph) untouched.
-    #[test]
-    fn sanitize_rewrites_the_phrase_in_any_message() {
-        let out = sanitize_text("The agent is powered by DeepSeek Harness and runs locally.");
-        assert!(!out.contains("DeepSeek Harness"), "got: {out}");
-        assert!(out.contains("runs locally"), "kept the rest: {out}");
-    }
-
-    /// End-to-end through the request sanitizer: the opener sits in the system
-    /// message, which is exactly where DSH emits it.
-    #[test]
-    fn sanitize_request_rewrites_the_harness_opener_in_the_system_message() {
-        let mut req = openai::OpenAIRequest {
-            model: "deepseek-v4.1-flash".to_string(),
-            messages: vec![
-                openai::Message {
-                    role: "system".to_string(),
-                    content: Some(openai::MessageContent::Text(
-                        "You are an AI agent powered by DeepSeek Harness.".to_string(),
-                    )),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                },
-                openai::Message {
-                    role: "user".to_string(),
-                    content: Some(openai::MessageContent::Text("hi".to_string())),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                },
-            ],
-            ..Default::default()
-        };
-        sanitize_openai_request(&mut req);
-        let system = match req.messages[0].content.as_ref().unwrap() {
-            openai::MessageContent::Text(t) => t.clone(),
-            _ => panic!("expected text content"),
-        };
-        assert!(
-            !system.contains("You are an AI agent powered by DeepSeek Harness"),
-            "system prompt still carries the rejected opener: {system}"
-        );
     }
 
     #[test]
