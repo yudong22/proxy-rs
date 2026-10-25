@@ -1293,10 +1293,11 @@ pub async fn refresh_credential(
     {
         credential.refresh_token = Some(rt.to_string());
     }
-    if let Some(exp) = unwrapped
-        .get("expiresAt")
-        .and_then(serde_json::Value::as_i64)
-    {
+    // Both field shapes, same helper the QR-login poll uses: the refresh
+    // endpoint answers `expiresIn` (seconds, e.g. 96492) and never `expiresAt`,
+    // so reading only the absolute field discarded the expiry on every single
+    // renewal and left a token that lives ~27 hours looking unknown-lived.
+    if let Some(exp) = expires_at_ms_from(&unwrapped, crate::util::unix_millis()) {
         credential.expires_at_ms = Some(exp);
     }
     if let Some(domain) = unwrapped.get("domain").and_then(serde_json::Value::as_str) {
@@ -1304,8 +1305,8 @@ pub async fn refresh_credential(
     }
     credential.last_error.clear();
     // Stamp the renewal: this is what the unknown-expiry backstop measures from,
-    // so a credential whose token has no `expiresAt` still gets renewed again
-    // later instead of looking permanently fresh.
+    // so a credential whose response carries no usable expiry still gets renewed
+    // again later instead of looking permanently fresh.
     credential.last_refresh_at_ms = Some(crate::util::unix_millis());
     upsert_credential(credential.clone())?;
     Ok(())
@@ -1487,60 +1488,140 @@ pub async fn poll_oauth_token(
         .map_err(|e| anyhow::anyhow!("轮询授权状态失败: {}", e))?;
 
     let body = resp.text().await.unwrap_or_default();
-    let val: serde_json::Value = match serde_json::from_str(&body) {
+
+    match parse_oauth_token_response(&body, crate::util::unix_millis()) {
+        OAuthTokenGrant::Pending => Ok(OAuthPollResult::Pending),
+        OAuthTokenGrant::Failed(error) => Ok(OAuthPollResult::Failed { error }),
+        OAuthTokenGrant::Granted(grant) => finish_oauth_login(client, base, grant).await,
+    }
+}
+
+/// One poll's decoded outcome, before any further network or disk side effect.
+///
+/// Split out of [`poll_oauth_token`] so the envelope rules — which code means
+/// "keep waiting", how a rejection is described, and how expiry is expressed —
+/// are testable without an HTTP client or a data directory.
+enum OAuthTokenGrant {
+    Pending,
+    Granted(TokenGrant),
+    Failed(String),
+}
+
+/// The token fields a successful poll yields.
+struct TokenGrant {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at_ms: Option<i64>,
+    domain: String,
+}
+
+/// Decode the `/v2/plugin/auth/token` envelope.
+///
+/// `now_ms` is passed in rather than read here so the relative `expiresIn`
+/// conversion is deterministic under test.
+///
+/// Every rejection carries the upstream's own `code` and `msg`. Reporting a
+/// bare sentence instead is what made a stuck QR login impossible to diagnose
+/// after the fact: the GUI only ever showed "授权失败: 授权失败".
+fn parse_oauth_token_response(body: &str, now_ms: i64) -> OAuthTokenGrant {
+    let val: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(OAuthPollResult::Failed {
-                error: format!("无效响应: {}", e),
-            })
+            return OAuthTokenGrant::Failed(format!(
+                "授权响应不是有效 JSON ({}): {}",
+                e,
+                crate::util::truncate(body, 200)
+            ))
         }
     };
 
-    let code = val.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code == LOGIN_TOKEN_PENDING_CODE {
-        return Ok(OAuthPollResult::Pending);
+    let code = val.get("code").and_then(serde_json::Value::as_i64);
+    if code == Some(LOGIN_TOKEN_PENDING_CODE) {
+        return OAuthTokenGrant::Pending;
     }
-
-    if code != 0 {
-        let msg = val
-            .get("msg")
-            .and_then(|m| m.as_str())
-            .unwrap_or("授权失败");
-        return Ok(OAuthPollResult::Failed {
-            error: msg.to_string(),
-        });
+    if code != Some(0) {
+        // A missing `code` stays distinct from `code == 0`: treating an absent
+        // field as success would report a malformed body as an authorized
+        // login and then fail later on the missing token.
+        return OAuthTokenGrant::Failed(format!(
+            "上游拒绝授权 (code={}): {}",
+            code.map(|c| c.to_string()).unwrap_or_else(|| "缺失".into()),
+            val.get("msg")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("无 msg")
+        ));
     }
 
     let data = match val.get("data") {
         Some(d) if d.is_object() => d,
         _ => {
-            return Ok(OAuthPollResult::Failed {
-                error: "缺少 token 数据".to_string(),
-            })
+            return OAuthTokenGrant::Failed(format!(
+                "授权响应缺少 data: {}",
+                crate::util::truncate(body, 200)
+            ))
         }
     };
 
     let access_token = data
         .get("accessToken")
-        .and_then(|s| s.as_str())
+        .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
     if access_token.is_empty() {
-        return Ok(OAuthPollResult::Failed {
-            error: "缺少 accessToken".to_string(),
-        });
+        return OAuthTokenGrant::Failed(format!(
+            "授权响应缺少 accessToken: {}",
+            crate::util::truncate(body, 200)
+        ));
     }
 
-    let refresh_token = data
-        .get("refreshToken")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string());
-    let expires_at_ms = data.get("expiresAt").and_then(|e| e.as_i64());
-    let domain = data
-        .get("domain")
-        .and_then(|d| d.as_str())
-        .unwrap_or("copilot.tencent.com")
-        .to_string();
+    OAuthTokenGrant::Granted(TokenGrant {
+        access_token,
+        refresh_token: data
+            .get("refreshToken")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        expires_at_ms: expires_at_ms_from(data, now_ms),
+        domain: data
+            .get("domain")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("copilot.tencent.com")
+            .to_string(),
+    })
+}
+
+/// Absolute access-token expiry in epoch millis from either field shape.
+///
+/// The OAuth endpoints answer with **`expiresIn` in seconds**
+/// (`"expiresIn": 2419198`), while the desktop client's persisted login state
+/// uses `expiresAt` in millis. Reading only `expiresAt` made every scanned
+/// account look like it had no known expiry, which silently demoted it to the
+/// conservative unknown-expiry backstop ([`UNKNOWN_EXPIRY_REFRESH_AFTER_MS`]):
+/// a token that really lives ~28 days was treated as unrenewable-until-6h and
+/// its true `exp` was never recorded. Preferring the absolute field keeps
+/// imported states exact; the relative one covers the OAuth answer.
+fn expires_at_ms_from(data: &serde_json::Value, now_ms: i64) -> Option<i64> {
+    if let Some(exp) = data.get("expiresAt").and_then(serde_json::Value::as_i64) {
+        return Some(exp);
+    }
+    let secs = data
+        .get("expiresIn")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|s| *s > 0)?;
+    Some(now_ms.saturating_add(secs.saturating_mul(1000)))
+}
+
+/// Turn a granted token into a stored credential, fetching its profile first.
+async fn finish_oauth_login(
+    client: &reqwest::Client,
+    base: &str,
+    grant: TokenGrant,
+) -> Result<OAuthPollResult> {
+    let TokenGrant {
+        access_token,
+        refresh_token,
+        expires_at_ms,
+        domain,
+    } = grant;
 
     // Fetch account profile for nickname / uid / enterpriseId
     let account = fetch_account(client, base, &access_token)
@@ -2788,6 +2869,53 @@ mod tests {
     /// and a single unreachable account could not be retried on its own. These
     /// setters are what the single-identity path writes through, so the isolation
     /// property belongs here.
+    /// The pool GUI's drag reorder writes the store order; `ordered_credentials`
+    /// must then report that order — except that a pinned default is hoisted to
+    /// the front.
+    ///
+    /// This is why `wb_reorder_credentials` syncs the default when a row is
+    /// dragged to the top: without that, the drag is silently undone by this
+    /// hoist on the very next reload, and the user watches the list snap back.
+    #[test]
+    fn ordered_credentials_hoists_the_pinned_default_above_store_order() {
+        let dir = std::env::temp_dir().join(format!("proxy-rs-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = crate::settings::data_dir_test_lock();
+        let previous = std::env::var_os(crate::settings::DATA_DIR_ENV);
+        std::env::set_var(crate::settings::DATA_DIR_ENV, &dir);
+
+        let mk = |id: &str| WorkBuddyCredential {
+            id: id.to_string(),
+            label: id.to_string(),
+            access_token: format!("t-{id}"),
+            enabled: true,
+            ..Default::default()
+        };
+        // Store order after a drag that puts wb-third first.
+        save_credentials(&[mk("wb-third"), mk("wb-first"), mk("wb-second")]).unwrap();
+
+        // With no default pinned, the store order is returned verbatim.
+        save_preferences(&PoolPreferences::default()).unwrap();
+        let ids: Vec<String> = ordered_credentials().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["wb-third", "wb-first", "wb-second"]);
+
+        // Pinning wb-second hoists it, keeping the rest in store order.
+        set_default_identity("wb-second").unwrap();
+        let ids: Vec<String> = ordered_credentials().into_iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            vec!["wb-second", "wb-third", "wb-first"],
+            "the pinned default must lead, with the dragged order preserved behind it"
+        );
+
+        std::env::remove_var(crate::settings::DATA_DIR_ENV);
+        if let Some(v) = previous {
+            std::env::set_var(crate::settings::DATA_DIR_ENV, v);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn setting_points_touches_only_the_named_identity() {
         let dir = std::env::temp_dir().join(format!("proxy-rs-points-{}", std::process::id()));
@@ -3036,6 +3164,134 @@ mod tests {
         let svg = generate_qr_svg("https://copilot.tencent.com/login?state=test").unwrap();
         assert!(svg.contains("<svg"));
         assert!(svg.contains("</svg>"));
+    }
+
+    // ── QR-login poll envelope ─────────────────────────────────────────────
+    // These cover the "扫码后只显示授权失败、日志里什么也没有" bug: the poll
+    // collapsed every rejection into a bare sentence, and read expiry only from
+    // `expiresAt`, which the OAuth endpoints never send.
+
+    /// The real success body, trimmed to the fields the parser reads.
+    const GRANTED_BODY: &str = r#"{"code":0,"msg":"OK","data":{
+        "accessToken":"at-123","refreshToken":"rt-456",
+        "expiresIn":2419198,"tokenType":"Bearer",
+        "domain":"www.codebuddy.cn"}}"#;
+
+    #[test]
+    fn pending_code_is_pending_not_a_failure() {
+        // 11217 is the "user hasn't scanned yet" answer: it repeats every 2s
+        // and must never surface as an error in the GUI or the log.
+        let body = r#"{"code":11217,"msg":"login ing..."}"#;
+        assert!(matches!(
+            parse_oauth_token_response(body, 0),
+            OAuthTokenGrant::Pending
+        ));
+    }
+
+    #[test]
+    fn rejected_poll_keeps_the_upstream_code_and_message() {
+        // The whole point of the fix: the reason must survive to the caller so
+        // it can be written to disk. An expired-scan rejection is the case that
+        // used to reach the GUI as a bare "授权失败".
+        let body = r#"{"code":11213,"msg":"账号已失效，请联系企业管理员"}"#;
+        let failure = match parse_oauth_token_response(body, 0) {
+            OAuthTokenGrant::Failed(msg) => msg,
+            other => panic!("expected Failed, got {:?}", std::mem::discriminant(&other)),
+        };
+        assert!(failure.contains("11213"), "code missing from: {failure}");
+        assert!(
+            failure.contains("账号已失效"),
+            "upstream msg missing from: {failure}"
+        );
+    }
+
+    #[test]
+    fn missing_code_is_a_failure_not_a_grant() {
+        // `unwrap_or(0)` here would read a malformed body as an authorized
+        // login and then fail later on a missing token, which is far harder to
+        // attribute than a rejection reported at the envelope.
+        let body = r#"{"data":{"accessToken":"at-123"}}"#;
+        match parse_oauth_token_response(body, 0) {
+            OAuthTokenGrant::Failed(msg) => assert!(msg.contains("code=缺失"), "{msg}"),
+            _ => panic!("a body without `code` must not be treated as granted"),
+        }
+    }
+
+    #[test]
+    fn granted_poll_derives_expiry_from_expires_in_seconds() {
+        // The OAuth answer carries *only* `expiresIn` seconds. Ignoring it left
+        // every scanned account with `expires_at_ms: None`, which silently
+        // demoted it to the 6-hour unknown-expiry backstop.
+        let now = 1_700_000_000_000i64;
+        let grant = match parse_oauth_token_response(GRANTED_BODY, now) {
+            OAuthTokenGrant::Granted(g) => g,
+            _ => panic!("expected a granted token"),
+        };
+        assert_eq!(grant.access_token, "at-123");
+        assert_eq!(grant.refresh_token.as_deref(), Some("rt-456"));
+        assert_eq!(grant.domain, "www.codebuddy.cn");
+        assert_eq!(grant.expires_at_ms, Some(now + 2_419_198_000));
+    }
+
+    #[test]
+    fn absolute_expires_at_wins_over_relative_expires_in() {
+        // An imported desktop login state carries millis; a response carrying
+        // both must keep the exact value rather than a rounded one.
+        let data: serde_json::Value =
+            serde_json::from_str(r#"{"expiresAt":1893456000000,"expiresIn":60}"#).unwrap();
+        assert_eq!(
+            expires_at_ms_from(&data, 1_700_000_000_000),
+            Some(1893456000000)
+        );
+    }
+
+    #[test]
+    fn expiry_stays_unknown_when_neither_field_is_usable() {
+        // Absent or non-positive `expiresIn` must not invent an already-expired
+        // timestamp: `Some(now)` would make the credential look dead on arrival.
+        for body in [
+            r#"{"accessToken":"at","expiresIn":0}"#,
+            r#"{"accessToken":"at","expiresIn":-5}"#,
+            r#"{"accessToken":"at"}"#,
+        ] {
+            let data: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(expires_at_ms_from(&data, 1_700_000_000_000), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn refresh_response_expiry_is_read_from_expires_in() {
+        // The *refresh* endpoint answers with `expiresIn` only (a real one said
+        // `"expiresIn":96492` and no `expiresAt`). Both the renewal path and the
+        // QR-login path go through `expires_at_ms_from`, so this guards the
+        // shared rule rather than one call site: before it, every renewal
+        // discarded the new expiry and the credential fell back to the 6-hour
+        // unknown-expiry backstop.
+        let refreshed: serde_json::Value =
+            serde_json::from_str(r#"{"accessToken":"at","refreshToken":"rt","expiresIn":96492}"#)
+                .unwrap();
+        let now = 1_792_906_228_000i64; // the 13:30:28 renewal
+        assert_eq!(expires_at_ms_from(&refreshed, now), Some(now + 96_492_000));
+    }
+
+    #[test]
+    fn granted_poll_without_access_token_is_a_failure() {
+        let body = r#"{"code":0,"data":{"refreshToken":"rt"}}"#;
+        match parse_oauth_token_response(body, 0) {
+            OAuthTokenGrant::Failed(msg) => assert!(msg.contains("accessToken"), "{msg}"),
+            _ => panic!("a token-less grant must fail"),
+        }
+    }
+
+    #[test]
+    fn non_json_poll_body_reports_the_body() {
+        // A gateway HTML page is the realistic shape here; the snippet is what
+        // turns "无效响应" into something diagnosable.
+        let failure = match parse_oauth_token_response("<html>502 Bad Gateway</html>", 0) {
+            OAuthTokenGrant::Failed(msg) => msg,
+            _ => panic!("HTML must not parse as a grant"),
+        };
+        assert!(failure.contains("502 Bad Gateway"), "{failure}");
     }
 
     // ── Check-in classification ────────────────────────────────────────────

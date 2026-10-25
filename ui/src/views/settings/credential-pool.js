@@ -105,7 +105,14 @@ export async function renderIdentityPool() {
       const reloginNote = c.needs_relogin
         ? raw(`<span class="badge-pill wb-relogin-pill" title="${reloginWhy}${c.last_error ? `：${c.last_error}` : ''}；请点「重新绑定」">需重新绑定</span>`)
         : '';
-      return html`<div class="wb-credential-row${raw(isDefault ? ' wb-credential-row--default' : '')}">
+      // The row is the drag handle. Only credentials are draggable: they are the
+      // ordered failover list, whereas API keys are a separate store with its own
+      // resolution rules, so dragging a key among accounts would imply an order
+      // relationship that does not exist.
+      return html`<div class="wb-credential-row wb-credential-row--draggable${raw(isDefault ? ' wb-credential-row--default' : '')}"
+        draggable="true" data-cred-row="${c.id}"
+        title="拖动可调整优先顺序：越靠上越先被使用，失败后按此顺序依次尝试">
+        <span class="wb-drag-handle" aria-hidden="true">⋮⋮</span>
         <div class="wb-credential-main">
           ${typePill}
           <span class="wb-credential-label">${c.label || c.nickname || c.id}</span>
@@ -167,6 +174,8 @@ export async function renderIdentityPool() {
     }).join('');
 
     listEl.innerHTML = credRows + keyRows;
+
+    wireCredentialDrag(listEl);
 
     // Unified "set default" — selects the default identity regardless of type.
     for (const btn of listEl.querySelectorAll('[data-default]')) {
@@ -438,4 +447,83 @@ export function initCredentialPool() {
 
   renderIdentityPool();
   loadSchedule();
+}
+
+/**
+ * Make the credential rows drag-reorderable, and persist the result.
+ *
+ * The order is not cosmetic: the pool tries credentials top-down, so this list
+ * is the failover priority. Dragging commits immediately (no 保存 button) —
+ * the row order on screen and the stored order must never disagree, and a
+ * pending-edit state would let the user navigate away believing it was saved.
+ *
+ * Uses native HTML5 drag events rather than pointer maths: rows are already
+ * discrete targets, and `dragover` on a row tells us the drop index without
+ * measuring geometry.
+ *
+ * @param {HTMLElement} listEl  container holding the rows
+ */
+function wireCredentialDrag(listEl) {
+  const rows = () => [...listEl.querySelectorAll('[data-cred-row]')];
+  let draggingId = null;
+
+  for (const row of rows()) {
+    row.addEventListener('dragstart', (e) => {
+      draggingId = row.dataset.credRow;
+      row.classList.add('wb-credential-row--dragging');
+      // Firefox refuses to start a drag unless some data is set.
+      e.dataTransfer?.setData('text/plain', draggingId);
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+    });
+
+    row.addEventListener('dragend', () => {
+      draggingId = null;
+      row.classList.remove('wb-credential-row--dragging');
+      for (const r of rows()) r.classList.remove('wb-credential-row--drop-target');
+    });
+
+    // `dragover` must be cancelled on every row, otherwise the drop event never
+    // fires: the default action for a non-cancelled dragover is "not a drop
+    // target".
+    row.addEventListener('dragover', (e) => {
+      if (!draggingId || row.dataset.credRow === draggingId) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      for (const r of rows()) {
+        r.classList.toggle('wb-credential-row--drop-target', r === row);
+      }
+    });
+
+    row.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      const targetId = row.dataset.credRow;
+      const sourceId = draggingId;
+      draggingId = null;
+      if (!sourceId || sourceId === targetId) return;
+
+      // Insert the dragged row *at* the target's position, keeping every other
+      // row's relative order. Recomputed from the live DOM so a drop after an
+      // earlier reorder still reflects what the user sees.
+      const next = rows().map((r) => r.dataset.credRow);
+      const from = next.indexOf(sourceId);
+      const to = next.indexOf(targetId);
+      if (from < 0 || to < 0) return;
+      next.splice(to, 0, ...next.splice(from, 1));
+
+      try {
+        await invoke('wb_reorder_credentials', { ids: next });
+        showWbStatus('已调整优先顺序：越靠上越先被使用');
+        // Repaint from the backend rather than reordering the DOM by hand: the
+        // stored order is the source of truth, and a repaint also refreshes the
+        // 默认 badge, which follows "first usable" when no explicit default is
+        // set — reordering can therefore change which account shows as 默认.
+        await renderIdentityPool();
+      } catch (err) {
+        showWbStatus('调整顺序失败: ' + err, true);
+        // Put the DOM back where the backend says it is; leaving the visual
+        // order ahead of the stored one is the exact drift this guards against.
+        await renderIdentityPool();
+      }
+    });
+  }
 }

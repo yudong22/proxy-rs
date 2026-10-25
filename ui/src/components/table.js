@@ -6,6 +6,7 @@
  */
 
 import { $, $$, setText, html, raw, debounce } from '../core/dom.js';
+import { getRequestLogs } from '../core/api.js';
 import { invoke } from '../core/ipc.js';
 import { appState } from '../core/state.js';
 import { shortSessionId, shortTime, formatDuration } from '../lib/format.js';
@@ -192,6 +193,12 @@ function updateSessionDropdown() {
 
 /**
  * Load one page of request logs.
+ *
+ * `getRequestLogs` reads `GET /api/request-logs` from the local listener and
+ * falls back to the `get_request_logs` Tauri command while the service is
+ * stopped; both return the same payload, so the pager and facets below are
+ * transport-agnostic.
+ *
  * @param {boolean} [resetPage] jump back to page 1 (a filter changed).
  */
 export async function fetchRequestLogs(resetPage = false) {
@@ -221,7 +228,7 @@ export async function fetchRequestLogs(resetPage = false) {
   if (search) filter.search = search;
 
   try {
-    const res = await invoke('get_request_logs', { filter });
+    const res = await getRequestLogs(filter);
     if (!res) return;
     appState.requestLogs = res.items || [];
     appState.requestLogsTotal = res.total || 0;

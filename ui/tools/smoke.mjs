@@ -15,6 +15,12 @@
  *   - cross-module integration points still fire: the command palette's dynamic
  *     import of the settings view, the account pool's repaint after OAuth, and
  *     the pool import/export dialogs (preview enables 确认导入, apply repaints).
+ *
+ * Since the overview statistics and the request-log table read `GET /api/*`
+ * from the listener (falling back to IPC), this harness also serves those two
+ * endpoints and asserts they were hit — so a change that silently routes the
+ * dashboard back through an unregistered command fails here instead of only in
+ * a built app.
  */
 
 import fs from 'node:fs';
@@ -98,6 +104,9 @@ const MOCK = {
     default_identity_id: 'cred-1',
   },
   wb_relogin: { id: 'cred-3', label: '需重登账号', enabled: true, masked_token: 'sk-***3' },
+  // Drag-to-reorder the failover priority. The mock echoes what it was told to
+  // store, so a test can assert the submitted order rather than the old one.
+  wb_reorder_credentials: { ok: true, default_moved: false },
   wb_refresh_points_single: {
     result: { id: 'cred-1', label: '测试账号一', points: 1234.5 },
     current_identity: { id: 'cred-1', label: '测试账号一', points: 1234.5 },
@@ -148,6 +157,12 @@ const EXPECTED = {
     '输出速度（TPS）': '42.5 tok/s',
   },
   speedHeaderLabels: ['dsh:0.1.6'],
+  // The overview statistics row must show the values served by /api/stats/today,
+  // not the IPC mock's (1234 / 2.50M / 42%) — that difference is what proves the
+  // HTTP leg is the one answering. formatNumber abbreviates 4321 -> "4.3K".
+  statsOverHttp: {
+    requests: '4.3K', tokens: '7.65M', cachePct: '66%', failed: '11', overrides: '9',
+  },
   text: {
     metricProvider: 'workbuddy-cn',
     metricPoints: '1234.50',
@@ -208,9 +223,46 @@ const EXPECTED = {
   },
 };
 
+/**
+ * The dashboard endpoints, served from the harness origin.
+ *
+ * Values are distinct from the IPC mock on purpose (`get_stats` reports 1234
+ * requests, this reports 4321): the boot assertion below then proves which
+ * transport answered, rather than passing either way.
+ */
+const API = {
+  '/api/stats/today': {
+    date: '2026-10-20',
+    requests_total: 4321, requests_success: 4310, requests_failed: 11,
+    tokens_total: 7654321, tokens_input: 1000, tokens_cache_read: 2000,
+    tokens_cache_write: 300, tokens_output: 4000,
+    cache_hit_pct: 66, overrides_total: 9,
+  },
+  '/api/request-logs': {
+    items: [{
+      id: 7, created_at: '2026-10-20 11:02:03', model: 'deepseek-chat',
+      client_model: 'deepseek-chat', route: '/v1/messages',
+      input_tokens: 120, output_tokens: 60, cache_read_tokens: 30, cache_write_tokens: 0,
+      duration_ms: 1500, ttft_ms: 200, model_ms: 900, ended_with_tool_call: false,
+      streamed: true, status: 200, error: null,
+      session_id: 'claude:abc', client: 'claude',
+      override_key: '', override_model: '', override_reason: '',
+    }],
+    total: 1, models: ['deepseek-chat'], client_models: ['deepseek-chat'],
+    clients: ['claude'], sessions: [{ session_id: 'claude:abc', client: 'claude' }],
+  },
+};
+const apiHits = [];
+
 const server = http.createServer((req, res) => {
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/') p = '/index.html';
+  if (Object.prototype.hasOwnProperty.call(API, p)) {
+    apiHits.push(p);
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(API[p]));
+    return;
+  }
   const file = path.join(UI, p);
   if (!file.startsWith(UI) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
     res.writeHead(404); res.end('not found'); return;
@@ -287,6 +339,9 @@ try {
     window.__CALLS__ = [];
     window.__INVOKE_ARGS__ = {};
     window.__MOCKDATA__ = ${JSON.stringify(MOCK)};
+    // The dashboard reads the listener's /api/* paths; point them at this
+    // harness so the HTTP leg runs against deterministic fixtures.
+    window.__PROXY_API_BASE__ = 'http://127.0.0.1:${PORT}';
     window.__TAURI__ = {
       core: { invoke: (cmd, args) => { window.__CALLS__.push(cmd);
         window.__INVOKE_ARGS__[cmd] = args;
@@ -347,9 +402,30 @@ try {
           scheduleHint: t('#wb-schedule-hint'), forceStreamHint: t('#force-stream-hint'),
           statusText: t('#status-text'), appVersion: t('#app-version'),
         },
+        // The overview statistics row, which reads GET /api/stats/today. Its
+        // values differ from the IPC mock's, so these assertions prove which
+        // transport answered.
+        stats: {
+          requests: t('#stat-requests'), tokens: t('#stat-tokens-total'),
+          cachePct: t('#stat-cache-pct'), failed: t('#stat-requests-failed'),
+          overrides: t('#metric-overrides'),
+        },
+        statsViaIpc: window.__CALLS__.includes('get_stats'),
         rowLabels: rows.map((r) => r.querySelector('.wb-credential-label')?.textContent),
         rowStates: rows.map((r) => r.querySelector('.wb-state-pill')?.textContent),
         defaultRowFlags: rows.map((r) => r.classList.contains('wb-credential-row--default')),
+        // Drag-to-reorder the failover priority: every credential row must be
+        // draggable and carry a grip. The API-key row behind it must NOT be —
+        // keys are a separate store with no position in the failover order.
+        // The rows array above covers credentials AND keys (both use
+        // .wb-credential-row), so the drag assertions key off data-cred-row,
+        // which only credentials carry - keeping the two stores distinct.
+        credDraggable: [...document.querySelectorAll('#wb-identity-list [data-cred-row]')]
+          .map((r) => r.getAttribute('draggable') === 'true'),
+        credHandles: [...document.querySelectorAll('#wb-identity-list [data-cred-row]')]
+          .map((r) => Boolean(r.querySelector('.wb-drag-handle'))),
+        keyDraggable: [...document.querySelectorAll('#wb-identity-list .wb-type-key')]
+          .map((k) => k.closest('.wb-credential-row')?.getAttribute('draggable') === 'true'),
         selectValue: sel?.value,
         dshButtonPresent: Boolean(document.querySelector('#btn-apply-dsh-config')),
         dshStatus: t('#dsh-config-status'),
@@ -362,12 +438,49 @@ try {
   check('rowLabels', b.rowLabels, EXPECTED.rowLabels);
   check('rowStates', b.rowStates, EXPECTED.rowStates);
   check('defaultRowFlags', b.defaultRowFlags, EXPECTED.defaultRowFlags);
+  check('every credential row is draggable', b.credDraggable, b.credDraggable.map(() => true));
+  check('every credential row has a drag handle', b.credHandles, b.credHandles.map(() => true));
+  check('api-key rows are not draggable', b.keyDraggable, b.keyDraggable.map(() => false));
+  check('credential rows are draggable at all', b.credDraggable.length > 0, true);
   check('selectValue', b.selectValue, EXPECTED.selectValue);
   check('dsh button present', b.dshButtonPresent, EXPECTED.dshButtonPresent);
   check('dsh status', b.dshStatus, EXPECTED.dshStatus);
   check('speed drill-down metrics', b.speedMetrics, EXPECTED.speedMetrics);
   check('speed drill-down session columns', b.speedHeaderLabels, EXPECTED.speedHeaderLabels);
   check('缓存命中率 card is not expandable', b.cacheCard, EXPECTED.cacheCard);
+  // The dashboard reads the listener's HTTP endpoints, not the IPC fallbacks.
+  check('overview stats come from /api/stats/today', b.stats, EXPECTED.statsOverHttp);
+  check('overview stats did not fall back to IPC', b.statsViaIpc, false);
+  check('harness served /api/stats/today', apiHits.includes('/api/stats/today'), true);
+
+  // The request-log table is the other HTTP-backed panel. Switching to the logs
+  // tab must fetch `/api/request-logs` (with the pager's limit/offset) and render
+  // the row the harness serves — not silently use the empty IPC mock.
+  await send('Runtime.evaluate', { expression: `window.switchTab('logs');` });
+  await new Promise((r) => setTimeout(r, 800));
+
+  const logsPan = await send('Runtime.evaluate', {
+    returnByValue: true,
+    expression: `(() => {
+      const rows = [...document.querySelectorAll('#request-logs-tbody tr')];
+      return {
+        rowCount: rows.length,
+        firstModel: rows[0]?.querySelector('.cell-model')?.textContent || '',
+        count: document.querySelector('#table-log-count')?.textContent,
+        logsViaIpc: window.__CALLS__.includes('get_request_logs'),
+      };
+    })()`,
+  });
+  const lp = logsPan.result.value;
+  check('request log row came from /api/request-logs', lp.firstModel, 'deepseek-chat');
+  check('request log page size came from /api/request-logs', lp.rowCount, 1);
+  check('request log total came from /api/request-logs', lp.count, '1 条记录');
+  check('harness served /api/request-logs', apiHits.includes('/api/request-logs'), true);
+  check('request log table did not fall back to IPC', lp.logsViaIpc, false);
+
+  // Back to the overview so the remaining integration checks find their elements.
+  await send('Runtime.evaluate', { expression: `window.switchTab('overview');` });
+  await new Promise((r) => setTimeout(r, 300));
 
   // Cross-module integration 1: palette's dynamic import of the settings view.
   await send('Runtime.evaluate', { expression: 'window.__CALLS__.length = 0;' });

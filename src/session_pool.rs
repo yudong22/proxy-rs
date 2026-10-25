@@ -126,6 +126,63 @@ impl CredentialPool {
         Self::new(Vec::new())
     }
 
+    /// Choose a replacement from `candidates` (`(pool index, credential)`).
+    ///
+    /// Returns the winning **pool index**, so the caller can index its own
+    /// vector instead of handing back a reference tied to a dropped iterator.
+    ///
+    /// The comparator must be a strict total order or `sort_by` panics with
+    /// "not a total order". Mixing "compare by position" with "compare by
+    /// points" is not one: if A and B report equal points they fall back to
+    /// position, while an A/B pair with different points compares by quota, so
+    /// the relation loses transitivity across three candidates. The fix is to
+    /// make the tiers explicit: order is the primary key and quota breaks ties
+    /// *only* between credentials at the same position — which never happens,
+    /// since positions are unique. Quota is therefore inert until the pool is
+    /// reordered, exactly as intended: it must never outrank an explicit choice.
+    fn pick_replacement<'a, I>(candidates: I) -> Option<usize>
+    where
+        I: IntoIterator<Item = (usize, &'a WorkBuddyCredential)>,
+    {
+        let mut best: Option<(usize, &WorkBuddyCredential)> = None;
+        for (index, cred) in candidates {
+            best = match best {
+                None => Some((index, cred)),
+                Some((best_index, best_cred)) => {
+                    if Self::replacement_outranks(index, cred, best_index, best_cred) {
+                        Some((index, cred))
+                    } else {
+                        Some((best_index, best_cred))
+                    }
+                }
+            };
+        }
+        best.map(|(index, _)| index)
+    }
+
+    /// Whether `(a_index, a)` should be tried before `(b_index, b)`.
+    ///
+    /// Pool position first (the user's drag order), then quota as a tie-break
+    /// that only applies within a position — see [`Self::pick_replacement`] for
+    /// why quota cannot be a global secondary key. A credential with no points
+    /// figure is "unknown", not zero, so it sorts after one that reports a
+    /// number at the same position (testable, and never reorders store order
+    /// when nothing is known).
+    fn replacement_outranks(
+        a_index: usize,
+        a: &WorkBuddyCredential,
+        b_index: usize,
+        b: &WorkBuddyCredential,
+    ) -> bool {
+        if a_index != b_index {
+            return a_index < b_index;
+        }
+        match (a.points, b.points) {
+            (Some(pa), Some(pb)) => pa > pb,
+            _ => false,
+        }
+    }
+
     /// Whether this pool has any enabled credential at all. When false, the
     /// request path must behave exactly like 1.7.1.
     pub async fn is_enabled(&self) -> bool {
@@ -216,27 +273,21 @@ impl CredentialPool {
     /// Failover: choose a replacement for `from` on behalf of one session and
     /// record the sticky binding.
     ///
-    /// Preference among the remaining healthy credentials is "most remaining
-    /// quota first" when a credential can report it, then store order. This is
-    /// the only place that ordering is consulted.
+    /// Preference among the remaining healthy credentials: **the pool order the
+    /// user set**, with remaining quota only breaking ties that order leaves
+    /// open. It used to be the other way round — most points first, store order
+    /// second — which meant a hand-ordered "try this one first" was silently
+    /// overruled the moment another account happened to hold a bigger balance.
     pub async fn switch(&self, session_id: &str, from: &str) -> Option<WorkBuddyCredential> {
         let now = crate::util::unix_millis();
         let entries = self.entries.read().await;
-        let mut candidates: Vec<&WorkBuddyCredential> = entries
-            .iter()
-            .filter(|c| c.id != from && c.is_usable(now))
-            .collect();
-        // Most remaining points first, when a refresh has recorded them: a
-        // failover should land on the account that can actually keep serving.
-        // Credentials with no figure sort last (treated as unknown, not zero),
-        // and ties keep store order.
-        candidates.sort_by(|a, b| {
-            b.points
-                .unwrap_or(-1.0)
-                .partial_cmp(&a.points.unwrap_or(-1.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let chosen = (*candidates.first()?).clone();
+        let chosen_index = Self::pick_replacement(
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.id != from && c.is_usable(now)),
+        )?;
+        let chosen = entries[chosen_index].clone();
 
         let mut switched = self.switched.write().await;
         // Enforce the LRU-ish bound: dropping expired entries first is enough
@@ -738,5 +789,89 @@ mod tests {
         p2.reload(vec![cred("wb-b"), cred("wb-a")]).await;
         assert_eq!(p2.sticky_count().await, 1);
         assert_eq!(p2.pick("claude:s1").await.unwrap().id, "wb-b");
+    }
+
+    // ── Failover order: the pool order the user set ────────────────────
+    // These pin the rule that replaced "most remaining quota first". A user who
+    // drags an account to the top is expressing "try this one first", and the
+    // old quota-first sort quietly overruled exactly that.
+
+    fn cred_with_points(id: &str, points: Option<f64>) -> WorkBuddyCredential {
+        WorkBuddyCredential { points, ..cred(id) }
+    }
+
+    /// The first entry of the pool is the replacement, regardless of quota.
+    #[tokio::test]
+    async fn failover_honours_pool_order_over_a_bigger_balance() {
+        // wb-b has far more points, but wb-a sits first, so a failure of the
+        // still-healthy wb-c must land on wb-a.
+        let p = CredentialPool::new(vec![
+            cred_with_points("wb-a", Some(1.0)),
+            cred_with_points("wb-b", Some(9999.0)),
+            cred_with_points("wb-c", Some(50.0)),
+        ]);
+        let chosen = p.switch("claude:s1", "wb-c").await.unwrap();
+        assert_eq!(
+            chosen.id, "wb-a",
+            "pool order must outrank a larger points balance"
+        );
+    }
+
+    /// Reordering the pool changes the replacement — the whole point of the
+    /// GUI's drag reorder.
+    #[tokio::test]
+    async fn reordering_the_pool_changes_the_replacement() {
+        let p = CredentialPool::new(vec![cred("wb-a"), cred("wb-b"), cred("wb-c")]);
+        assert_eq!(p.switch("claude:s1", "wb-c").await.unwrap().id, "wb-a");
+
+        // Move wb-b to the front, as a drag would.
+        p.reload(vec![cred("wb-b"), cred("wb-a"), cred("wb-c")])
+            .await;
+        assert_eq!(
+            p.switch("claude:s2", "wb-c").await.unwrap().id,
+            "wb-b",
+            "the new top entry must be tried first"
+        );
+    }
+
+    /// The failing credential is skipped, not chosen, even at the top.
+    #[tokio::test]
+    async fn the_failing_credential_is_never_its_own_replacement() {
+        let p = CredentialPool::new(vec![cred("wb-a"), cred("wb-b")]);
+        let chosen = p.switch("claude:s1", "wb-a").await.unwrap();
+        assert_eq!(chosen.id, "wb-b");
+    }
+
+    /// Ties keep pool order: `pick_replacement` must be a strict total order.
+    ///
+    /// The comparator it replaced mixed "compare by points" with "fall back to
+    /// position", which is not transitive across three candidates — the shape
+    /// that makes `sort_by` panic with "user-provided comparison function does
+    /// not correctly implement a total order".
+    #[tokio::test]
+    async fn equal_scores_keep_pool_order_and_do_not_panic() {
+        let p = CredentialPool::new(vec![
+            cred_with_points("wb-a", Some(10.0)),
+            cred_with_points("wb-b", Some(10.0)),
+            cred_with_points("wb-c", None),
+            cred_with_points("wb-d", Some(10.0)),
+        ]);
+        // No panic, and the earliest pool entry wins.
+        assert_eq!(p.switch("claude:s1", "wb-c").await.unwrap().id, "wb-a");
+    }
+
+    /// A credential with no points figure is "unknown", never treated as zero
+    /// and never promoted above an explicitly earlier entry.
+    #[tokio::test]
+    async fn unknown_points_do_not_demote_or_promote_a_credential() {
+        let p = CredentialPool::new(vec![
+            cred_with_points("wb-a", None),
+            cred_with_points("wb-b", Some(5000.0)),
+        ]);
+        assert_eq!(
+            p.switch("claude:s1", "wb-c").await.unwrap().id,
+            "wb-a",
+            "an unknown balance must not push the first entry behind a rich one"
+        );
     }
 }

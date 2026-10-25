@@ -162,6 +162,13 @@ fn current_identity_summary() -> Value {
     json!({ "id": id, "label": label, "points": points })
 }
 
+/// Today's counters, for the overview's statistics row.
+///
+/// The payload is built by [`proxy_rs::api::stats_today_json`] rather than
+/// inline here: the same shape is served by `GET /api/stats/today`, and two
+/// hand-rolled mappings of one `DayStats` is how the window and an external
+/// consumer silently drift apart. This command remains the fallback transport
+/// for a window whose listener is not up yet.
 #[tauri::command]
 async fn get_stats(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     // SQLite access is blocking; run it off the async runtime so a slow query
@@ -172,19 +179,7 @@ async fn get_stats(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
-    Ok(json!({
-        "date": today.date,
-        "requests_total": today.requests_total,
-        "requests_success": today.requests_success,
-        "requests_failed": today.requests_failed,
-        "tokens_total": today.tokens_total(),
-        "tokens_input": today.tokens_input,
-        "tokens_cache_read": today.tokens_cache_read,
-        "tokens_cache_write": today.tokens_cache_write,
-        "tokens_output": today.tokens_output,
-        "cache_hit_pct": today.cache_hit_pct(),
-        "overrides_total": today.overrides_total,
-    }))
+    Ok(proxy_rs::api::stats_today_json(&today))
 }
 
 /// How many recent conversations the speed panel compares.
@@ -389,6 +384,12 @@ async fn clear_logs(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
+/// One page of request logs plus the facet lists the filter dropdowns read.
+///
+/// Shaped by [`proxy_rs::api::request_logs_json`], the same function behind
+/// `GET /api/request-logs`: the window prefers that endpoint and falls back to
+/// this command when the listener is down, so the two must be byte-identical
+/// rather than merely similar.
 #[tauri::command]
 async fn get_request_logs(
     filter: Option<RequestLogFilter>,
@@ -402,7 +403,7 @@ async fn get_request_logs(
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
-    serde_json::to_value(&res).map_err(|e| e.to_string())
+    proxy_rs::api::request_logs_json(&res).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1133,6 +1134,93 @@ async fn wb_set_default_identity(
     Ok(json!({ "ok": true, "default_identity_id": prefs.default_identity_id }))
 }
 
+/// Reorder the credential pool: `ids` is the new priority order, first tried
+/// first.
+///
+/// **The array order in `workbuddy-credentials.json` *is* the priority list.**
+/// The pool is built from that vector in order (`pick` takes the first usable
+/// entry), so reordering the store is the whole mechanism — there is no separate
+/// priority column to keep in sync with it, and no second source of truth that
+/// could disagree after a hand edit.
+///
+/// Fails rather than partially applying: `ids` must be a permutation of exactly
+/// the credentials on disk. Accepting an unknown id would reorder a pool that
+/// does not match what the window showed, and accepting a subset would silently
+/// drop the credentials the caller forgot about.
+///
+/// **Interaction with the default identity.** [`ordered_credentials`] pins the
+/// chosen default to the front at load time, so a drag that puts account B above
+/// the pinned default A would be undone on the very next reload — the drag would
+/// appear to work and then silently revert. Since dragging a row to the top is
+/// an unambiguous "I want this one tried first", that gesture also moves the
+/// default to the same account; any other drag leaves the default alone and only
+/// changes the order *behind* it.
+///
+/// [`ordered_credentials`]: proxy_rs::workbuddy_auth::ordered_credentials
+#[tauri::command]
+async fn wb_reorder_credentials(
+    ctx: State<'_, Arc<AppContext>>,
+    ids: Vec<String>,
+) -> Result<Value, String> {
+    let mut items = proxy_rs::workbuddy_auth::load_credentials();
+
+    let known: std::collections::HashSet<&str> = items.iter().map(|c| c.id.as_str()).collect();
+    let requested: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+    if requested.len() != ids.len() {
+        return Err("排序列表含重复的凭据 id".to_string());
+    }
+    if requested != known || ids.len() != items.len() {
+        return Err(format!(
+            "排序列表与账号池不一致（池内 {} 个，提交 {} 个）",
+            items.len(),
+            ids.len()
+        ));
+    }
+
+    // `sort_by_key` on the requested position: an id absent from `ids` would
+    // sort as 0 (ahead of everything), so the permutation check above is what
+    // makes this safe rather than defensive.
+    let rank = |id: &str| ids.iter().position(|x| x == id).unwrap_or(usize::MAX);
+    items.sort_by_key(|c| rank(&c.id));
+
+    // Pin the default to the new top so the reload below cannot revert the drag
+    // (see the doc comment). Only when the current default is a credential: a
+    // key or "no pool" selection owns no position in this list.
+    let mut pinned_default = false;
+    if let Some(top) = ids.first() {
+        let prefs = proxy_rs::workbuddy_auth::load_preferences();
+        if prefs.default_identity_id.starts_with("wb-")
+            && prefs.default_identity_id != *top
+            && items.iter().any(|c| c.id == *top)
+        {
+            proxy_rs::workbuddy_auth::set_default_identity(top).map_err(|e| e.to_string())?;
+            pinned_default = true;
+        }
+    }
+
+    proxy_rs::workbuddy_auth::save_credentials(&items).map_err(|e| e.to_string())?;
+    reload_pool(&ctx).await;
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "账号池顺序已更新: {}{}",
+                items
+                    .iter()
+                    .map(|c| c.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" → "),
+                if pinned_default {
+                    "（首位账号已同步设为默认身份）"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .await;
+    Ok(json!({ "ok": true, "order": ids, "default_moved": pinned_default }))
+}
+
 #[tauri::command]
 async fn wb_sticky_reset(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
     ctx.credential_pool.reset_sticky().await;
@@ -1158,6 +1246,15 @@ async fn wb_oauth_start(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String
     }))
 }
 
+/// Poll one QR-login state. Called every 2s by the window until it stops.
+///
+/// **Only terminal outcomes are logged.** A poll that is merely waiting (`11217`
+/// "login ing...") returns every 2 seconds for as long as the user takes to
+/// scan, so logging it would bury the log in identical lines. But a *failure*
+/// used to be returned to the window and written nowhere, which made a broken
+/// scan undiagnosable after the fact: the log showed "已生成扫码授权" and then
+/// nothing, so the only way to learn the upstream's reason was to re-run the
+/// scan live. The reason (now carrying the upstream `code`/`msg`) goes to disk.
 #[tauri::command]
 async fn wb_oauth_poll(ctx: State<'_, Arc<AppContext>>, state: String) -> Result<Value, String> {
     let client = reqwest::Client::new();
@@ -1168,6 +1265,12 @@ async fn wb_oauth_poll(ctx: State<'_, Arc<AppContext>>, state: String) -> Result
     match res {
         proxy_rs::workbuddy_auth::OAuthPollResult::Pending => Ok(json!({ "status": "pending" })),
         proxy_rs::workbuddy_auth::OAuthPollResult::Failed { error } => {
+            ctx.logs
+                .push(
+                    "ERROR",
+                    format!("WorkBuddy 扫码授权失败: {} (state={})", error, state),
+                )
+                .await;
             Ok(json!({ "status": "failed", "error": error }))
         }
         proxy_rs::workbuddy_auth::OAuthPollResult::Success { credential } => {
@@ -2301,6 +2404,7 @@ fn main() {
             wb_relogin,
             wb_credentials_delete,
             wb_credentials_toggle,
+            wb_reorder_credentials,
             wb_sticky_reset,
             wb_oauth_start,
             wb_oauth_poll,

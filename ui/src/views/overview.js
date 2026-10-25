@@ -7,6 +7,7 @@
 
 import { $, setText, setClass, setHidden, html, raw } from '../core/dom.js';
 import { invoke } from '../core/ipc.js';
+import { getStats } from '../core/api.js';
 import { appState } from '../core/state.js';
 import {
   formatNumber,
@@ -166,11 +167,18 @@ export async function refreshStatus() {
   }
 }
 
-/** Read today's token totals. */
+/**
+ * Read today's token totals.
+ *
+ * `getStats` reads `GET /api/stats/today` from the local listener and falls back
+ * to the `get_stats` Tauri command when the service is stopped — see
+ * `core/api.js`. Both return the identical payload (`src/api.rs` defines it
+ * once), so this function does not care which transport answered.
+ */
 export async function refreshStats() {
   let s;
   try {
-    s = await invoke('get_stats');
+    s = await getStats();
   } catch (err) {
     console.error('refreshStats error:', err);
     return;

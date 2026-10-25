@@ -233,6 +233,38 @@
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+/* ── Drag-to-reorder the credential pool ──────────────────────────
+ *
+ * The row order *is* the failover priority (the pool tries credentials
+ * top-down), so the affordance has to look draggable without pretending every
+ * row is a control: a grip on the left, a grab cursor, and an accent line where
+ * the row will land. Colours come from tokens so dark mode follows. */
+.wb-credential-row--draggable {
+  cursor: grab;
+}
+
+.wb-credential-row--dragging {
+  opacity: .45;
+  /* No transition on the dragged row: a moving ghost under the pointer reads as
+   * lag rather than feedback. */
+}
+
+.wb-credential-row--drop-target {
+  /* An inset accent bar rather than a border: adding a border would shift the
+   * row's layout by its width and make the whole list jump while dragging. */
+  box-shadow: inset 0 2px 0 0 var(--accent);
+  border-color: var(--accent-tint-border);
+}
+
+.wb-drag-handle {
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: -2px;
+  line-height: 1;
+  user-select: none;
+  flex: 0 0 auto;
+}
+
 
 .wb-checkin-note {
   font-size: 11px;

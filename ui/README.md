@@ -17,7 +17,7 @@ ui/
   index.html           外壳：窗口 chrome + 每个视图一个空挂载点 + 样式表 <link>
   style/               样式，按「层次」拆分（见下）
   src/
-    core/              基础设施：dom（$ / html 模板 / 转义）、ipc（invoke/listen）、state
+    core/              基础设施：dom（$ / html 模板 / 转义）、ipc（invoke/listen）、api（HTTP + IPC 回退）、state
     lib/               format 等纯函数（无 DOM）
     components/        可复用 UI 部件（modal / confirm / toast / overlay / table / pills）
     views/             每个标签页一个视图；settings/ 因规模较大拆成目录
@@ -62,7 +62,7 @@ ui/
 1. **视图负责渲染，main.js 负责装配。** 每个视图导出 `render*()`（建 DOM）与 `init*()`（绑事件），由 `main.js` 在启动时各调用一次。视图不自行启动，也不互相 `init`。
 2. **不引入框架。** 渲染用 `core/dom.js` 的 `` html`` `` 模板标签——插值默认转义；需要嵌套标记时显式 `raw()`。不要用 `innerHTML` 拼字符串绕过它。
 3. **`appState` 只放跨模块共享的值。** 视图内部状态（选中项、定时器、已加载标记）留在该模块的闭包里。加字段前先确认真的有第二个模块要读。
-4. **IPC 只走 `core/ipc.js`。** 不要在视图里直接访问 `window.__TAURI__`；`invoke` 在浏览器里会降级为日志 no-op，这正是 `ui/tools/smoke.mjs` 能脱离 Tauri 跑完整启动流程的原因。
+4. **数据源只走 `core/`，视图不碰传输层。** 不要在视图里直接访问 `window.__TAURI__`，也不要在视图里手写 `fetch`：`core/ipc.js` 负责 IPC（浏览器里降级为日志 no-op，这是 `ui/tools/smoke.mjs` 能脱离 Tauri 跑完整启动流程的原因），`core/api.js` 负责两个观测面板的数据源。**首页统计与请求日志表走 HTTP 优先**（`GET /api/stats/today`、`GET /api/request-logs`），监听器不可用时自动回退到同名 Tauri 命令；两条传输返回同一份形状（由 `src/api.rs` 单点定义），所以视图不需要知道是谁答的。判断新数据属于哪边：需要 `AppHandle`、窗口或系统面板等能力的走 Tauri 命令；只读、可持久化查询的观测数据走 `/api/*`。
 5. **打破循环依赖用注入，不用反向 import。** 已有两例：`palette.js` 接收 `switchTab`，`settings/oauth-qr.js` 接收 `repaint`。反向 import 会让模块初始化顺序变成隐式契约。
 6. **`settings/` 的内部划分**：`form.js` 只搭骨架，`fields.js` 是纯标记构建器，`badges.js` 管「已修改」基线，`load.js` / `save.js` 读写后端，`credential-pool.js` / `oauth-qr.js` / `checkin.js` 管身份池，`pool-transfer.js` 管账号池导入 / 导出（两个弹窗），`dsh.js` 管 DSH 一键写入，`index.js` 是唯一对外接口。外部（`main.js` / `palette.js`）只从 `settings/index.js` 导入。
 
@@ -88,5 +88,7 @@ task ui-test          # = check-ui（静态）+ smoke（无头浏览器行为回
 - [ ] 深色模式下目视确认（`prefers-color-scheme: dark`）
 
 `smoke.mjs` 会在无头 Chrome 里对着 mock 后端把真实页面完整启动一遍，断言概览指标、设置表单与身份池的渲染值，并验证两个跨模块集成点（命令面板的动态导入、扫码成功后身份池重绘）。改动这些路径后它应当仍然全绿；若断言值确实需要变，请一并更新脚本里的 `EXPECTED`，让改动是显式的而不是被忽略的。
+
+该脚本还在自己的 origin 上实现了 `/api/stats/today` 与 `/api/request-logs`，**且故意与 IPC mock 取不同的值**（`get_stats` 报 1234 条、`/api/stats/today` 报 4321 条）。于是「首页统计来自 HTTP」和「没有回退到 IPC」是两条可证的断言，而不是靠两条路径恰好同值蒙混过去。新增 HTTP 化的面板时请沿用这个做法。
 
 新增/调整视觉效果时，**改令牌或复用既有类**，不要为单个视图新开一套样式——这正是本目录各项约定要防的事。

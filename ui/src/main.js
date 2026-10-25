@@ -135,8 +135,12 @@ for (const btn of $$('.tab')) {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 }
 
-refreshStatus();
-refreshStats();
+// Stats are read after the status lands, not beside it: the HTTP base URL is
+// built from `appState.port`, which `refreshStatus` is what fills in. Racing
+// the two would send the first `/api/stats/today` to the default port even when
+// the user configured another one — a failed fetch that only the 10s poll (or
+// the IPC fallback, when running inside Tauri) would paper over.
+refreshStatus().then(refreshStats, refreshStats);
 refreshSessionMetrics();
 loadSettings();
 

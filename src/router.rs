@@ -1,11 +1,18 @@
 //! Shared axum router construction for the proxy API.
 //!
-//! Both the headless binary (`src/main.rs`) and the Tauri GUI
-//! (`src-tauri/src/main.rs`) build their HTTP listener from this single
-//! function so that every route — including `GET /v1/credits` — is registered
-//! in exactly one place. Adding a route here makes it available in both
-//! front-ends; neither binary should hand-roll the router.
+//! Every route the listener serves — the proxied `/v1/*` protocols, the gateway
+//! balance (`GET /v1/credits`), `/metrics` and the read-only dashboard
+//! observation endpoints under `/api/*` — is registered here, in one place, so a
+//! new endpoint cannot exist in one front-end and not the other. The Tauri GUI
+//! (`src-tauri/src/main.rs`) is the only current caller; the function is kept
+//! free of GUI types so a headless front-end can reuse it unchanged.
+//!
+//! The `/api/*` routes are deliberately in this router rather than a second
+//! listener: they answer questions about the same `StatsDb` the proxy writes to,
+//! and a dashboard that only worked while a second port was open would be worse
+//! than the Tauri commands it replaces.
 
+use crate::api;
 use crate::credits;
 use crate::metrics;
 use crate::proxy;
@@ -69,6 +76,10 @@ pub fn build_app_router(
         .route("/models", get(proxy::list_models_handler))
         .route("/v1/credits", get(credits::credits_handler))
         .route("/credits", get(credits::credits_handler))
+        // Read-only dashboard observation. Not under `/v1` — see `api`'s module
+        // docs for why the client-facing protocol namespace must stay clean.
+        .route("/api/stats/today", get(api::stats_today_handler))
+        .route("/api/request-logs", get(api::request_logs_handler))
         .route("/health", get(|| async { "OK" }))
         .route(
             "/metrics",

@@ -294,6 +294,17 @@ curl -X POST http://localhost:3456/v1/messages \
 | GET | `/v1/credits`<br/>`/credits` | **网关额度与钱包余额**查询 |
 | GET | `/health` | **健康检查探针**，返回 `OK`（状态码 200） |
 | GET | `/metrics` | **Prometheus 监控指标**导出 |
+| GET | `/api/stats/today` | **今日用量统计**（请求数 / Token 分类 / 缓存命中率 / override 次数），桌面端首页数据源 |
+| GET | `/api/request-logs` | **请求日志分页查询**（`model` / `client_model` / `client` / `session_id` / `status_group` / `streamed` / `search` / `limit` / `offset`），桌面端日志页数据源 |
+
+### 观测接口 `/api/*`
+
+`/api/*` 是**本进程自身的只读观测接口**，与 `/v1/*` 的转发协议刻意分开命名：`/v1/*` 是客户端 CLI 指向的上游协议命名空间，把用量/日志塞进去会和将来的上游真实端点撞名。
+
+- **两个传输共用一份数据形状**：`src/api.rs` 的 `stats_today_json` / `request_logs_json` 同时被 HTTP handler 与 Tauri 命令（`get_stats` / `get_request_logs`）调用，避免两条路径各写一份 mock 而导致字段漂移。
+- **桌面端优先走 HTTP，服务停止时回退 IPC**：监听器只在服务运行时存在，而「今天用了多少」往往在启动前就要看，所以 `ui/src/core/api.js` 在 `fetch` 失败时降级到对应的 Tauri 命令（回环拒绝连接是毫秒级的，不会拖慢面板）。
+- **不受 `is_running` 门禁**：这两个接口不参与转发数据面，停止服务时端口本身已关闭，再加一道 503 门禁只会在状态切换的窗口期误伤。
+- **当前无鉴权**：路由器对 `/api/*` 沿用了 `CorsLayer::allow_origin(Any)`，即本机任意网页可读请求日志；`PROXY_BIND=0.0.0.0` 时局域网同样可读。仅适用于单机自用场景，共享主机部署前必须先加 token 或来源白名单。
 
 ---
 
@@ -317,6 +328,7 @@ src/                       # 代理核心库 crate: proxy_rs（纯 Rust，无 GU
     upstream_errors.rs     #     上游错误的分类、描述与降级重试
     sse.rs                 #     SSE 组帧、请求日志台账与 TTFT / 速度统计
     tests.rs               #     上述内容与 handler 的单元测试
+  api.rs                   # Layer 3：观测接口（/api/*，与 Tauri 命令共用数据形状）
   router.rs                # Layer 3：路由定义（系统所有路由的唯一注册点）
   service.rs               # Layer 3：后台服务控制器与启停生命周期
   config.rs                # Layer 3：配置合并与环境变数加载
