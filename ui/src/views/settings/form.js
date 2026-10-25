@@ -196,6 +196,8 @@ export function renderSettings() {
       <span class="wb-schedule-hint" id="wb-growth-hint"></span>
     </div>
 
+    <pre id="wb-growth-progress" class="wb-growth-progress" hidden></pre>
+
     <div id="wb-identity-list" class="wb-credential-list"></div>
     <div class="hint" id="wb-status"></div>
   `, { collapsible: false });

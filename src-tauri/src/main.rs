@@ -956,12 +956,26 @@ async fn wb_refresh_points_single(
 /// user commits to a run.
 #[tauri::command]
 async fn wb_growth_run(
+    app: tauri::AppHandle,
     ctx: State<'_, Arc<AppContext>>,
     dry_run: Option<bool>,
 ) -> Result<Value, String> {
     let dry = dry_run.unwrap_or(false);
     let credentials = proxy_rs::workbuddy_auth::load_credentials();
-    let report = proxy_rs::growth_runner::run_pool(&ctx.client, &credentials, None, dry).await;
+    // Stream every step to the window. A full-pool sweep takes tens of seconds
+    // (per-account stagger alone is 2–5 s), so a single "done" at the end left
+    // the button looking dead for the whole run.
+    let emit = move |p: proxy_rs::growth_runner::GrowthProgress| {
+        let _ = app.emit("growth-progress", &p);
+    };
+    let report = proxy_rs::growth_runner::run_pool_with_progress(
+        &ctx.client,
+        &credentials,
+        None,
+        dry,
+        Some(&emit),
+    )
+    .await;
 
     if !dry {
         ctx.logs
@@ -994,6 +1008,7 @@ async fn wb_growth_run(
 /// Run the growth-task automation for one account.
 #[tauri::command]
 async fn wb_growth_run_single(
+    app: tauri::AppHandle,
     ctx: State<'_, Arc<AppContext>>,
     id: String,
     dry_run: Option<bool>,
@@ -1003,7 +1018,18 @@ async fn wb_growth_run_single(
         return Err(format!("账号不存在: {id}"));
     };
     let dry = dry_run.unwrap_or(false);
-    let run = proxy_rs::growth_runner::run_account(&ctx.client, cred, None, dry).await;
+    // Same progress stream as the pool-wide run, with a one-account total.
+    let emit = move |p: proxy_rs::growth_runner::GrowthProgress| {
+        let _ = app.emit("growth-progress", &p);
+    };
+    let run = proxy_rs::growth_runner::run_account_with_progress(
+        &ctx.client,
+        cred,
+        None,
+        dry,
+        Some(&emit),
+    )
+    .await;
 
     if !dry {
         ctx.logs

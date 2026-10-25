@@ -38,6 +38,46 @@ const DEFAULT_BUDGET_MS: i64 = 120_000;
 /// 保守值：跑满 5 次的任务多花 4 秒，换来的是一条相对安全的节奏。
 const REPORT_GAP_MS: i64 = 1_000;
 
+/// 运行过程中的一条进度。
+///
+/// 编排层不认识 Tauri，也不该认识：它只把"发生了什么"交出去，由命令层决定
+/// 发成事件、写日志还是画到面板上。这样 CLI 与 GUI 能共用同一套汇报逻辑。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum GrowthProgress {
+    /// 开始处理某个账号（`index`/`total` 从 1 开始，用于「第 2/4 个」）。
+    AccountStart {
+        index: usize,
+        total: usize,
+        credential_id: String,
+        label: String,
+    },
+    /// 某个任务已完成并领到奖。
+    TaskClaimed {
+        credential_id: String,
+        code: String,
+        credit: f64,
+    },
+    /// 某个任务上报后进度没动，已放弃。
+    TaskStalled { credential_id: String, code: String },
+    /// 某个账号处理完毕。
+    AccountDone {
+        credential_id: String,
+        label: String,
+        claimed: usize,
+        credits: f64,
+    },
+    /// 整个运行结束。
+    Finished {
+        accounts: usize,
+        claimed: usize,
+        credits: f64,
+    },
+}
+
+/// 进度回调。同步 `Fn` 即可：实现只需要把事件丢进队列/发出去，不做重活。
+pub type ProgressFn<'a> = &'a (dyn Fn(GrowthProgress) + Send + Sync);
+
 /// 一个任务为什么没有自动化。
 #[derive(Debug, Clone, Serialize)]
 pub struct SkippedTask {
@@ -66,6 +106,11 @@ pub struct AccountGrowthRun {
     pub label: String,
     /// 被接受接取的任务数。
     pub accepted: usize,
+    /// 接取被拒的任务数。
+    ///
+    /// `auto` 类与已完成的任务上游会拒绝接取，这属于正常状态而非失败，因此只
+    /// 计数、不进 `errors`——否则一次成功的运行会在日志里留下 ERROR。
+    pub rejected_accepts: usize,
     /// 达到目标并成功领奖的任务。
     pub claimed: Vec<ClaimedTask>,
     /// 本次实际拿到的积分（`claimed` 的 credit 之和）。
@@ -122,6 +167,17 @@ pub async fn run_account(
     only: Option<&[&str]>,
     dry_run: bool,
 ) -> AccountGrowthRun {
+    run_account_with_progress(client, cred, only, dry_run, None).await
+}
+
+/// 同 [`run_account`]，额外汇报进度。
+pub async fn run_account_with_progress(
+    client: &reqwest::Client,
+    cred: &WorkBuddyCredential,
+    only: Option<&[&str]>,
+    dry_run: bool,
+    progress: Option<ProgressFn<'_>>,
+) -> AccountGrowthRun {
     let mut run = AccountGrowthRun {
         credential_id: cred.id.clone(),
         label: crate::workbuddy_auth::display_label(cred),
@@ -167,7 +223,7 @@ pub async fn run_account(
         if dry_run || !task.is_actionable() {
             continue;
         }
-        advance_task(&growth, cred, task, &mut run, dry_run).await;
+        advance_task(&growth, cred, task, &mut run, dry_run, progress).await;
         if run.restricted {
             break;
         }
@@ -190,8 +246,11 @@ pub async fn run_account(
                 Ok(report) => {
                     run.accepted = report.accepted.len();
                     if !report.rejected.is_empty() {
-                        // 被拒不一定是错误：`auto` 类本来就不接受接取。记录但不报错。
-                        run.errors.push(format!("接取被拒: {:?}", report.rejected));
+                        // 被拒是**正常**的：`auto` 类任务上游本来就不接受接取，
+                        // 而已完成的任务也无需再接。把它记进 `errors` 会让一次
+                        // 完全成功运行在日志里显示一行 ERROR，用户据此以为失败。
+                        // 只记录数量，具体 code 交给 debug 级别。
+                        run.rejected_accepts = report.rejected.len();
                     }
                 }
                 Err(e) => {
@@ -257,11 +316,13 @@ pub async fn run_account(
         if !task.needs_work() {
             continue;
         }
-        advance_task(&growth, cred, task, &mut run, dry_run).await;
+        advance_task(&growth, cred, task, &mut run, dry_run, progress).await;
     }
 
     run.energy_after = growth.energy(cred).await.ok();
-    run.credits_earned = run.claimed.iter().map(|c| c.credit).sum();
+    // `sum()` on an empty iterator yields `-0.0` for floats in some code paths,
+    // which prints as "-0" in the log and reads like a loss. Normalise it.
+    run.credits_earned = run.claimed.iter().map(|c| c.credit).sum::<f64>().abs();
     run
 }
 
@@ -275,8 +336,18 @@ async fn advance_task(
     task: &GrowthTask,
     run: &mut AccountGrowthRun,
     dry_run: bool,
+    progress: Option<ProgressFn<'_>>,
 ) {
     if dry_run {
+        return;
+    }
+    // 已领奖的任务一律不碰。
+    //
+    // 调用方本应用 `needs_work()` 过滤，但 `auto` 类任务走的是另一条分支，那里
+    // 只看 `is_actionable()`——一个 `claimed` 的任务 `remaining() == 0`，本就
+    // 不该进来。这里再加一道显式守卫，因为**重复上报已领奖的任务**不仅浪费，
+    // 还会制造无谓的成长接口请求，而这类高频访问正是风控关注的模式。
+    if task.is_claimed() {
         return;
     }
     let Some(Automation::Auto { event }) = &task.automation else {
@@ -344,6 +415,12 @@ async fn advance_task(
             stall_rounds += 1;
             if stall_rounds >= 2 {
                 run.stalled.push(task.code.clone());
+                if let Some(cb) = progress {
+                    cb(GrowthProgress::TaskStalled {
+                        credential_id: cred.id.clone(),
+                        code: task.code.clone(),
+                    });
+                }
                 return;
             }
         }
@@ -368,6 +445,13 @@ async fn advance_task(
                 credit: report.credit,
                 energy: report.energy,
             });
+            if let Some(cb) = progress {
+                cb(GrowthProgress::TaskClaimed {
+                    credential_id: cred.id.clone(),
+                    code: task.code.clone(),
+                    credit: report.credit,
+                });
+            }
         }
         Err(e) => {
             let msg = e.to_string();
@@ -400,8 +484,27 @@ pub async fn run_pool(
     only: Option<&[&str]>,
     dry_run: bool,
 ) -> GrowthRunReport {
+    run_pool_with_progress(client, credentials, only, dry_run, None).await
+}
+
+/// 同 [`run_pool`]，额外汇报进度（每个账号开始/结束、每次领奖、整体结束）。
+pub async fn run_pool_with_progress(
+    client: &reqwest::Client,
+    credentials: &[WorkBuddyCredential],
+    only: Option<&[&str]>,
+    dry_run: bool,
+    progress: Option<ProgressFn<'_>>,
+) -> GrowthRunReport {
     let mut report = GrowthRunReport::default();
     let mut first = true;
+    // 先算出真正会参与运行的账号数，「第 2/4 个」才有意义（被跳过的账号
+    // 不该占分母，否则用户看到「第 3/5 个」却发现只剩 2 个在跑）。
+    let runnable = credentials
+        .iter()
+        .filter(|c| c.enabled)
+        .filter(|c| !matches!(c.cooldown_until_ms, Some(u) if u > crate::util::unix_millis()))
+        .count();
+    let mut index = 0usize;
 
     for cred in credentials {
         if !cred.enabled {
@@ -425,7 +528,24 @@ pub async fn run_pool(
         }
         first = false;
 
-        let run = run_account(client, cred, only, dry_run).await;
+        index += 1;
+        if let Some(cb) = progress {
+            cb(GrowthProgress::AccountStart {
+                index,
+                total: runnable,
+                credential_id: cred.id.clone(),
+                label: crate::workbuddy_auth::display_label(cred),
+            });
+        }
+        let run = run_account_with_progress(client, cred, only, dry_run, progress).await;
+        if let Some(cb) = progress {
+            cb(GrowthProgress::AccountDone {
+                credential_id: cred.id.clone(),
+                label: run.label.clone(),
+                claimed: run.claimed.len(),
+                credits: run.credits_earned,
+            });
+        }
         if run.restricted {
             report
                 .skipped_accounts
@@ -435,6 +555,13 @@ pub async fn run_pool(
         report.total_credits += run.credits_earned;
         report.total_claimed += run.claimed.len();
         report.accounts.push(run);
+    }
+    if let Some(cb) = progress {
+        cb(GrowthProgress::Finished {
+            accounts: report.total_accounts,
+            claimed: report.total_claimed,
+            credits: report.total_credits,
+        });
     }
     report
 }
@@ -469,6 +596,19 @@ pub fn should_run_night(prefs: &crate::workbuddy_auth::PoolPreferences, today: &
 pub fn summarize(report: &GrowthRunReport) -> String {
     if report.accounts.is_empty() {
         return "成长任务：没有可运行的账号".to_string();
+    }
+    // 「没什么可做」和「跑了但失败」必须区分开：前者是正常状态（任务都已领完、
+    // 或只剩不可自动化的），后者才需要用户干预。混成一句话会让用户以为出错。
+    let skipped: usize = report.accounts.iter().map(|a| a.skipped.len()).sum();
+    let errors: usize = report.accounts.iter().map(|a| a.errors.len()).sum();
+    if report.total_claimed == 0 && errors == 0 {
+        if skipped > 0 {
+            return format!(
+                "成长任务：没有可自动化的任务了（{} 个需你在桌面端手动完成）",
+                skipped
+            );
+        }
+        return "成长任务：所有任务都已完成并领取，无需再跑".to_string();
     }
     let mut parts = vec![format!(
         "共 {} 个账号，领取 {} 个任务，获得 {} 积分",
@@ -577,6 +717,63 @@ mod tests {
         assert!(s.contains("100"), "要报出积分: {s}");
         assert!(s.contains("未推进"), "要暴露未推进任务: {s}");
         assert!(s.contains("错误"), "要暴露错误: {s}");
+    }
+
+    /// 「没什么可做」必须与「失败」区分，否则一次正常运行看起来像出错。
+    #[test]
+    fn summary_distinguishes_nothing_to_do_from_failure() {
+        let with_manual = GrowthRunReport {
+            accounts: vec![AccountGrowthRun {
+                credential_id: "wb-a".into(),
+                label: "甲".into(),
+                skipped: vec![SkippedTask {
+                    code: "RichMeow_Chat".into(),
+                    title: "桌面对话".into(),
+                    reason: "只认桌面".into(),
+                    hint: Some("在桌面端发起 1 次对话".into()),
+                    reward: 100,
+                }],
+                ..Default::default()
+            }],
+            total_accounts: 1,
+            ..Default::default()
+        };
+        let s = summarize(&with_manual);
+        assert!(s.contains("手动完成"), "应指引用户手动做: {s}");
+        assert!(!s.contains("失败"), "这不是失败: {s}");
+
+        let nothing = GrowthRunReport {
+            accounts: vec![AccountGrowthRun {
+                credential_id: "wb-b".into(),
+                label: "乙".into(),
+                ..Default::default()
+            }],
+            total_accounts: 1,
+            ..Default::default()
+        };
+        let s2 = summarize(&nothing);
+        assert!(s2.contains("无需再跑"), "全领完要说清: {s2}");
+    }
+
+    /// 已领奖的任务不该再被上报——重复上报既浪费也制造风控暴露。
+    #[test]
+    fn claimed_tasks_are_skipped_by_needs_work() {
+        let t = crate::growth::GrowthTask {
+            code: "chat_5".into(),
+            title: "对话".into(),
+            status: "claimed".into(),
+            task_type: "single".into(),
+            current: 5,
+            target: 5,
+            reward: 100,
+            automation: Some(crate::growth::Automation::Auto {
+                event: crate::growth::EventKind::Chat,
+            }),
+            expert_id: None,
+        };
+        assert!(!t.needs_work());
+        assert!(!t.is_claimable());
+        assert!(!t.is_actionable());
     }
 
     /// 空池不该 panic，也不该产出误导性的「全部完成」。

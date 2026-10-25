@@ -7,13 +7,18 @@
  */
 
 import { $, html, raw } from '../../core/dom.js';
-import { invoke } from '../../core/ipc.js';
+import { invoke, listen } from '../../core/ipc.js';
 import { refreshStatus } from '../overview.js';
 import { toast } from '../../components/toast.js';
 import { formatPoints } from '../../lib/format.js';
 import { startQrCodeLogin, setOAuthPoolRefresh } from './oauth-qr.js';
 import { initRelogin, setReloginPoolRefresh } from './relogin.js';
 import { triggerBatchCheckin } from './checkin.js';
+
+/** Whether a growth run is in flight (drives the progress line). */
+let growthRunActive = false;
+/** Recent progress lines, newest last. */
+let growthProgressLines = [];
 
 /** State label → badge class, so a cooled credential reads differently. */
 const WB_STATE_LABELS = {
@@ -394,39 +399,118 @@ export function initCredentialPool() {
 
   // 增长积分：跑一遍成长任务并领奖。结果里「跳过」和「未推进」必须显式告知，
   // 否则用户会以为"跑了=全拿到了"。
+  // Growth progress stream. Bound once per view init; the handler only updates
+  // the status line, so re-rendering the pool does not lose the listener.
+  // `initCredentialPool` is called synchronously from the view router, so the
+  // subscription is fired and forgotten rather than awaited: binding a listener
+  // must not delay first paint of the pool.
+  listen('growth-progress', (p) => {
+    if (!p || !p.phase) return;
+    // Only surface while a run is actually in flight: a stray event after the
+    // run finished must not overwrite the final summary.
+    if (!growthRunActive) return;
+    const lines = growthProgressLines;
+    if (p.phase === 'account_start') {
+      lines.push(`⏳ 第 ${p.index}/${p.total} 个账号：${p.label}`);
+    } else if (p.phase === 'task_claimed') {
+      lines.push(`  ✓ ${p.code} +${p.credit} 分`);
+    } else if (p.phase === 'task_stalled') {
+      lines.push(`  · ${p.code} 未推进，已跳过`);
+    } else if (p.phase === 'account_done') {
+      lines.push(
+        p.claimed > 0
+          ? `  → ${p.label}：${p.claimed} 个任务 +${p.credits} 分`
+          : `  → ${p.label}：本次无可领取`,
+      );
+    } else if (p.phase === 'finished') {
+      lines.push(`全部完成：${p.claimed} 个任务 +${p.credits} 分`);
+    }
+    // Keep only the tail: a long pool run would otherwise fill the line.
+    if (lines.length > 6) lines.splice(0, lines.length - 6);
+    const el = $('#wb-growth-progress');
+    if (el) {
+      el.textContent = lines.join('\n');
+      el.hidden = false;
+    }
+  });
+
   $('#btn-wb-growth')?.addEventListener('click', async () => {
     const btn = $('#btn-wb-growth');
     if (btn) {
       btn.disabled = true;
       btn.textContent = '⏳ 增长中...';
     }
+    // Progress state: the event handler appends lines while `growthRunActive`.
+    growthRunActive = true;
+    growthProgressLines = ['开始运行成长任务…'];
+    const progEl = $('#wb-growth-progress');
+    if (progEl) {
+      progEl.hidden = false;
+      progEl.textContent = growthProgressLines.join('\n');
+    }
     try {
       const report = await invoke('wb_growth_run', { dryRun: false });
       await renderIdentityPool();
       await refreshStatus();
+
       const claimed = report?.total_claimed ?? 0;
       const credits = report?.total_credits ?? 0;
-      showWbStatus(
-        claimed > 0
-          ? `增长任务完成：领取 ${claimed} 个任务，获得 ${credits} 积分`
-          : '增长任务已运行：本次没有可领取的积分（详见日志）',
-      );
-      // 需要手动完成的任务单独提示一次——那是用户唯一能再拿分的入口。
       const manual = (report?.accounts || [])
         .flatMap((a) => a.skipped || [])
         .filter((s) => s.hint);
-      if (manual.length) {
-        showWbStatus(
-          `有 ${manual.length} 个任务需要你在桌面客户端手动完成（见日志）`,
-        );
+      const stalled = (report?.accounts || []).reduce(
+        (n, a) => n + (a.stalled?.length || 0),
+        0,
+      );
+
+      // One consolidated message. Previously two `showWbStatus` calls ran back to
+      // back and the second overwrote the first, so a successful run could end
+      // up showing only "有 N 个任务需要你手动完成" and the earned credits were
+      // never mentioned.
+      const parts = [];
+      if (claimed > 0) {
+        parts.push(`领取 ${claimed} 个任务，获得 ${credits} 积分`);
+      } else if (stalled === 0 && manual.length === 0) {
+        // Nothing left to automate and nothing failed: this is the normal
+        // "all claimed" state, not an error. Saying "没有可领取的积分" alone read
+        // as a failure to users.
+        parts.push('所有可自动化的任务都已领完');
+      } else {
+        parts.push('本次没有新领取的积分');
       }
+      if (stalled > 0) parts.push(`${stalled} 个任务上报后未推进`);
+      if (manual.length > 0) parts.push(`${manual.length} 个任务需你手动完成`);
+      showWbStatus(`增长任务完成：${parts.join('；')}`);
+
+      // A toast makes the outcome visible even if the status line is off-screen.
+      // Only a real failure gets the error tone; "already all claimed" is a
+      // success with zero delta.
+      const allDone = claimed === 0 && stalled === 0;
+      toast(
+        claimed > 0
+          ? `增长完成：+${credits} 积分（${claimed} 个任务）`
+          : allDone
+            ? '增长完成：可自动化的任务都已领完'
+            : '增长已运行：本次没有新领取的积分',
+        'ok',
+      );
     } catch (e) {
       showWbStatus('增长任务失败: ' + e, true);
+      toast('增长任务失败: ' + e, 'error');
     } finally {
+      growthRunActive = false;
       if (btn) {
         btn.disabled = false;
         btn.textContent = '📈 增长积分';
       }
+      // Leave the progress line visible briefly, then clear it so a later run
+      // starts clean instead of appending to stale output.
+      setTimeout(() => {
+        const el = $('#wb-growth-progress');
+        if (el && !growthRunActive) {
+          el.textContent = growthProgressLines.join('\n');
+        }
+      }, 0);
     }
   });
 

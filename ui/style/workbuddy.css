@@ -234,6 +234,29 @@
   box-shadow: var(--shadow-sm);
 }
 
+/* Growth-run progress output.
+ *
+ * A live log rather than a spinner: a full-pool run reports per-account and
+ * per-task results, and seeing "which account is it on" is what makes a long
+ * run tolerable. Monospace + `pre-wrap` keeps the indentation of the per-task
+ * lines, and `max-height` stops a 20-task run from pushing the pool list off
+ * screen. */
+.wb-growth-progress {
+  margin: 8px 0;
+  padding: 8px 10px;
+  max-height: 140px;
+  overflow-y: auto;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--muted);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
 .wb-points {
   font-size: 11px;
   color: var(--muted);
