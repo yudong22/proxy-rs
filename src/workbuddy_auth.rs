@@ -1318,6 +1318,58 @@ pub fn migrate_credential_ids() -> Result<usize> {
 /// backend; workbuddy2api uses the same prefix for both regions).
 pub const AUTH_PREFIX: &str = "/v2/plugin";
 
+/// Per-account refresh locks.
+///
+/// The upstream **rotates** the refresh token on every renewal, so two
+/// concurrent refreshes of one account are not idempotent: the first consumes
+/// `refreshToken A` and receives `B`, and the second still presents `A`, which
+/// is now dead. The loser sees `12153 refresh token is invalid` and — because a
+/// rejected refresh is exactly what marks an account "needs re-login" — a
+/// perfectly healthy account gets flagged. That is the shape of the
+/// libai/S.D incident: flagged as rejected, then healthy again later.
+///
+/// Serialising per credential id (not globally) keeps different accounts
+/// refreshing in parallel, which matters because the pool refreshes several at
+/// once on a schedule.
+fn refresh_locks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The lock guarding refreshes of one credential.
+fn refresh_lock_for(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut map = refresh_locks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// The `X-Auth-Refresh-Source` value for an endpoint.
+///
+/// The CN deployment tags desktop-issued renewals `workbuddy` and only the
+/// plugin/IDE path uses `plugin`; the international deployment uses `plugin`.
+/// Our code sent `plugin` everywhere. Both are accepted today — verified against
+/// the live endpoint 2026-10-25 — so this is not a fix for a current failure,
+/// but the channel marker is what the gateway would key a future tightening on,
+/// and being wrong there would fail the same way the chat channel did.
+fn refresh_source_for(endpoint: &str) -> &'static str {
+    let host = endpoint
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host = host.split('/').next().unwrap_or(host);
+    if host.ends_with("workbuddy.ai") {
+        "plugin"
+    } else {
+        "workbuddy"
+    }
+}
+
 /// Refresh an access token against the desktop client's refresh endpoint.
 ///
 /// Mirrors workbuddy2api's `refresh()`: `POST /v2/plugin/auth/token/refresh`
@@ -1329,6 +1381,35 @@ pub async fn refresh_credential(
     endpoint: &str,
     credential: &mut WorkBuddyCredential,
 ) -> Result<()> {
+    // Serialise per account: the upstream rotates the refresh token, so two
+    // concurrent renewals make the second present a token the first consumed.
+    // Re-acquiring the guard here also re-reads the freshest token from disk
+    // below, which is what makes the second caller a no-op instead of a failure.
+    let lock = refresh_lock_for(&credential.id);
+    let _guard = lock.lock().await;
+
+    // Another task may have refreshed this credential while we waited. Adopt
+    // its result rather than spending the rotated token a second time.
+    //
+    // The test is "the store holds a *different* access token than the caller
+    // passed in", not "the stored one is usable": usability folds in `enabled`
+    // and cooldown, and a credential that is cooling down (or was just disabled)
+    // still has a perfectly fresh token that must not be refreshed again. Using
+    // `is_usable` here would re-spend the rotated token in exactly the failover
+    // scenario this lock exists to protect.
+    if let Some(stored) = load_credentials()
+        .into_iter()
+        .find(|c| c.id == credential.id)
+    {
+        if stored.access_token != credential.access_token
+            && !stored.access_token.is_empty()
+            && stored.refresh_token == credential.refresh_token
+        {
+            *credential = stored;
+            return Ok(());
+        }
+    }
+
     let Some(refresh_token) = credential.refresh_token.clone() else {
         anyhow::bail!("凭据没有 refreshToken，无法刷新；请重新导入登录态");
     };
@@ -1344,7 +1425,7 @@ pub async fn refresh_credential(
         .header("User-Agent", crate::providers::WORKBUDDY_USER_AGENT)
         .header("X-Product-Code", "codebuddy")
         .header("X-Refresh-Token", refresh_token)
-        .header("X-Auth-Refresh-Source", "plugin")
+        .header("X-Auth-Refresh-Source", refresh_source_for(endpoint))
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -3355,6 +3436,88 @@ mod tests {
         let svg = generate_qr_svg("https://copilot.tencent.com/login?state=test").unwrap();
         assert!(svg.contains("<svg"));
         assert!(svg.contains("</svg>"));
+    }
+
+    // ── Refresh channel marker ─────────────────────────────────────────────
+    // The CN deployment tags desktop renewals `workbuddy`; the international one
+    // uses `plugin`. We sent `plugin` everywhere, which the endpoint still
+    // accepts (verified live 2026-10-25) — but the marker is what a channel
+    // tightening would key on, and getting it wrong would fail exactly the way
+    // the chat channel already does.
+
+    #[test]
+    fn refresh_source_follows_the_deployment() {
+        assert_eq!(
+            refresh_source_for("https://copilot.tencent.com"),
+            "workbuddy"
+        );
+        assert_eq!(refresh_source_for("https://www.codebuddy.cn"), "workbuddy");
+        assert_eq!(
+            refresh_source_for("https://www.workbuddy.ai"),
+            "plugin",
+            "the international deployment keeps the plugin marker"
+        );
+    }
+
+    #[test]
+    fn refresh_source_tolerates_a_trailing_path_and_scheme_noise() {
+        // `auth_endpoint_for` returns a bare authority, but a hand-entered
+        // domain may carry a path or a trailing slash; the host is what decides.
+        assert_eq!(refresh_source_for("https://www.codebuddy.cn/"), "workbuddy");
+        assert_eq!(refresh_source_for("http://www.workbuddy.ai/v2"), "plugin");
+    }
+
+    // ── Per-account refresh serialisation ──────────────────────────────────
+    // The upstream rotates the refresh token, so two concurrent renewals of one
+    // account make the second present an already-consumed token and fail with
+    // `12153 refresh token is invalid` — which the caller records as "needs
+    // re-login" on a perfectly healthy account.
+
+    /// The same credential id must yield the same lock, different ids must not.
+    #[test]
+    fn refresh_locks_are_per_credential() {
+        let a1 = refresh_lock_for("wb-aaa");
+        let a2 = refresh_lock_for("wb-aaa");
+        let b = refresh_lock_for("wb-bbb");
+        assert!(
+            std::sync::Arc::ptr_eq(&a1, &a2),
+            "one account must share one lock"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&a1, &b),
+            "different accounts must not serialise against each other"
+        );
+    }
+
+    /// Holding one account's lock must not block another account's.
+    ///
+    /// This is what keeps the scheduled pool refresh parallel; a single global
+    /// lock would serialise every account behind the slowest one.
+    #[tokio::test]
+    async fn holding_one_accounts_lock_does_not_block_another() {
+        let held = refresh_lock_for("wb-held").lock_owned().await;
+        let other = refresh_lock_for("wb-free");
+        let acquired =
+            tokio::time::timeout(std::time::Duration::from_millis(200), other.lock_owned()).await;
+        assert!(
+            acquired.is_ok(),
+            "a different account must not wait on this one"
+        );
+        drop(held);
+    }
+
+    /// The same account's second caller waits for the first.
+    #[tokio::test]
+    async fn the_same_accounts_second_caller_waits() {
+        let first = refresh_lock_for("wb-same").lock_owned().await;
+        let second = refresh_lock_for("wb-same");
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(150), second.lock_owned()).await;
+        assert!(
+            waited.is_err(),
+            "two renewals of one account must not run concurrently"
+        );
+        drop(first);
     }
 
     // ── QR-login poll envelope ─────────────────────────────────────────────
