@@ -117,7 +117,12 @@ const MOCK = {
     keys: [{ id: 'key-1', label: '备用密钥', enabled: true, points: 88, masked: 'sk-***k' }],
     default_identity_id: 'cred-1',
   },
-  wb_preferences: { daily_checkin_enabled: true, daily_checkin_time: '08:30', last_checkin_run_date: '2026-01-01' },
+  wb_preferences: { daily_checkin_enabled: true, daily_checkin_time: '08:30', last_checkin_run_date: '2026-01-01', growth_enabled: false },
+  // Growth automation: the mock reports what a run would produce so the button's
+  // message can be asserted. `total_claimed`/`total_credits` are what the UI reads.
+  wb_growth_run: { total_accounts: 1, total_claimed: 2, total_credits: 200, accounts: [] },
+  wb_growth_run_single: { credential_id: 'cred-1', label: '测试账号一', claimed: [], credits_earned: 0, skipped: [], stalled: [], errors: [] },
+  wb_growth_preview: { tasks: [], energy: 13, earnable: 800 },
   fetch_models: { models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }] },
   test_upstream: { ok: true, detail: '上游流式响应正常' },
   wb_oauth_start: { state: 'abc', auth_url: 'https://example.test/auth', qr_svg: '<svg id="qrsvg"></svg>' },
@@ -431,6 +436,16 @@ try {
           .map((k) => k.closest('[data-ident-row]')?.classList.contains('wb-credential-row--draggable') === true),
         rowIds: [...document.querySelectorAll('#wb-identity-list [data-ident-row]')]
           .map((r) => r.dataset.identRow),
+        // Growth automation: the toolbar entry, the per-row entry, and the
+        // opt-in switch must all exist. The switch defaults to off, which is the
+        // product decision — auto-running upstream calls is opt-in.
+        growth: {
+          toolbarButton: Boolean(document.querySelector('#btn-wb-growth')),
+          rowButtons: document.querySelectorAll('[data-growth]').length,
+          togglePresent: Boolean(document.querySelector('#wb-growth-enabled')),
+          toggleChecked: document.querySelector('#wb-growth-enabled')?.checked ?? null,
+          hint: (document.querySelector('#wb-growth-hint')?.textContent || '').trim(),
+        },
         selectValue: sel?.value,
         dshButtonPresent: Boolean(document.querySelector('#btn-apply-dsh-config')),
         dshStatus: t('#dsh-config-status'),
@@ -450,6 +465,11 @@ try {
   check('identity rows are draggable at all', b.credDraggable.length > 0, true);
   check('rows render in the requested identity order', b.rowIds,
     ['cred-1', 'cred-2', 'cred-3', 'cred-4', 'key-1']);
+  check('growth toolbar button exists', b.growth.toolbarButton, true);
+  check('growth row button exists per credential', b.growth.rowButtons > 0, true);
+  check('growth switch exists', b.growth.togglePresent, true);
+  check('growth switch defaults to off', b.growth.toggleChecked, false);
+  check('growth hint says it is off', b.growth.hint.includes('关闭中'), true);
   check('selectValue', b.selectValue, EXPECTED.selectValue);
   check('dsh button present', b.dshButtonPresent, EXPECTED.dshButtonPresent);
   check('dsh status', b.dshStatus, EXPECTED.dshStatus);

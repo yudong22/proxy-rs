@@ -154,6 +154,10 @@ export function renderSettings() {
       <button type="button" class="btn btn-small" id="btn-wb-checkin-all">
         🎁 账号池一键打卡
       </button>
+      <button type="button" class="btn btn-small" id="btn-wb-growth"
+        title="自动完成 Growth 成长任务并领取积分（只做可自动化的；需你手动完成的会在面板列明）">
+        📈 增长积分
+      </button>
       <button type="button" class="btn btn-small" id="btn-wb-refresh-points"
         title="刷新账号与密钥的剩余积分（全部身份）；只想刷某一个请用该行的「刷新积分」">
         💎 刷新全部积分
@@ -182,6 +186,14 @@ export function renderSettings() {
       <input type="time" id="wb-checkin-time" class="log-input wb-time-input" value="09:00">
       <button type="button" class="btn btn-small" id="btn-wb-schedule-save">保存定时</button>
       <span class="wb-schedule-hint" id="wb-schedule-hint"></span>
+    </div>
+
+    <div class="wb-schedule-row">
+      <label class="wb-checkbox-inline">
+        <input type="checkbox" id="wb-growth-enabled">
+        <span>自动跑成长任务</span>
+      </label>
+      <span class="wb-schedule-hint" id="wb-growth-hint"></span>
     </div>
 
     <div id="wb-identity-list" class="wb-credential-list"></div>

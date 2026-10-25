@@ -140,6 +140,24 @@ pub struct PoolPreferences {
     /// rather than hiding accounts.
     #[serde(default)]
     pub identity_order: Vec<String>,
+    /// Whether the scheduler runs the growth-task automation at all.
+    ///
+    /// **Off by default.** The automation calls the growth endpoints
+    /// repeatedly for every account; enabling it is an explicit opt-in rather
+    /// than something a fresh install does behind the user's back.
+    #[serde(default)]
+    pub growth_enabled: bool,
+    /// Local calendar day (`YYYY-MM-DD`) the growth automation last ran, so a
+    /// restart inside the same day does not run it twice.
+    #[serde(default)]
+    pub last_growth_run_date: Option<String>,
+    /// Local calendar day the *night-only* pass (`black_cat`) last ran.
+    ///
+    /// Tracked separately from [`Self::last_growth_run_date`] because those are
+    /// two different windows: the day pass must not consume the night pass's
+    /// slot, and the night pass only applies inside 23:00–08:00.
+    #[serde(default)]
+    pub last_night_growth_date: Option<String>,
 }
 
 fn default_checkin_time() -> String {
@@ -1016,6 +1034,19 @@ where
     let mut ranked: Vec<(usize, T)> = items.into_iter().map(|i| (rank(&i), i)).collect();
     ranked.sort_by_key(|(r, _)| *r);
     ranked.into_iter().map(|(_, i)| i).collect()
+}
+
+/// Persist the growth-automation switch, leaving every other preference alone.
+///
+/// Separate from [`save_schedule`] because the two switches are independent: a
+/// user may want automatic check-in but not the growth automation (it calls the
+/// upstream far more often). Returns the stored preferences so the caller can
+/// echo them back to the window.
+pub fn save_growth_enabled(enabled: bool) -> Result<PoolPreferences> {
+    let mut prefs = load_preferences();
+    prefs.growth_enabled = enabled;
+    save_preferences(&prefs)?;
+    Ok(prefs)
 }
 
 /// Credentials in the order the pool should try them.

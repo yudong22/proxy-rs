@@ -139,6 +139,8 @@ export async function renderIdentityPool() {
           <button type="button" class="btn btn-small" data-points="${c.id}"
             title="刷新此账号的剩余积分">刷新积分</button>
           <button type="button" class="btn btn-small" data-checkin="${c.id}" title="为此账号每日打卡领积分">打卡</button>
+          <button type="button" class="btn btn-small" data-growth="${c.id}"
+            title="为此账号自动完成成长任务并领取积分">增长</button>
           <button type="button" class="btn btn-small" data-toggle-cred="${c.id}" data-enabled="${c.enabled ? '1' : '0'}">
             ${c.enabled ? '禁用' : '启用'}
           </button>
@@ -235,7 +237,30 @@ export async function renderIdentityPool() {
         }
       });
     }
-    for (const btn of listEl.querySelectorAll('[data-checkin]')) {
+    for (const btn of listEl.querySelectorAll('[data-growth]')) {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.growth;
+      btn.disabled = true;
+      btn.textContent = '...';
+      try {
+        const run = await invoke('wb_growth_run_single', { id, dryRun: false });
+        await renderIdentityPool();
+        await refreshStatus();
+        const n = (run?.claimed || []).length;
+        showWbStatus(
+          n > 0
+            ? `增长完成：领取 ${n} 个任务，获得 ${run.credits_earned} 积分`
+            : '增长已运行：本次没有可领取的积分（详见日志）',
+        );
+      } catch (e) {
+        showWbStatus('增长失败: ' + e, true);
+        btn.disabled = false;
+        btn.textContent = '增长';
+      }
+    });
+  }
+
+  for (const btn of listEl.querySelectorAll('[data-checkin]')) {
       btn.addEventListener('click', async () => {
         const id = btn.dataset.checkin;
         btn.disabled = true;
@@ -330,6 +355,16 @@ export async function loadSchedule() {
   try {
     const prefs = await invoke('wb_preferences');
     if (!prefs) return;
+    const growthBox = $('#wb-growth-enabled');
+    if (growthBox) {
+      growthBox.checked = Boolean(prefs.growth_enabled);
+      const gh = $('#wb-growth-hint');
+      if (gh) {
+        gh.textContent = prefs.growth_enabled
+          ? '已开启：每天自动跑一次成长任务；23:00–08:00 额外跑「夜猫子」'
+          : '关闭中：只在你点「增长积分」时运行';
+      }
+    }
     const enabled = $('#wb-checkin-enabled');
     const time = $('#wb-checkin-time');
     if (enabled) enabled.checked = Boolean(prefs.daily_checkin_enabled);
@@ -357,6 +392,44 @@ export function initCredentialPool() {
   $('#btn-wb-qrcode')?.addEventListener('click', startQrCodeLogin);
   $('#btn-wb-checkin-all')?.addEventListener('click', triggerBatchCheckin);
 
+  // 增长积分：跑一遍成长任务并领奖。结果里「跳过」和「未推进」必须显式告知，
+  // 否则用户会以为"跑了=全拿到了"。
+  $('#btn-wb-growth')?.addEventListener('click', async () => {
+    const btn = $('#btn-wb-growth');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ 增长中...';
+    }
+    try {
+      const report = await invoke('wb_growth_run', { dryRun: false });
+      await renderIdentityPool();
+      await refreshStatus();
+      const claimed = report?.total_claimed ?? 0;
+      const credits = report?.total_credits ?? 0;
+      showWbStatus(
+        claimed > 0
+          ? `增长任务完成：领取 ${claimed} 个任务，获得 ${credits} 积分`
+          : '增长任务已运行：本次没有可领取的积分（详见日志）',
+      );
+      // 需要手动完成的任务单独提示一次——那是用户唯一能再拿分的入口。
+      const manual = (report?.accounts || [])
+        .flatMap((a) => a.skipped || [])
+        .filter((s) => s.hint);
+      if (manual.length) {
+        showWbStatus(
+          `有 ${manual.length} 个任务需要你在桌面客户端手动完成（见日志）`,
+        );
+      }
+    } catch (e) {
+      showWbStatus('增长任务失败: ' + e, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '📈 增长积分';
+      }
+    }
+  });
+
   $('#btn-wb-refresh-points')?.addEventListener('click', async () => {
     const btn = $('#btn-wb-refresh-points');
     if (btn) {
@@ -380,13 +453,14 @@ export function initCredentialPool() {
   $('#btn-wb-schedule-save')?.addEventListener('click', async () => {
     const enabled = Boolean($('#wb-checkin-enabled')?.checked);
     const time = $('#wb-checkin-time')?.value || '09:00';
+    const growth = Boolean($('#wb-growth-enabled')?.checked);
     const btn = $('#btn-wb-schedule-save');
     if (btn) {
       btn.disabled = true;
       btn.textContent = '保存中...';
     }
     try {
-      const res = await invoke('wb_set_schedule', { enabled, time });
+      const res = await invoke('wb_set_schedule', { enabled, time, growthEnabled: growth });
       const hint = $('#wb-schedule-hint');
       if (hint) {
         hint.textContent = res.daily_checkin_enabled

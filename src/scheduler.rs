@@ -152,6 +152,116 @@ pub async fn run_login_state_scanner(
     }
 }
 
+/// How often the growth-task scheduler wakes.
+///
+/// Growth tasks have no fixed wall-clock slot (unlike the check-in), but running
+/// the same endpoints back-to-back for every account is exactly the pattern
+/// upstream risk control watches for. One hour between passes keeps a full pool
+/// sweep from ever looking like a burst, and is granular enough that the
+/// 23:00–08:00 `black_cat` window is entered within minutes of opening.
+const GROWTH_TICK_SECS: u64 = 3600;
+
+/// Growth-task automation: the optional third scheduler loop.
+///
+/// **Off unless the user turns it on** (`PoolPreferences::growth_enabled`). The
+/// loop still ticks when disabled — the tick is a cheap preference read with no
+/// I/O, so an idle app pays nothing, and flipping the switch takes effect within
+/// an hour instead of requiring a restart.
+///
+/// Two independent passes share this loop:
+///
+/// * the **day pass** runs every runnable task once per local day;
+/// * the **night pass** runs only `black_cat`, only inside 23:00–08:00, and is
+///   tracked by its own date field.
+///
+/// Keeping them separate matters: sharing one "already ran today" stamp would
+/// let the day pass consume the night pass's slot, so `black_cat` (which only
+/// counts after 23:00) would never get a chance.
+pub async fn run_growth_tasks(
+    client: reqwest::Client,
+    logs: Arc<crate::settings::LogBuffer>,
+    shutdown: CancellationToken,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(GROWTH_TICK_SECS));
+    // Skip the immediate first tick: the app has just started and the day's
+    // catch-up (if any) can wait a moment for the pool and settings to settle.
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+
+        let prefs = workbuddy_auth::load_preferences();
+        if !prefs.growth_enabled {
+            continue;
+        }
+
+        let today = workbuddy_auth::local_day(crate::util::unix_millis());
+        let credentials = workbuddy_auth::load_credentials();
+        if credentials.is_empty() {
+            continue;
+        }
+
+        // Night pass first: inside the window it is time-critical (it can only
+        // run then), while the day pass is valid at any hour.
+        if crate::growth_runner::should_run_night(&prefs, &today) {
+            let report =
+                crate::growth_runner::run_pool(&client, &credentials, Some(&["black_cat"]), false)
+                    .await;
+            logs.push(
+                "INFO",
+                format!(
+                    "成长任务（夜间）: 共 {} 个账号，领取 {} 个任务，获得 {} 积分",
+                    report.total_accounts, report.total_claimed, report.total_credits
+                ),
+            )
+            .await;
+            if report.total_accounts > 0 {
+                // Only stamp the day when the pass actually ran; a skipped pool
+                // must not consume the night slot.
+                if let Err(e) = crate::growth_runner::mark_growth_run(&today, true) {
+                    logs.push("ERROR", format!("成长任务夜间记录写入失败: {e}"))
+                        .await;
+                }
+            }
+        }
+
+        if crate::growth_runner::should_run_day(&prefs, &today) {
+            let report = crate::growth_runner::run_pool(&client, &credentials, None, false).await;
+            logs.push(
+                "INFO",
+                format!("成长任务: {}", crate::growth_runner::summarize(&report)),
+            )
+            .await;
+            // Surface the two outcomes a user must act on, one line each.
+            for run in report.accounts.iter() {
+                for s in run.skipped.iter().filter(|s| s.hint.is_some()) {
+                    logs.push(
+                        "INFO",
+                        format!("成长任务需你手动完成 {}（{}）", s.code, s.reason),
+                    )
+                    .await;
+                }
+                for code in run.stalled.iter() {
+                    logs.push(
+                        "WARN",
+                        format!("成长任务 {} 上报后进度未推进，上游可能已加校验", code),
+                    )
+                    .await;
+                }
+            }
+            if report.total_accounts > 0 {
+                if let Err(e) = crate::growth_runner::mark_growth_run(&today, false) {
+                    logs.push("ERROR", format!("成长任务记录写入失败: {e}"))
+                        .await;
+                }
+            }
+        }
+    }
+}
+
 /// Whether the configured time has arrived on the local clock.
 ///
 /// True once the wall clock is at or past `HH:MM` today (which covers the

@@ -857,9 +857,19 @@ async fn wb_set_schedule(
     ctx: State<'_, Arc<AppContext>>,
     enabled: bool,
     time: String,
+    // Optional: leave `None` to keep the current growth switch untouched.
+    // Folding it into this command (rather than adding a fourth one) keeps the
+    // two schedule-related toggles written by the same call, so the settings
+    // file cannot end up with one updated and the other stale after a save.
+    growth_enabled: Option<bool>,
 ) -> Result<Value, String> {
     let prefs =
         proxy_rs::workbuddy_auth::save_schedule(enabled, &time).map_err(|e| e.to_string())?;
+    let prefs = if let Some(growth) = growth_enabled {
+        proxy_rs::workbuddy_auth::save_growth_enabled(growth).map_err(|e| e.to_string())?
+    } else {
+        prefs
+    };
     ctx.logs
         .push(
             "INFO",
@@ -935,6 +945,108 @@ async fn wb_refresh_points_single(
     Ok(json!({
         "result": result,
         "current_identity": current_identity_summary(),
+    }))
+}
+
+/// Run the growth-task automation for the whole pool (manual trigger).
+///
+/// `dry_run` returns the task list, its classification and the potentially
+/// earnable credits **without writing anything upstream** — that is what the GUI
+/// uses to show "what can be automated, what you must do yourself" before the
+/// user commits to a run.
+#[tauri::command]
+async fn wb_growth_run(
+    ctx: State<'_, Arc<AppContext>>,
+    dry_run: Option<bool>,
+) -> Result<Value, String> {
+    let dry = dry_run.unwrap_or(false);
+    let credentials = proxy_rs::workbuddy_auth::load_credentials();
+    let report = proxy_rs::growth_runner::run_pool(&ctx.client, &credentials, None, dry).await;
+
+    if !dry {
+        ctx.logs
+            .push("INFO", proxy_rs::growth_runner::summarize(&report))
+            .await;
+        // Stalled tasks are the one signal that upstream changed behaviour under
+        // us; say so explicitly instead of reporting a silent success.
+        for run in report.accounts.iter() {
+            for code in run.stalled.iter() {
+                ctx.logs
+                    .push(
+                        "WARN",
+                        format!("成长任务 {} 上报后进度未推进（账号 {}）", code, run.label),
+                    )
+                    .await;
+            }
+            for s in run.skipped.iter().filter(|s| s.hint.is_some()) {
+                ctx.logs
+                    .push(
+                        "INFO",
+                        format!("成长任务需手动完成 {}（{}）", s.code, s.reason),
+                    )
+                    .await;
+            }
+        }
+    }
+    serde_json::to_value(&report).map_err(|e| e.to_string())
+}
+
+/// Run the growth-task automation for one account.
+#[tauri::command]
+async fn wb_growth_run_single(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+    dry_run: Option<bool>,
+) -> Result<Value, String> {
+    let credentials = proxy_rs::workbuddy_auth::load_credentials();
+    let Some(cred) = credentials.iter().find(|c| c.id == id) else {
+        return Err(format!("账号不存在: {id}"));
+    };
+    let dry = dry_run.unwrap_or(false);
+    let run = proxy_rs::growth_runner::run_account(&ctx.client, cred, None, dry).await;
+
+    if !dry {
+        ctx.logs
+            .push(
+                "INFO",
+                format!(
+                    "成长任务（{}）: 领取 {} 个任务，获得 {} 积分",
+                    run.label,
+                    run.claimed.len(),
+                    run.credits_earned
+                ),
+            )
+            .await;
+        for code in run.stalled.iter() {
+            ctx.logs
+                .push("WARN", format!("成长任务 {} 上报后进度未推进", code))
+                .await;
+        }
+        for e in run.errors.iter() {
+            ctx.logs.push("ERROR", format!("成长任务失败: {e}")).await;
+        }
+    }
+    serde_json::to_value(&run).map_err(|e| e.to_string())
+}
+
+/// Read-only preview of one account's growth tasks.
+///
+/// Deliberately a separate command from `wb_growth_run_single(dry_run=true)`:
+/// a preview must be safe to call on every panel open, and keeping it a distinct
+/// entry point makes that intent obvious at the call site.
+#[tauri::command]
+async fn wb_growth_preview(ctx: State<'_, Arc<AppContext>>, id: String) -> Result<Value, String> {
+    let credentials = proxy_rs::workbuddy_auth::load_credentials();
+    let Some(cred) = credentials.iter().find(|c| c.id == id) else {
+        return Err(format!("账号不存在: {id}"));
+    };
+    let growth = proxy_rs::growth::GrowthClient::new(&ctx.client, None);
+    let tasks = growth.tasks(cred).await.map_err(|e| e.to_string())?;
+    let energy = growth.energy(cred).await.ok();
+    Ok(json!({
+        "tasks": tasks,
+        "energy": energy,
+        "earnable": tasks.iter().filter(|t| t.is_actionable()).map(|t| t.reward).sum::<u32>(),
     }))
 }
 
@@ -2302,6 +2414,20 @@ fn main() {
                 ),
             );
 
+            // Growth-task automation: opt-in, so it is spawned unconditionally
+            // but does nothing until `growth_enabled` is set. Spawning it here
+            // (rather than when the switch flips) keeps the runtime contract
+            // identical to the other two loops.
+            spawn_supervised(
+                ctx_for_scheduler.clone(),
+                "成长任务",
+                proxy_rs::scheduler::run_growth_tasks(
+                    ctx_for_scheduler.client.clone(),
+                    ctx_for_scheduler.logs.clone(),
+                    tokio_util::sync::CancellationToken::new(),
+                ),
+            );
+
             // Build Tray Menu
             let status_i =
                 MenuItem::with_id(app, "status_label", "🟢 状态: 运行中", false, None::<&str>)?;
@@ -2403,6 +2529,9 @@ fn main() {
             wb_sticky_reset,
             wb_oauth_start,
             wb_oauth_poll,
+            wb_growth_run,
+            wb_growth_run_single,
+            wb_growth_preview,
             wb_checkin_all,
             wb_checkin_single,
             wb_set_default,
