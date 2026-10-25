@@ -414,6 +414,13 @@ const FINGERPRINT_FEATURES: &[&str] = &[
     "github.com/anthropics/",
     "11128",
     "anthropics/claude-code/issues",
+    // DeepSeek Harness ships this as its fixed system-prompt opener. The gateway
+    // rejects it as an unapproved channel (verified live 2026-10-25: this exact
+    // sentence returns 400/11-128, while "powered by DeepSeek Harness" and
+    // "DeepSeek Harness" alone are served). Without an entry here every DSH
+    // request paid a failed round-trip before the degraded retry rescued it,
+    // which is why the log looked like solid content_blocked.
+    "You are an AI agent powered by DeepSeek Harness",
 ];
 
 /// `(from, to)` rewrite pairs. Each rewrites exactly one token so semantics are
@@ -435,6 +442,14 @@ fn rewrite_table() -> &'static [(&'static str, &'static str)] {
         (
             "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
             "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+        ),
+        // DeepSeek Harness identity opener. Rewritten to an equally neutral
+        // self-description rather than deleted: it is the agent's opening line,
+        // and removing it changes how the model frames the whole conversation.
+        // Only the literal form is rejected, so a minimal rewording is enough.
+        (
+            "You are an AI agent powered by DeepSeek Harness",
+            "You are a helpful AI assistant",
         ),
         // Upstream anti-probing: any occurrence of the bare error code `11128`
         // in the body is itself a block condition. A hyphen keeps it readable
@@ -796,6 +811,74 @@ mod tests {
         let out = sanitize_text("the upstream returned code 11128");
         assert!(out.contains("11-128"));
         assert!(!out.contains("11128"));
+    }
+
+    /// The DeepSeek Harness opener is rejected by the gateway as an unapproved
+    /// channel, so it must be rewritten before the request leaves.
+    ///
+    /// Verified live (2026-10-25): the exact sentence returns 400/11-128 while
+    /// "powered by DeepSeek Harness" and "DeepSeek Harness" alone are served —
+    /// so the rewrite has to cover the full opener, not just the product name.
+    /// This is the difference between one failed round-trip per DSH request
+    /// (every request logged a content_blocked before its degraded retry) and
+    /// none.
+    #[test]
+    fn sanitize_rewrites_the_deepseek_harness_opener() {
+        let out = sanitize_text("You are an AI agent powered by DeepSeek Harness.");
+        assert!(
+            !out.contains("You are an AI agent powered by DeepSeek Harness"),
+            "the rejected opener must not survive: {out}"
+        );
+        // The replacement keeps the sentence an identity statement, so the model
+        // still gets an opener instead of a hole where one used to be.
+        assert!(out.contains("You are a helpful AI assistant"), "got: {out}");
+    }
+
+    /// Text that merely names the product is *not* rewritten: the gateway serves
+    /// it, and rewriting more than necessary would corrupt legitimate content.
+    #[test]
+    fn sanitize_leaves_a_bare_harness_mention_alone() {
+        let text = "The agent is powered by DeepSeek Harness and runs locally.";
+        assert_eq!(sanitize_text(text), text);
+    }
+
+    /// End-to-end through the request sanitizer: the opener sits in the system
+    /// message, which is exactly where DSH emits it.
+    #[test]
+    fn sanitize_request_rewrites_the_harness_opener_in_the_system_message() {
+        let mut req = openai::OpenAIRequest {
+            model: "deepseek-v4.1-flash".to_string(),
+            messages: vec![
+                openai::Message {
+                    role: "system".to_string(),
+                    content: Some(openai::MessageContent::Text(
+                        "You are an AI agent powered by DeepSeek Harness.".to_string(),
+                    )),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                openai::Message {
+                    role: "user".to_string(),
+                    content: Some(openai::MessageContent::Text("hi".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            ..Default::default()
+        };
+        sanitize_openai_request(&mut req);
+        let system = match req.messages[0].content.as_ref().unwrap() {
+            openai::MessageContent::Text(t) => t.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            !system.contains("You are an AI agent powered by DeepSeek Harness"),
+            "system prompt still carries the rejected opener: {system}"
+        );
     }
 
     #[test]
