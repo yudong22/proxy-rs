@@ -26,6 +26,12 @@
   gap: 8px;
   min-width: 0;
   flex-wrap: wrap;
+  /* The row is `space-between` with three children once the drag handle exists
+   * (handle, main, actions). Without this the main block floats to the centre
+   * instead of hugging the handle, which reads as the account list being
+   * centre-aligned while API-key rows (two children, no handle) stay left. */
+  flex: 1 1 auto;
+  justify-content: flex-start;
 }
 
 .wb-credential-label {
@@ -257,6 +263,9 @@
 }
 
 .wb-drag-handle {
+  /* Sits flush with the row's left padding so every row's text starts at the
+   * same x whether or not it is draggable. */
+  margin-left: -2px;
   color: var(--muted);
   font-size: 12px;
   letter-spacing: -2px;

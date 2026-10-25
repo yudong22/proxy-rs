@@ -102,11 +102,13 @@ const MOCK = {
       { id: 'cred-4', label: '令牌被拒账号', nickname: '丁', state: 'ok', enabled: true, points: 5, sticky_sessions: 0, checked_in_today: false, masked_token: 'sk-***4', has_refresh_token: true, needs_relogin: true, relogin_required_since_ms: 1790000000000, last_error: '刷新端点返回 401: token revoked' },
     ],
     default_identity_id: 'cred-1',
+    // Interleaved priority order: keys participate in the same list.
+    identity_order: ['cred-1', 'cred-2', 'cred-3', 'cred-4', 'key-1'],
   },
   wb_relogin: { id: 'cred-3', label: '需重登账号', enabled: true, masked_token: 'sk-***3' },
   // Drag-to-reorder the failover priority. The mock echoes what it was told to
   // store, so a test can assert the submitted order rather than the old one.
-  wb_reorder_credentials: { ok: true, default_moved: false },
+  wb_reorder_identities: { ok: true, default_moved: false },
   wb_refresh_points_single: {
     result: { id: 'cred-1', label: '测试账号一', points: 1234.5 },
     current_identity: { id: 'cred-1', label: '测试账号一', points: 1234.5 },
@@ -420,12 +422,15 @@ try {
         // The rows array above covers credentials AND keys (both use
         // .wb-credential-row), so the drag assertions key off data-cred-row,
         // which only credentials carry - keeping the two stores distinct.
-        credDraggable: [...document.querySelectorAll('#wb-identity-list [data-cred-row]')]
-          .map((r) => r.getAttribute('draggable') === 'true'),
-        credHandles: [...document.querySelectorAll('#wb-identity-list [data-cred-row]')]
-          .map((r) => Boolean(r.querySelector('.wb-drag-handle'))),
+        credDraggable: [...document.querySelectorAll('#wb-identity-list [data-ident-row]')]
+          .map((r) => r.classList.contains('wb-credential-row--draggable')),
+        credHandles: [...document.querySelectorAll('#wb-identity-list [data-ident-row]')]
+          .map((r) => Boolean(r.querySelector('[data-drag-handle]'))),
+        // Credentials AND keys are draggable now: one interleaved order.
         keyDraggable: [...document.querySelectorAll('#wb-identity-list .wb-type-key')]
-          .map((k) => k.closest('.wb-credential-row')?.getAttribute('draggable') === 'true'),
+          .map((k) => k.closest('[data-ident-row]')?.classList.contains('wb-credential-row--draggable') === true),
+        rowIds: [...document.querySelectorAll('#wb-identity-list [data-ident-row]')]
+          .map((r) => r.dataset.identRow),
         selectValue: sel?.value,
         dshButtonPresent: Boolean(document.querySelector('#btn-apply-dsh-config')),
         dshStatus: t('#dsh-config-status'),
@@ -438,10 +443,13 @@ try {
   check('rowLabels', b.rowLabels, EXPECTED.rowLabels);
   check('rowStates', b.rowStates, EXPECTED.rowStates);
   check('defaultRowFlags', b.defaultRowFlags, EXPECTED.defaultRowFlags);
-  check('every credential row is draggable', b.credDraggable, b.credDraggable.map(() => true));
-  check('every credential row has a drag handle', b.credHandles, b.credHandles.map(() => true));
-  check('api-key rows are not draggable', b.keyDraggable, b.keyDraggable.map(() => false));
-  check('credential rows are draggable at all', b.credDraggable.length > 0, true);
+  check('every identity row is draggable', b.credDraggable, b.credDraggable.map(() => true));
+  check('every identity row has a drag handle', b.credHandles, b.credHandles.map(() => true));
+  // Keys join the same ordered list rather than being a separate block.
+  check('api-key rows are draggable too', b.keyDraggable, b.keyDraggable.map(() => true));
+  check('identity rows are draggable at all', b.credDraggable.length > 0, true);
+  check('rows render in the requested identity order', b.rowIds,
+    ['cred-1', 'cred-2', 'cred-3', 'cred-4', 'key-1']);
   check('selectValue', b.selectValue, EXPECTED.selectValue);
   check('dsh button present', b.dshButtonPresent, EXPECTED.dshButtonPresent);
   check('dsh status', b.dshStatus, EXPECTED.dshStatus);

@@ -628,10 +628,13 @@ async fn wb_credentials_list(ctx: State<'_, Arc<AppContext>>) -> Result<Value, S
         let sessions = ctx.credential_pool.sticky_sessions_for(&c.id).await;
         list.push(mask_credential(c, sessions, c.id == default_id));
     }
+    // The GUI renders credentials and keys as one draggable list, so it needs
+    // the interleaved order to know where the keys sit among the accounts.
     Ok(json!({
         "credentials": list,
         "default_credential_id": prefs.default_credential_id,
         "default_identity_id": prefs.default_identity_id,
+        "identity_order": prefs.identity_order,
     }))
 }
 
@@ -1134,84 +1137,80 @@ async fn wb_set_default_identity(
     Ok(json!({ "ok": true, "default_identity_id": prefs.default_identity_id }))
 }
 
-/// Reorder the credential pool: `ids` is the new priority order, first tried
-/// first.
+/// Reorder the whole identity pool — credentials and API keys interleaved.
 ///
-/// **The array order in `workbuddy-credentials.json` *is* the priority list.**
-/// The pool is built from that vector in order (`pick` takes the first usable
-/// entry), so reordering the store is the whole mechanism — there is no separate
-/// priority column to keep in sync with it, and no second source of truth that
-/// could disagree after a hand edit.
+/// `ids` is the new priority order, first tried first. The two stores live in
+/// separate files, so neither array can express "account A, then key K, then
+/// account B"; the order is therefore persisted as
+/// `PoolPreferences::identity_order` and read back by `ordered_credentials()`
+/// and `enabled_api_keys()`.
 ///
 /// Fails rather than partially applying: `ids` must be a permutation of exactly
-/// the credentials on disk. Accepting an unknown id would reorder a pool that
+/// the identities on disk. Accepting an unknown id would reorder a pool that
 /// does not match what the window showed, and accepting a subset would silently
-/// drop the credentials the caller forgot about.
+/// drop the identities the caller forgot about.
 ///
-/// **Interaction with the default identity.** [`ordered_credentials`] pins the
-/// chosen default to the front at load time, so a drag that puts account B above
-/// the pinned default A would be undone on the very next reload — the drag would
-/// appear to work and then silently revert. Since dragging a row to the top is
-/// an unambiguous "I want this one tried first", that gesture also moves the
-/// default to the same account; any other drag leaves the default alone and only
-/// changes the order *behind* it.
-///
-/// [`ordered_credentials`]: proxy_rs::workbuddy_auth::ordered_credentials
+/// **Interaction with the default identity.** `ordered_credentials` pins the
+/// chosen default credential to the front at load time, so a drag that puts
+/// account B above the pinned default A would be undone on the next reload — the
+/// drag would appear to work and then silently revert. Dragging a row to the top
+/// is an unambiguous "I want this one tried first", so that gesture also moves
+/// the default to the same identity; any other drag leaves it alone.
 #[tauri::command]
-async fn wb_reorder_credentials(
+async fn wb_reorder_identities(
     ctx: State<'_, Arc<AppContext>>,
     ids: Vec<String>,
 ) -> Result<Value, String> {
-    let mut items = proxy_rs::workbuddy_auth::load_credentials();
+    let mut known: Vec<String> = proxy_rs::workbuddy_auth::load_credentials()
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+    known.extend(
+        proxy_rs::workbuddy_auth::load_api_keys()
+            .iter()
+            .map(|k| k.id.clone()),
+    );
 
-    let known: std::collections::HashSet<&str> = items.iter().map(|c| c.id.as_str()).collect();
-    let requested: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
-    if requested.len() != ids.len() {
-        return Err("排序列表含重复的凭据 id".to_string());
+    let known_set: std::collections::HashSet<&str> = known.iter().map(|s| s.as_str()).collect();
+    let requested_set: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+    if requested_set.len() != ids.len() {
+        return Err("排序列表含重复的身份 id".to_string());
     }
-    if requested != known || ids.len() != items.len() {
+    if requested_set != known_set || ids.len() != known.len() {
         return Err(format!(
-            "排序列表与账号池不一致（池内 {} 个，提交 {} 个）",
-            items.len(),
+            "排序列表与身份池不一致（池内 {} 个，提交 {} 个）",
+            known.len(),
             ids.len()
         ));
     }
 
-    // `sort_by_key` on the requested position: an id absent from `ids` would
-    // sort as 0 (ahead of everything), so the permutation check above is what
-    // makes this safe rather than defensive.
-    let rank = |id: &str| ids.iter().position(|x| x == id).unwrap_or(usize::MAX);
-    items.sort_by_key(|c| rank(&c.id));
+    let mut prefs = proxy_rs::workbuddy_auth::load_preferences();
+    prefs.identity_order = ids.clone();
 
-    // Pin the default to the new top so the reload below cannot revert the drag
-    // (see the doc comment). Only when the current default is a credential: a
-    // key or "no pool" selection owns no position in this list.
+    // Pin the default to the new top so the reload cannot revert the drag (see
+    // the doc comment). Only when the current default is one of the identities
+    // that moved to the top; `__none__` owns no position here.
     let mut pinned_default = false;
     if let Some(top) = ids.first() {
-        let prefs = proxy_rs::workbuddy_auth::load_preferences();
-        if prefs.default_identity_id.starts_with("wb-")
-            && prefs.default_identity_id != *top
-            && items.iter().any(|c| c.id == *top)
-        {
-            proxy_rs::workbuddy_auth::set_default_identity(top).map_err(|e| e.to_string())?;
+        let current = prefs.default_identity_id.clone();
+        let pin_eligible =
+            (current.starts_with("wb-") || current.starts_with("k-")) && current != *top;
+        if pin_eligible {
+            prefs.default_identity_id = top.clone();
             pinned_default = true;
         }
     }
+    proxy_rs::workbuddy_auth::save_preferences(&prefs).map_err(|e| e.to_string())?;
 
-    proxy_rs::workbuddy_auth::save_credentials(&items).map_err(|e| e.to_string())?;
     reload_pool(&ctx).await;
     ctx.logs
         .push(
             "INFO",
             format!(
-                "账号池顺序已更新: {}{}",
-                items
-                    .iter()
-                    .map(|c| c.label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" → "),
+                "身份池顺序已更新: {}{}",
+                ids.join(" → "),
                 if pinned_default {
-                    "（首位账号已同步设为默认身份）"
+                    "（首位身份已同步设为默认）"
                 } else {
                     ""
                 }
@@ -2404,7 +2403,7 @@ fn main() {
             wb_relogin,
             wb_credentials_delete,
             wb_credentials_toggle,
-            wb_reorder_credentials,
+            wb_reorder_identities,
             wb_sticky_reset,
             wb_oauth_start,
             wb_oauth_poll,

@@ -34,6 +34,12 @@ export async function renderIdentityPool() {
     ]);
     const creds = credsRes?.credentials || [];
     const keys = keysRes?.keys || [];
+    // Credentials and keys are one ordered list in the GUI (a drag can put a key
+    // between two accounts), but they come from two commands backed by two
+    // files. `identity_order` is the interleaved order the backend will try them
+    // in; render in exactly that order so the screen never disagrees with the
+    // failover sequence.
+    const identityOrder = credsRes?.identity_order || [];
     // The unified default identity in force (credential id, key id, "__none__",
     // or "" meaning first-usable fallback). Used to mark the "默认" badge.
     const defaultIdentityId = credsRes?.default_identity_id
@@ -70,7 +76,7 @@ export async function renderIdentityPool() {
       return;
     }
 
-    const credRows = creds.map((c) => {
+    const credRowList = creds.map((c) => {
       const [stateLabel, stateClass] = WB_STATE_LABELS[c.state] || ['未知', ''];
       const isDefault = effDefault === c.id;
       // Only a relocated, still-healthy account is worth calling out: it is the
@@ -110,9 +116,9 @@ export async function renderIdentityPool() {
       // resolution rules, so dragging a key among accounts would imply an order
       // relationship that does not exist.
       return html`<div class="wb-credential-row wb-credential-row--draggable${raw(isDefault ? ' wb-credential-row--default' : '')}"
-        draggable="true" data-cred-row="${c.id}"
-        title="拖动可调整优先顺序：越靠上越先被使用，失败后按此顺序依次尝试">
-        <span class="wb-drag-handle" aria-hidden="true">⋮⋮</span>
+        data-ident-row="${c.id}"
+        title="拖动左侧手柄可调整优先顺序：越靠上越先被使用，失败后按此顺序依次尝试">
+        <span class="wb-drag-handle" data-drag-handle aria-hidden="true">⋮⋮</span>
         <div class="wb-credential-main">
           ${typePill}
           <span class="wb-credential-label">${c.label || c.nickname || c.id}</span>
@@ -139,9 +145,9 @@ export async function renderIdentityPool() {
           <button type="button" class="btn btn-small btn-danger" data-delete-cred="${c.id}">删除</button>
         </div>
       </div>`;
-    }).join('');
+    });
 
-    const keyRows = keys.map((k) => {
+    const keyRowList = keys.map((k) => {
       const isDefault = effDefault === k.id;
       const statePill = k.enabled
         ? raw('<span class="badge-pill wb-state-pill wb-state-ok">已启用</span>')
@@ -153,7 +159,10 @@ export async function renderIdentityPool() {
       const pointsChip = raw(
         `<span class="wb-points" title="剩余积分">💎 ${formatPoints(k.points)}</span>`,
       );
-      return html`<div class="wb-credential-row${raw(isDefault ? ' wb-credential-row--default' : '')}">
+      return html`<div class="wb-credential-row wb-credential-row--draggable${raw(isDefault ? ' wb-credential-row--default' : '')}"
+        data-ident-row="${k.id}"
+        title="拖动左侧手柄可调整优先顺序：越靠上越先被使用，失败后按此顺序依次尝试">
+        <span class="wb-drag-handle" data-drag-handle aria-hidden="true">⋮⋮</span>
         <div class="wb-credential-main">
           ${typePill}
           <span class="wb-credential-label">${k.label || k.id}</span>
@@ -171,9 +180,19 @@ export async function renderIdentityPool() {
           <button type="button" class="btn btn-small btn-danger" data-delete-key="${k.id}">删除</button>
         </div>
       </div>`;
-    }).join('');
+    });
 
-    listEl.innerHTML = credRows + keyRows;
+    // Build one row per identity, then emit them in `identity_order`. Anything
+    // the order does not name (a brand-new import) goes after, preserving the
+    // relative order it arrived in.
+    const rowsById = new Map();
+    creds.forEach((c, i) => rowsById.set(c.id, credRowList[i]));
+    keys.forEach((k, i) => rowsById.set(k.id, keyRowList[i]));
+    const orderedIds = [
+      ...identityOrder.filter((id) => rowsById.has(id)),
+      ...[...rowsById.keys()].filter((id) => !identityOrder.includes(id)),
+    ];
+    listEl.innerHTML = orderedIds.map((id) => rowsById.get(id)).join('');
 
     wireCredentialDrag(listEl);
 
@@ -450,73 +469,98 @@ export function initCredentialPool() {
 }
 
 /**
- * Make the credential rows drag-reorderable, and persist the result.
+ * Make the identity rows reorderable by dragging, and persist the result.
  *
- * The order is not cosmetic: the pool tries credentials top-down, so this list
- * is the failover priority. Dragging commits immediately (no 保存 button) —
- * the row order on screen and the stored order must never disagree, and a
+ * The order is not cosmetic: the pool tries identities top-down, so this list
+ * is the failover priority. Dragging commits immediately (no 保存 button) — the
+ * row order on screen and the stored order must never disagree, and a
  * pending-edit state would let the user navigate away believing it was saved.
  *
- * Uses native HTML5 drag events rather than pointer maths: rows are already
- * discrete targets, and `dragover` on a row tells us the drop index without
- * measuring geometry.
+ * **Pointer events, not HTML5 drag-and-drop.** `dragstart`/`dragover`/`drop`
+ * never fired inside the packaged app: Tauri's webview handles native drag and
+ * drop itself (`dragDropEnabled`, on by default), so the DOM never sees the
+ * events. A headless-Chrome harness cannot catch that class of bug — it passed
+ * there and did nothing in the real window. Pointer events are generated by the
+ * webview itself and are unaffected by the native drag layer.
  *
  * @param {HTMLElement} listEl  container holding the rows
  */
 function wireCredentialDrag(listEl) {
-  const rows = () => [...listEl.querySelectorAll('[data-cred-row]')];
-  let draggingId = null;
+  const rows = () => [...listEl.querySelectorAll('[data-ident-row]')];
+  let drag = null;
+
+  /** Row under the pointer, by hit-testing the container's children. */
+  const rowAt = (clientY) => {
+    for (const r of rows()) {
+      const box = r.getBoundingClientRect();
+      if (clientY >= box.top && clientY <= box.bottom) return r;
+    }
+    return null;
+  };
+
+  const cleanup = () => {
+    for (const r of rows()) {
+      r.classList.remove('wb-credential-row--dragging', 'wb-credential-row--drop-target');
+    }
+    document.body.classList.remove('wb-dragging-ident');
+    drag = null;
+  };
 
   for (const row of rows()) {
-    row.addEventListener('dragstart', (e) => {
-      draggingId = row.dataset.credRow;
-      row.classList.add('wb-credential-row--dragging');
-      // Firefox refuses to start a drag unless some data is set.
-      e.dataTransfer?.setData('text/plain', draggingId);
-      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
-    });
+    const handle = row.querySelector('[data-drag-handle]');
+    // Only the grip starts a drag. Starting from anywhere in the row would
+    // swallow clicks on the row's own buttons, which is exactly what a user
+    // aiming at 重新绑定 must not have happen.
+    if (!handle) continue;
 
-    row.addEventListener('dragend', () => {
-      draggingId = null;
-      row.classList.remove('wb-credential-row--dragging');
-      for (const r of rows()) r.classList.remove('wb-credential-row--drop-target');
-    });
-
-    // `dragover` must be cancelled on every row, otherwise the drop event never
-    // fires: the default action for a non-cancelled dragover is "not a drop
-    // target".
-    row.addEventListener('dragover', (e) => {
-      if (!draggingId || row.dataset.credRow === draggingId) return;
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
       e.preventDefault();
-      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      drag = { id: row.dataset.identRow, moved: false };
+      // Pointer capture keeps the events coming to the handle even as the
+      // pointer travels over other rows.
+      handle.setPointerCapture?.(e.pointerId);
+      row.classList.add('wb-credential-row--dragging');
+      document.body.classList.add('wb-dragging-ident');
+    });
+
+    handle.addEventListener('pointermove', (e) => {
+      if (!drag) return;
+      drag.moved = true;
+      const over = rowAt(e.clientY);
       for (const r of rows()) {
-        r.classList.toggle('wb-credential-row--drop-target', r === row);
+        r.classList.toggle(
+          'wb-credential-row--drop-target',
+          Boolean(over) && r === over && r.dataset.identRow !== drag.id,
+        );
       }
     });
 
-    row.addEventListener('drop', async (e) => {
-      e.preventDefault();
-      const targetId = row.dataset.credRow;
-      const sourceId = draggingId;
-      draggingId = null;
-      if (!sourceId || sourceId === targetId) return;
+    const finish = async (e) => {
+      if (!drag) return;
+      const sourceId = drag.id;
+      const moved = drag.moved;
+      const over = rowAt(e.clientY);
+      const targetId = over?.dataset.identRow;
+      cleanup();
+      if (!moved || !targetId || targetId === sourceId) return;
 
       // Insert the dragged row *at* the target's position, keeping every other
-      // row's relative order. Recomputed from the live DOM so a drop after an
+      // row's relative order. Recomputed from the live DOM so a drag after an
       // earlier reorder still reflects what the user sees.
-      const next = rows().map((r) => r.dataset.credRow);
+      const next = rows().map((r) => r.dataset.identRow);
       const from = next.indexOf(sourceId);
       const to = next.indexOf(targetId);
       if (from < 0 || to < 0) return;
       next.splice(to, 0, ...next.splice(from, 1));
 
       try {
-        await invoke('wb_reorder_credentials', { ids: next });
+        await invoke('wb_reorder_identities', { ids: next });
         showWbStatus('已调整优先顺序：越靠上越先被使用');
         // Repaint from the backend rather than reordering the DOM by hand: the
         // stored order is the source of truth, and a repaint also refreshes the
         // 默认 badge, which follows "first usable" when no explicit default is
-        // set — reordering can therefore change which account shows as 默认.
+        // set — reordering can therefore change which identity shows as 默认.
         await renderIdentityPool();
       } catch (err) {
         showWbStatus('调整顺序失败: ' + err, true);
@@ -524,6 +568,9 @@ function wireCredentialDrag(listEl) {
         // order ahead of the stored one is the exact drift this guards against.
         await renderIdentityPool();
       }
-    });
+    };
+
+    handle.addEventListener('pointerup', finish);
+    handle.addEventListener('pointercancel', () => cleanup());
   }
 }

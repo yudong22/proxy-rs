@@ -127,6 +127,19 @@ pub struct PoolPreferences {
     /// legacy `*_id` fields are retained only for first-run migration.
     #[serde(default)]
     pub default_identity_id: String,
+    /// The GUI's full identity order, credentials and API keys interleaved.
+    ///
+    /// The two stores live in separate files, so neither one's array order can
+    /// express "account A, then key K, then account B" — the single ordering the
+    /// pool GUI shows and the user drags. This list is that one order; it is
+    /// consulted by [`ordered_identities`].
+    ///
+    /// Deliberately advisory: an id that no longer exists is skipped, and any
+    /// identity missing from the list is appended in store order. A stale list
+    /// therefore degrades to "the old ordering for the entries it still names"
+    /// rather than hiding accounts.
+    #[serde(default)]
+    pub identity_order: Vec<String>,
 }
 
 fn default_checkin_time() -> String {
@@ -839,16 +852,28 @@ pub fn active_api_key_entry() -> Option<ApiKeyEntry> {
             return Some(k.clone());
         }
     }
-    items.iter().find(|k| enabled(k)).cloned()
+    // No pin: the first enabled key in the GUI's order, so dragging a key to the
+    // top of the identity list makes it the one used.
+    let ordered = apply_identity_order(items, &prefs.identity_order, |k| k.id.as_str());
+    ordered.into_iter().find(|k| enabled(k))
 }
 
 /// All currently enabled API keys in the key pool with non-empty keys.
+///
+/// Returned in the GUI's identity order, so a key dragged above another key (or
+/// into the middle of the accounts) is tried in that position: the failover path
+/// walks this list, and `enabled_api_keys()` is its only entry point.
 pub fn enabled_api_keys() -> Vec<ApiKeyEntry> {
-    let items = load_api_keys();
+    let prefs = load_preferences();
+    let items = apply_identity_order(
+        load_api_keys()
+            .into_iter()
+            .filter(|k| k.enabled && !k.key.trim().is_empty())
+            .collect(),
+        &prefs.identity_order,
+        |k| k.id.as_str(),
+    );
     items
-        .into_iter()
-        .filter(|k| k.enabled && !k.key.trim().is_empty())
-        .collect()
 }
 
 /// Set the default credential id, validating it exists.
@@ -968,15 +993,45 @@ pub fn set_default_identity(id: &str) -> Result<PoolPreferences> {
     Ok(prefs)
 }
 
-/// Credentials in the order the pool should try them: the chosen default first,
-/// then the rest in store order.
+/// Reorder `items` to follow [`PoolPreferences::identity_order`].
+///
+/// Ids named in the order keep their listed position; anything not listed is
+/// appended in its original (store) order. Stale ids — an account deleted since
+/// the last drag — are simply absent and nothing else shifts, so a stale order
+/// degrades to "the remembered prefix, then the rest as before" rather than
+/// dropping entries from the pool.
+fn apply_identity_order<T, F>(items: Vec<T>, order: &[String], id_of: F) -> Vec<T>
+where
+    F: Fn(&T) -> &str,
+{
+    if order.is_empty() {
+        return items;
+    }
+    let rank = |item: &T| -> usize {
+        let id = id_of(item);
+        order.iter().position(|x| x == id).unwrap_or(usize::MAX)
+    };
+    // `sort_by_key` is stable, so everything not named in `order` keeps its
+    // store order at the tail instead of shuffling unpredictably.
+    let mut ranked: Vec<(usize, T)> = items.into_iter().map(|i| (rank(&i), i)).collect();
+    ranked.sort_by_key(|(r, _)| *r);
+    ranked.into_iter().map(|(_, i)| i).collect()
+}
+
+/// Credentials in the order the pool should try them.
+///
+/// Order = the GUI's identity order first (which is what a drag writes), then
+/// the pinned default hoisted to the front, then store order.
 ///
 /// Ordering *is* the default mechanism ([`crate::session_pool::CredentialPool`]
 /// picks the first usable entry), so selecting a default is a reorder at load
 /// time rather than a new field the request path must check.
 pub fn ordered_credentials() -> Vec<WorkBuddyCredential> {
-    let mut items = load_credentials();
     let prefs = load_preferences();
+    // The GUI's interleaved order is the primary statement of intent; it is what
+    // a drag writes and what the user sees.
+    let mut items =
+        apply_identity_order(load_credentials(), &prefs.identity_order, |c| c.id.as_str());
     // The unified 身份池 selector is the source of truth when it pins a
     // credential; the legacy `default_credential_id` is only consulted for
     // installs that predate it. A key/`__none__` selection must not reorder the
@@ -2876,6 +2931,40 @@ mod tests {
     /// This is why `wb_reorder_credentials` syncs the default when a row is
     /// dragged to the top: without that, the drag is silently undone by this
     /// hoist on the very next reload, and the user watches the list snap back.
+    /// `identity_order` interleaves credentials and keys; each store is sorted
+    /// by it, and unlisted ids keep their store order at the tail.
+    #[test]
+    fn identity_order_sorts_each_store_and_appends_the_unlisted() {
+        let mk = |id: &str| WorkBuddyCredential {
+            id: id.to_string(),
+            label: id.to_string(),
+            access_token: format!("t-{id}"),
+            enabled: true,
+            ..Default::default()
+        };
+        let order = vec!["wb-c".to_string(), "k-1".to_string(), "wb-a".to_string()];
+        // wb-b is deliberately absent from the order: it must stay last rather
+        // than vanish, and the listed ones must follow the listed positions.
+        let sorted = apply_identity_order(vec![mk("wb-a"), mk("wb-b"), mk("wb-c")], &order, |c| {
+            c.id.as_str()
+        });
+        let ids: Vec<&str> = sorted.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["wb-c", "wb-a", "wb-b"]);
+    }
+
+    /// An empty order is a no-op, so installs that never dragged are unaffected.
+    #[test]
+    fn empty_identity_order_leaves_the_store_order_alone() {
+        let mk = |id: &str| WorkBuddyCredential {
+            id: id.to_string(),
+            access_token: format!("t-{id}"),
+            ..Default::default()
+        };
+        let sorted = apply_identity_order(vec![mk("wb-a"), mk("wb-b")], &[], |c| c.id.as_str());
+        let ids: Vec<&str> = sorted.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["wb-a", "wb-b"]);
+    }
+
     #[test]
     fn ordered_credentials_hoists_the_pinned_default_above_store_order() {
         let dir = std::env::temp_dir().join(format!("proxy-rs-order-{}", std::process::id()));
