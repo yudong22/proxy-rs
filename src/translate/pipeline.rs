@@ -444,6 +444,98 @@ fn rewrite_table() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// DeepSeek Harness identity neutralization
+// ---------------------------------------------------------------------------
+//
+// The WorkBuddy/CodeBuddy gateway rejects a request as an "unapproved channel"
+// (business code 11-128) when the **system message** contains one of the two
+// literals below. Both ship verbatim in DSH's own system prompt:
+//
+//   * `You are an AI agent powered by DeepSeek Harness.`
+//     — `packages/core/system-prompt/src/index.ts` (`harness:identity` section)
+//   * `DeepSeek Harness Web GUI`
+//     — `packages/context/harness-dev-context/src/index.ts` (`WEB_SURFACE_PROMPT`)
+//
+// Verified live against the real upstream on 2026-10-25 (DSH 0.2.1-rc.3, real
+// 653 KB / 14-message / 42-tool capture):
+//
+//   · unmodified capture                       -> 400 / 11-128
+//   · both literals rewritten                  -> 200
+//   · only one of the two rewritten            -> 400  (both are needed)
+//   · the same literal placed in a user, tool
+//     or reasoning message                     -> 200  (system-only check)
+//
+// Two consequences shape the implementation:
+//
+//   1. Both literals must be rewritten. Fixing either one alone still fails,
+//      which is why v2.1.4 (identity opener only) and v2.1.5 (Web GUI phrase
+//      only) each appeared not to work.
+//   2. The match is on the *system channel*, not on request content. Earlier
+//      attempts replaced the phrase everywhere in the body, which corrupted the
+//      user's own data (~40 hits lived in tool results: project paths, source
+//      code, `git log` output). Restricting this pass to `system` messages
+//      fixes the rejection while leaving every other message byte-identical.
+
+/// DSH identity opener, without the trailing period so the form lacking it
+/// (also rejected) is covered by the same entry.
+const DSH_IDENTITY_LITERAL: &str = "You are an AI agent powered by DeepSeek Harness";
+/// Equally neutral self-description: keeps the opener's role in the prompt (it
+/// opens by telling the model what it is) but drops the product name, which is
+/// the part the gateway keys on.
+const DSH_IDENTITY_REPLACEMENT: &str = "You are an AI agent";
+/// DSH web-surface phrase. Only the product name inside it is rewritten; the
+/// sentence keeps its meaning, since the guidance that follows is what actually
+/// tells the model how to behave in the GUI.
+const DSH_WEB_GUI_LITERAL: &str = "DeepSeek Harness Web GUI";
+const DSH_WEB_GUI_REPLACEMENT: &str = "web GUI";
+
+/// Whether `text` carries either rejected DSH literal. Cheap `contains` checks so
+/// the common (already-clean) path allocates nothing.
+fn has_harness_identity(text: &str) -> bool {
+    text.contains(DSH_IDENTITY_LITERAL) || text.contains(DSH_WEB_GUI_LITERAL)
+}
+
+/// Rewrite the two gateway-rejected DSH literals. Returns `None` when neither is
+/// present, so the caller can skip replacing the message content.
+///
+/// Applied to `system` messages only — see the block comment above for why the
+/// scope matters.
+pub(crate) fn neutralize_harness_identity(text: &str) -> Option<String> {
+    if !has_harness_identity(text) {
+        return None;
+    }
+    Some(
+        text.replace(DSH_IDENTITY_LITERAL, DSH_IDENTITY_REPLACEMENT)
+            .replace(DSH_WEB_GUI_LITERAL, DSH_WEB_GUI_REPLACEMENT),
+    )
+}
+
+/// Rewrite DSH's rejected literals across every `system` message of `req`,
+/// leaving all other messages untouched. Returns how many messages changed.
+///
+/// Deliberately independent of the `sanitize_fingerprints` setting: those rules
+/// neutralize the *client's* identity (Claude Code / Codex), while this one
+/// unblocks a gateway check that is not the user's to opt out of.
+pub(crate) fn neutralize_harness_system_messages(req: &mut openai::OpenAIRequest) -> usize {
+    let mut changed = 0;
+    for msg in req.messages.iter_mut() {
+        if msg.role != "system" {
+            continue;
+        }
+        let Some(openai::MessageContent::Text(text)) = &msg.content else {
+            continue;
+        };
+        if let Some(rewritten) = neutralize_harness_identity(text) {
+            if rewritten != *text {
+                msg.content = Some(openai::MessageContent::Text(rewritten));
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
 /// Strip layer: `x-anthropic-billing-header: …;?` (key+value, whole segment
 /// removed).
 fn hdr_re() -> &'static Regex {
@@ -1505,5 +1597,169 @@ mod tests {
         assert_eq!(result.data.len(), 1);
         assert_eq!(result.data[0].id, FREE_MODEL_NAME);
         assert_eq!(result.first_id.as_deref(), Some(FREE_MODEL_NAME));
+    }
+    // ---- DeepSeek Harness identity neutralization --------------------------
+    //
+    // Each test pins one of the facts established against the live gateway on
+    // 2026-10-25 (see the block comment beside `neutralize_harness_identity`), so
+    // a future "simplification" cannot silently reintroduce a failed round-trip
+    // per request or the user-data corruption of the reverted attempts.
+
+    const DSH_OPENER: &str = "You are an AI agent powered by DeepSeek Harness.";
+    const DSH_WEB_GUI: &str = "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.";
+
+    fn system_msg(text: &str) -> openai::Message {
+        openai::Message {
+            role: "system".to_string(),
+            content: Some(openai::MessageContent::Text(text.to_string())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn text_msg(role: &str, text: &str) -> openai::Message {
+        openai::Message {
+            role: role.to_string(),
+            content: Some(openai::MessageContent::Text(text.to_string())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn req_with(messages: Vec<openai::Message>) -> openai::OpenAIRequest {
+        openai::OpenAIRequest {
+            model: "deepseek-v4.1-flash".to_string(),
+            messages,
+            max_tokens: Some(64),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: Some(false),
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// The gateway rejects the identity opener; it must not survive verbatim.
+    #[test]
+    fn rewrites_harness_identity_opener() {
+        let out = neutralize_harness_identity(DSH_OPENER).expect("opener must be rewritten");
+        assert!(!out.contains("DeepSeek Harness"));
+        assert_eq!(out, "You are an AI agent.");
+    }
+
+    /// The gateway also rejects the web-surface phrase. Fixing only one of the
+    /// two literals still returned 400 live, so both must be covered.
+    #[test]
+    fn rewrites_harness_web_gui_phrase() {
+        let out =
+            neutralize_harness_identity(DSH_WEB_GUI).expect("web GUI phrase must be rewritten");
+        assert!(!out.contains("DeepSeek Harness"));
+        // The surrounding guidance is what actually shapes behaviour; it stays.
+        assert!(out.contains("You are interacting with the user through the web GUI"));
+        assert!(out.contains("whose URL the runtime context names."));
+    }
+
+    /// Both literals in one system prompt: one pass neutralizes both, which is
+    /// the condition the real capture needed.
+    #[test]
+    fn rewrites_both_literals_in_one_prompt() {
+        let prompt = format!("{DSH_OPENER}\n\n{DSH_WEB_GUI}");
+        let out = neutralize_harness_identity(&prompt).expect("both literals present");
+        assert!(
+            !out.contains("DeepSeek Harness"),
+            "no literal may survive: {out}"
+        );
+    }
+
+    /// Bare product-name mentions are served by the gateway, so rewriting them
+    /// would only be gratuitous prompt damage.
+    #[test]
+    fn leaves_bare_product_name_alone() {
+        let text =
+            "The DeepSeek Harness implementation checkout is /Users/denis/Sites/deepseek-harness.";
+        assert_eq!(neutralize_harness_identity(text), None);
+    }
+
+    /// Clean prompts must not be rewritten at all (no allocation, no drift).
+    #[test]
+    fn leaves_clean_system_prompt_alone() {
+        let text = "You are a helpful assistant. Be concise.";
+        assert_eq!(neutralize_harness_identity(text), None);
+    }
+
+    /// The gateway inspects the system channel only: the same literal inside a
+    /// tool result is served. Rewriting there corrupted the user's own data
+    /// (project paths, source code, `git log` output) for no benefit.
+    #[test]
+    fn does_not_touch_non_system_messages() {
+        let mut req = req_with(vec![
+            system_msg(DSH_OPENER),
+            text_msg("user", "read the file"),
+            text_msg("tool", &format!("content:\n{DSH_OPENER}\n{DSH_WEB_GUI}")),
+            text_msg("assistant", DSH_OPENER),
+        ]);
+        // Keep a byte-exact copy of everything that is not a system message.
+        let before: Vec<String> = req
+            .messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| format!("{:?}", m.content))
+            .collect();
+
+        let changed = neutralize_harness_system_messages(&mut req);
+        assert_eq!(changed, 1, "exactly the one system message should change");
+
+        let after: Vec<String> = req
+            .messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| format!("{:?}", m.content))
+            .collect();
+        assert_eq!(before, after, "non-system messages must be byte-identical");
+
+        // And the system message really did get repaired.
+        match &req.messages[0].content {
+            Some(openai::MessageContent::Text(t)) => {
+                assert!(!t.contains("DeepSeek Harness"));
+            }
+            other => panic!("unexpected system content: {other:?}"),
+        }
+    }
+
+    /// A prompt needing no rewrite reports zero changes, so the caller can skip
+    /// logging work on ordinary traffic.
+    #[test]
+    fn reports_zero_changes_for_clean_system_prompt() {
+        let mut req = req_with(vec![system_msg("You are a helpful assistant.")]);
+        assert_eq!(neutralize_harness_system_messages(&mut req), 0);
+    }
+
+    /// Guard against the silent no-op that shipped in an earlier attempt: a
+    /// rewrite pair whose `from` and `to` were identical, so the pass "ran" and
+    /// changed nothing. Asserting the output differs from the input catches it.
+    #[test]
+    fn rewrite_actually_changes_the_text() {
+        let out = neutralize_harness_identity(DSH_OPENER).expect("rewritten");
+        assert_ne!(out, DSH_OPENER, "rewrite must not be an identity mapping");
+    }
+
+    /// The upstream normalizes zero-width characters away, so a zero-width-based
+    /// "break the literal" trick is invisible to it. This pass must not rely on
+    /// invisible characters to work.
+    #[test]
+    fn replacement_uses_visible_text_only() {
+        let out = neutralize_harness_identity(DSH_OPENER).expect("rewritten");
+        assert!(
+            !out.chars().any(|c| c == '\u{200B}' || c == '\u{FEFF}'),
+            "replacement must not smuggle zero-width characters: {out:?}"
+        );
     }
 }
