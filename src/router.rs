@@ -80,6 +80,20 @@ pub fn build_app_router(
         // docs for why the client-facing protocol namespace must stay clean.
         .route("/api/stats/today", get(api::stats_today_handler))
         .route("/api/request-logs", get(api::request_logs_handler))
+        // The three background loops' own status, plus the single mutating route
+        // under `/api`. Both are purely additive: no `/v1/*` route changes, so a
+        // client pointed at the proxy cannot observe that they exist. The POST is
+        // token-gated and origin-checked inside the handler — see `api_token`.
+        .route("/api/scheduler", get(api::scheduler_handler))
+        .route(
+            // Axum 0.7 path-parameter syntax is `:name` — braces became the
+            // syntax only in 0.8. With braces this route registrations still
+            // succeed but never match a real path, so every trigger 404s while
+            // the snapshot route works, which is a maddening half-working
+            // surface. `tests/api_scheduler.rs` pins the behaviour.
+            "/api/scheduler/run/:loop_id",
+            post(api::scheduler_run_handler),
+        )
         .route("/health", get(|| async { "OK" }))
         .route(
             "/metrics",

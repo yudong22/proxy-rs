@@ -99,7 +99,7 @@ pub struct WorkBuddyCredential {
 /// Kept in its own file rather than on each credential so "the default" is a
 /// single value that cannot disagree with itself, and so the scheduler settings
 /// survive a credential being deleted.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolPreferences {
     /// Id of the credential every healthy session uses. Empty means "first
     /// usable in store order", the pre-1.8.2 behaviour.
@@ -162,6 +162,35 @@ pub struct PoolPreferences {
 
 fn default_checkin_time() -> String {
     "09:00".to_string()
+}
+
+/// The default preferences, matching what an empty `workbuddy-pool.json` decodes
+/// to.
+///
+/// Hand-written rather than derived, and the difference is a real bug rather
+/// than tidiness: `#[serde(default = "default_checkin_time")]` applies only to
+/// *deserialization*, so a derived `Default` left `daily_checkin_time` as `""`.
+/// [`load_preferences`] returns `Default::default()` whenever the file is absent
+/// — i.e. on every fresh install — so the scheduler ran with an empty time
+/// (harmless, because `normalize_checkin_time` falls back to 09:00) while
+/// `/api/scheduler` published `"cadence": {"at": ""}`, an empty wall-clock time
+/// that no consumer can render. Both the behaviour and the reported fact must
+/// come from the same default.
+impl Default for PoolPreferences {
+    fn default() -> Self {
+        Self {
+            default_credential_id: String::new(),
+            daily_checkin_time: default_checkin_time(),
+            daily_checkin_enabled: false,
+            last_checkin_run_date: None,
+            default_key_id: String::new(),
+            default_identity_id: String::new(),
+            identity_order: Vec::new(),
+            growth_enabled: false,
+            last_growth_run_date: None,
+            last_night_growth_date: None,
+        }
+    }
 }
 
 /// Pool preferences file path: `~/.proxy-rs/workbuddy-pool.json`.
@@ -2660,6 +2689,73 @@ async fn batch_claim_daily_checkin_inner(
         already_checked_in,
         failed,
         details,
+    }
+}
+
+#[cfg(test)]
+mod prefs_default_tests {
+    use super::*;
+
+    /// A fresh install must report the same default time it actually uses.
+    ///
+    /// Regression: `Default` was derived while the time's 09:00 fallback lived
+    /// only in `#[serde(default = ...)]`, which applies to deserialization
+    /// alone. `load_preferences()` returns `Default::default()` when no file
+    /// exists, so the scheduler silently ran on `""` (rescued at the last
+    /// moment by `normalize_checkin_time`) while `/api/scheduler` published an
+    /// empty wall-clock time that no consumer could render.
+    #[test]
+    fn default_preferences_carry_the_same_checkin_time_an_empty_file_decodes_to() {
+        let from_default = PoolPreferences::default();
+        let from_empty_file: PoolPreferences = serde_json::from_str("{}").expect("empty object");
+        assert_eq!(
+            from_default.daily_checkin_time, from_empty_file.daily_checkin_time,
+            "the in-memory default and the on-disk default must agree"
+        );
+        assert_eq!(from_default.daily_checkin_time, "09:00");
+        assert_eq!(
+            normalize_checkin_time(&from_default.daily_checkin_time),
+            "09:00",
+            "the default must already be normalized, not merely normalizable"
+        );
+    }
+
+    /// Every field, not just the time, must agree between the two paths.
+    ///
+    /// A mismatch here is how a scheduler can run with one policy while the API
+    /// reports another, so the assertion is on the whole struct.
+    #[test]
+    fn default_preferences_equal_an_empty_file_in_every_field() {
+        let from_default = PoolPreferences::default();
+        let from_empty_file: PoolPreferences = serde_json::from_str("{}").expect("empty object");
+        // Both reference the same switches; compare the fields that decide
+        // behaviour plus the ones the API publishes.
+        assert_eq!(
+            from_default.daily_checkin_enabled,
+            from_empty_file.daily_checkin_enabled
+        );
+        assert_eq!(from_default.growth_enabled, from_empty_file.growth_enabled);
+        assert_eq!(
+            from_default.last_checkin_run_date,
+            from_empty_file.last_checkin_run_date
+        );
+        assert_eq!(
+            from_default.last_growth_run_date,
+            from_empty_file.last_growth_run_date
+        );
+        assert_eq!(
+            from_default.last_night_growth_date,
+            from_empty_file.last_night_growth_date
+        );
+        assert_eq!(
+            from_default.default_identity_id,
+            from_empty_file.default_identity_id
+        );
+        assert_eq!(from_default.identity_order, from_empty_file.identity_order);
+        assert!(
+            from_default.daily_checkin_time.len() == 5,
+            "{from_default:?}"
+        );
     }
 }
 

@@ -39,6 +39,7 @@
 - **终态错误原样透传**：上游返回 **400 / 413 / 422** 时，代理保留上游自带的状态码与错误体，不再一律折叠成 502。这一点对智能体客户端是决定性的：Codex 只有在收到 400 `context_length_exceeded` 时才会去压缩上下文；若看到 502，它会判定「网关临时故障」并对**同一条超长 prompt 反复重试**（实测连续重试 37 次）。502 只留给真正的网关故障（5xx、网络层失败），客户端据此重试才是正确的。
 - **失败原因可诊断**：请求日志里的错误不再只有 `error decoding response body` 这类只说明「哪一层失败」的措辞，而是带上完整因果链与形状判定——**上游中途断流（body 被截断）**、**上游卡住不发了（超时）**、**响应完整但无法解析**三者在日志和请求详情里明确区分；流式请求中途失败时，客户端还会收到明确的终止错误帧，而不是一个「说到一半就停住」的 HTTP 200。
 - **实时日志流**：桌面控制台高吞吐实时日志缓冲 + `~/.proxy-rs/logs/proxy.log` 持久化。
+- **后台定时循环可观测**：三个 WorkBuddy 循环（每日打卡 / 登录态巡检 / 成长任务）此前只有内存日志环留痕，重启即不可考。现在每个循环维护**两个**记录槽——`last_run`（真干活：成功 / 空闲 / 失败）与 `last_skip`（被闸门挡下的原因）——落盘到 `scheduler-state.json` 并由 `GET /api/scheduler` 发布。两槽而不是一个，是因为这些循环 tick 得密但绝大多数 tick 在**拒绝**干活，单槽会让「上次真的跑了」被一个只证明定时器活着的跳过时间戳顶掉。外部 agent 因此能直接问「网关的定时现在什么状态」，也能 `POST /api/scheduler/run/{loop}` 手动补跑一次（forced 语义，**不占用**当天定时槽位；这是唯一需要 `PROXY_API_TOKEN` 的路由）。接口契约见 [`docs/scheduler-api.md`](docs/scheduler-api.md)。
 
 ### 4. 极致桌面与原生体验
 - **系统托盘常驻**：原生托盘图标实时展示服务运行状态，支持一键启停，关闭主窗口后台静默运行。
@@ -260,6 +261,7 @@ curl -X POST http://localhost:3456/v1/messages \
 | `PROXY_CREDENTIAL_POOL` | 否 | 有启用凭据时自动开启 | WorkBuddy 登录态凭据池总开关（`false` 强制关闭） |
 | `PROXY_SESSION_SWITCH` | 否 | `true` | 会话遇到 429/402/配额码/刷新失败时自动切换到备用凭据；关闭后错误原样透传 |
 | `PROXY_SESSION_AFFINITY_TTL` | 否 | `86400000` (24h) | 切换后会话粘滞时长（毫秒），超时后回到默认凭据 |
+| `PROXY_API_TOKEN` | 否 | - | `/api/*` **写路由**的 Bearer 令牌（目前只有 `POST /api/scheduler/run/{loop}`）。不配则写路由一律 `403 mutation_disabled`；启动时读一次，改后需重启 |
 
 \* 上游需要鉴权时必填。当启用 `UPSTREAM_API_KEY_PASSTHROUGH=true` 时，不得同时指定 `UPSTREAM_API_KEY`。
 
@@ -276,6 +278,7 @@ curl -X POST http://localhost:3456/v1/messages \
 | `~/.proxy-rs/workbuddy-credentials.json` | WorkBuddy / CodeBuddy 登录态凭据池（0600，GUI「WorkBuddy 账号池」导入） |
 | `~/.proxy-rs/api-keys.json` | 上游 API 密钥池（0600，与账号统一在「身份池」中管理） |
 | `~/.proxy-rs/workbuddy-pool.json` | 身份池偏好：默认身份、每日定时打卡设置 |
+| `~/.proxy-rs/scheduler-state.json` | 三个后台循环的「上次运行 / 上次跳过」记录（`/api/scheduler` 的数据源，纯观测，不参与调度决策） |
 
 **跨机迁移**：GUI「身份池 → 📤 导出账号池」把上述三个文件的内容打包成一个文件（系统保存面板里自选位置，可选口令加密），在另一台机器上「📥 导入账号池」即可恢复；导入前会对三个文件各生成一份 `<文件名>.proxy-rs-backup-<时间戳>` 备份，替换式导入后可手工回滚。
 
@@ -296,6 +299,8 @@ curl -X POST http://localhost:3456/v1/messages \
 | GET | `/metrics` | **Prometheus 监控指标**导出 |
 | GET | `/api/stats/today` | **今日用量统计**（请求数 / Token 分类 / 缓存命中率 / override 次数），桌面端首页数据源 |
 | GET | `/api/request-logs` | **请求日志分页查询**（`model` / `client_model` / `client` / `session_id` / `status_group` / `streamed` / `search` / `limit` / `offset`），桌面端日志页数据源 |
+| GET | `/api/scheduler` | **三个后台循环的状态快照**（开关 / 节奏 / 上次运行 / 上次跳过 / 下次到期），供外部 agent 读取。只读、无鉴权，见 [`docs/scheduler-api.md`](docs/scheduler-api.md) |
+| POST | `/api/scheduler/run/{loop}` | **手动补跑一个循环**（forced 语义，不占用当天定时槽位）。**唯一需要鉴权的路由**：必须 `Authorization: Bearer $PROXY_API_TOKEN`，且拒绝任何带 `Origin` 的请求 |
 
 ### 观测接口 `/api/*`
 

@@ -76,6 +76,17 @@ fn env_lookup(name: &str) -> Option<String> {
         .or_else(|| std::env::var(name).ok())
 }
 
+/// A configuration value from `.env` or the process environment, verbatim.
+///
+/// The same `.env`-aware lookup [`Config::from_settings`] uses, exposed for
+/// settings read outside the proxy config — today the `/api` mutation token.
+/// Without it a token placed in `~/.proxy-rs/.env` (the only place a
+/// Finder-launched `.app` can read a secret from) would be invisible, and the
+/// mutation routes would stay switched off no matter what the user wrote.
+pub fn env_value(name: &str) -> Option<String> {
+    env_lookup(name)
+}
+
 /// Trimmed, non-empty configuration value, if set.
 fn non_empty_env(name: &str) -> Option<String> {
     env_lookup(name)
