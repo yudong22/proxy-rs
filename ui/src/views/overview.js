@@ -263,6 +263,33 @@ function sessionColumnLabel(sessionId) {
  * predates timing, or whose replies were plain non-streamed JSON, genuinely has
  * no speed to report.
  */
+/**
+ * Where a session's last turn sits in time, for the 上次运行 row.
+ *
+ * Today's turns render as a bare clock (`14:32`), anything older keeps its date
+ * (`10-26 14:32`). Showing the date for today too would spend four characters
+ * on a constant; dropping it for an older day would make yesterday's session
+ * look like it just ran.
+ *
+ * @param {string} lastAt - `YYYY-MM-DD HH:MM:SS` from the stats row.
+ * @returns {string} A short, unambiguous label; the raw value when unparseable.
+ */
+function lastRunLabel(lastAt) {
+  const raw = String(lastAt || '').trim();
+  // `YYYY-MM-DD HH:MM:SS` — split rather than `new Date()`: the value is a
+  // local wall-clock string with no zone, and `new Date` would reinterpret it
+  // as UTC and shift it by the machine's offset.
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(raw);
+  if (!m) return raw || '—';
+  const clock = `${m[4]}:${m[5]}`;
+  const today = new Date();
+  const isToday =
+    Number(m[1]) === today.getFullYear() &&
+    Number(m[2]) === today.getMonth() + 1 &&
+    Number(m[3]) === today.getDate();
+  return isToday ? clock : `${m[2]}-${m[3]} ${clock}`;
+}
+
 function renderSpeedTable(m) {
   const body = $('#speed-sessions-body');
   if (!body) return;
@@ -319,6 +346,19 @@ function renderSpeedTable(m) {
       value: s => (s.output_tokens > 0 ? formatNumber(s.output_tokens) : '—'),
     },
     {
+      label: '上次运行',
+      // `last_at` is the most recent turn's finish time in this window. It has
+      // always been in the payload and was never rendered, which made a column
+      // of today's aggregates read as if it were live: two sessions showing the
+      // same tokens per second looked comparable even when one had been idle
+      // for hours.
+      //
+      // Formatted as clock time rather than a relative "3 小时前": the row sits
+      // beside cumulative figures for *today*, so the absolute time is what
+      // lets the reader decide whether those figures describe recent behaviour.
+      value: s => (s.last_at ? lastRunLabel(s.last_at) : '—'),
+    },
+    {
       label: '输出速度（TPS）',
       value: s => formatTps(s.speed_tps),
     },
@@ -331,8 +371,18 @@ function renderSpeedTable(m) {
   const head = sessions
     .map(s => {
       const isCurrent = Boolean(s.session_id) && s.session_id === m.session_id;
+      // Subagent lineage. The numbers in this column already include the
+      // children, so this line is what explains why a conversation's totals
+      // exceed what its own turns produced — without it the column reads as
+      // inflated. `0` is rendered as nothing: it means "none recorded", which
+      // is also what every pre-lineage row says, so claiming "0 个子智能体"
+      // would assert something the data cannot support.
+      const subagents =
+        s.subagent_sessions > 0
+          ? html`<span class="session-subagents">含 ${s.subagent_sessions} 个子智能体</span>`
+          : '';
       return html`
-        <th class="col-session-cell${raw(isCurrent ? ' is-current' : '')}" title="${s.session_id || ''}">${sessionColumnLabel(s.session_id)}</th>
+        <th class="col-session-cell${raw(isCurrent ? ' is-current' : '')}" title="${s.session_id || ''}">${sessionColumnLabel(s.session_id)}${raw(subagents)}</th>
       `;
     })
     .join('');

@@ -66,6 +66,11 @@ const MOCK = {
     // Today's request count and cache-hit rate for this session (see
     // stats::SessionMetrics). `cache_hit_pct` is null when unmeasured.
     requests: 7, cache_hit_pct: 62,
+    // The current session's own lineage count. The mock reports one child so
+    // the header renders the suffix; `subagent_sessions: 0` below pins that a
+    // session with none renders nothing at all.
+    subagent_sessions: 1,
+    is_subagent: false,
     recent: [{
       // A cumulative tool wait in the hours range, so this fixture exercises
       // `formatLongDuration`'s minutes path rather than a sub-minute value that
@@ -73,6 +78,22 @@ const MOCK = {
       session_id: 'dsh:0.1.6', model_ms: 1500, tool_wait_ms: 14_190_100, tool_waits: 1281,
       avg_ttft_ms: 300, output_tokens: 500, speed_tps: 42.5,
       requests: 7, cache_hit_pct: 62,
+      // A non-today timestamp, so the 上次运行 row is exercised on its
+      // date-bearing branch rather than only the bare-clock one.
+      last_at: '2026-10-26 14:32:10',
+      // This conversation delegated to two subagents; its figures above already
+      // include them.
+      subagent_sessions: 2, is_subagent: false,
+    }, {
+      // A session with no recorded children: the header must show the bare id
+      // and NOT "含 0 个子智能体", because zero means "none recorded" rather
+      // than "none ran".
+      session_id: 'claude:aa11bb22', model_ms: 900, tool_wait_ms: null, tool_waits: 0,
+      avg_ttft_ms: 250, output_tokens: 300, speed_tps: 33.3,
+      requests: 4, cache_hit_pct: 50,
+      // No last_at: an unmeasured row must render "—", never a fabricated time.
+      last_at: null,
+      subagent_sessions: 0, is_subagent: false,
     }],
   },
   get_settings: {
@@ -160,8 +181,8 @@ const MOCK = {
 
 /** What the UI must produce. Values captured from the pre-split build. */
 const EXPECTED = {
-  counts: { credentialRows: 5, providerOptions: 3, speedRows: 8 },
-  // 7 metric rows + the 会话 header row.
+  counts: { credentialRows: 5, providerOptions: 3, speedRows: 9 },
+  // 8 metric rows + the 会话 header row.
   speedMetrics: {
     '请求次数': '7',
     '缓存命中': '62%',
@@ -169,9 +190,16 @@ const EXPECTED = {
     '工具调用用时': '236分 30秒（1281 次）',
     '首 token 平均（TTFT）': '300毫秒',
     '输出 tokens': '500',
+    // The most recent turn falls on an earlier day, so this exercises the
+    // date-bearing branch of `lastRunLabel` instead of a bare clock.
+    '上次运行': '10-26 14:32',
     '输出速度（TPS）': '42.5 tok/s',
   },
-  speedHeaderLabels: ['dsh:0.1.6'],
+  // Session columns, including the subagent suffix. The first conversation
+  // recorded children, so its header carries the count; the second recorded
+  // none and must NOT say "含 0 个子智能体" — zero means "none recorded", and
+  // every row written before lineage reporting says exactly that.
+  speedHeaderLabels: ['dsh:0.1.6含 2 个子智能体', 'claude:aa11bb22'],
   // The overview statistics row must show the values served by /api/stats/today,
   // not the IPC mock's (1234 / 2.50M / 42%) — that difference is what proves the
   // HTTP leg is the one answering. formatNumber abbreviates 4321 -> "4.3K".
@@ -184,8 +212,13 @@ const EXPECTED = {
     metricPointsAccount: '测试账号一',
     metricSpeed: '42.5 tok/s',
     portValue: '3456',
-    checkinTime: '08:30',
-    scheduleHint: '上次定时打卡：2026-01-01',
+    // The fixture has 每日打卡 on and growth off, so the summary must NAME the
+    // running job — "已开启 1 项" would not tell a reader which background job
+    // touches their accounts.
+    automationSummary: '已开启：每日打卡 08:30',
+    // The trigger must be present in the page itself; without it the switches
+    // would be unreachable once moved into the dialog.
+    automationButton: true,
     forceStreamHint: '跟随服务商预设：开启',
     statusText: '运行中 · 端口 3456',
     appVersion: 'v9.9.9',
@@ -426,8 +459,13 @@ try {
         text: {
           metricProvider: t('#metric-provider'), metricPoints: t('#metric-points'),
           metricPointsAccount: t('#metric-points-account'), metricSpeed: t('#metric-speed'),
-          portValue: v('#setting-port'), checkinTime: v('#wb-checkin-time'),
-          scheduleHint: t('#wb-schedule-hint'), forceStreamHint: t('#force-stream-hint'),
+          portValue: v('#setting-port'),
+          // The two automation switches moved into a lazy dialog; what the page
+          // itself must always show is the summary line naming what runs
+          // unattended, because a closed dialog hides the switches themselves.
+          automationSummary: t('#wb-automation-summary'),
+          automationButton: Boolean(document.querySelector('#btn-wb-automation')),
+          forceStreamHint: t('#force-stream-hint'),
           statusText: t('#status-text'), appVersion: t('#app-version'),
         },
         // The overview statistics row, which reads GET /api/stats/today. Its
@@ -463,9 +501,10 @@ try {
         growth: {
           toolbarButton: Boolean(document.querySelector('#btn-wb-growth')),
           rowButtons: document.querySelectorAll('[data-growth]').length,
-          togglePresent: Boolean(document.querySelector('#wb-growth-enabled')),
-          toggleChecked: document.querySelector('#wb-growth-enabled')?.checked ?? null,
-          hint: (document.querySelector('#wb-growth-hint')?.textContent || '').trim(),
+          // The switches live in the automation dialog and are built on first
+          // open, so absence here is the expected state — opening it is asserted
+          // separately below.
+          toggleInPage: Boolean(document.querySelector('#wb-growth-enabled')),
         },
         selectValue: sel?.value,
         dshButtonPresent: Boolean(document.querySelector('#btn-apply-dsh-config')),
@@ -488,9 +527,47 @@ try {
     ['cred-1', 'cred-2', 'cred-3', 'cred-4', 'key-1']);
   check('growth toolbar button exists', b.growth.toolbarButton, true);
   check('growth row button exists per credential', b.growth.rowButtons > 0, true);
-  check('growth switch exists', b.growth.togglePresent, true);
-  check('growth switch defaults to off', b.growth.toggleChecked, false);
-  check('growth hint says it is off', b.growth.hint.includes('关闭中'), true);
+  check('growth switches are not in the page until asked for', b.growth.toggleInPage, false);
+
+  // The automation dialog: open it and assert both switches appear with the
+  // stored preference values. This is what replaces the two old inline rows —
+  // the point of the move is that both switches are visible at once, so a test
+  // that only checked "a button exists" would not cover the actual change.
+  await send('Runtime.evaluate', { expression: `document.querySelector('#btn-wb-automation')?.click()` });
+  await new Promise((r) => setTimeout(r, 400));
+  const automation = await send('Runtime.evaluate', {
+    returnByValue: true,
+    expression: `(() => {
+      const el = document.querySelector('#wb-automation-overlay');
+      return {
+        open: Boolean(el) && el.classList.contains('active'),
+        hasCheckin: Boolean(document.querySelector('#wb-checkin-enabled')),
+        hasGrowth: Boolean(document.querySelector('#wb-growth-enabled')),
+        checkinChecked: document.querySelector('#wb-checkin-enabled')?.checked ?? null,
+        growthChecked: document.querySelector('#wb-growth-enabled')?.checked ?? null,
+        checkinTime: document.querySelector('#wb-checkin-time')?.value ?? null,
+        growthHint: (document.querySelector('#wb-growth-hint')?.textContent || '').trim(),
+      };
+    })()`,
+  });
+  const auto = automation.result.value;
+  check('automation dialog opens', auto.open, true);
+  check('automation dialog holds both switches', [auto.hasCheckin, auto.hasGrowth], [true, true]);
+  // The switches must reflect the stored preferences, not a hardcoded default:
+  // this fixture has 每日打卡 on and growth off, so a dialog that reset either
+  // would silently change what runs unattended.
+  check('automation switches reflect stored preferences',
+    [auto.checkinChecked, auto.growthChecked], [true, false]);
+  check('check-in time seeds from stored preferences', auto.checkinTime, '08:30');
+  check('growth hint explains the off state', auto.growthHint.includes('关闭中'), true);
+  // Close it again so the rest of the run sees the resting page.
+  await send('Runtime.evaluate', { expression: `document.querySelector('#wb-automation-overlay [data-close]')?.click()` });
+  await new Promise((r) => setTimeout(r, 250));
+  const closed = await send('Runtime.evaluate', {
+    returnByValue: true,
+    expression: `Boolean(document.querySelector('#wb-automation-overlay')?.classList.contains('active'))`,
+  });
+  check('automation dialog closes again', closed.result.value, false);
 
   // Cross-module integration 5: the growth-run progress stream.
   //

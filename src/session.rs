@@ -58,6 +58,31 @@ pub struct SessionInfo {
     /// header form carries one (Codex's `x-codex-turn-metadata.model`). `None`
     /// for body dialects, where the body's own `model` field is authoritative.
     pub model_hint: Option<String>,
+    /// Namespaced id of the session that spawned this one, or empty.
+    ///
+    /// Only DSH reports lineage (`x-deepseek-harness-parent-session-id`, sent
+    /// for subagent children alone), so this is empty for every other dialect
+    /// and for every DSH top-level conversation.
+    pub parent_session_id: String,
+}
+
+impl SessionInfo {
+    /// A resolved identity with no parent lineage, for the dialects that do not
+    /// report any.
+    ///
+    /// A constructor rather than repeating `parent_session_id: String::new()`
+    /// at every site: the dialects that *cannot* have a parent outnumber the
+    /// one that can, and a missed field there would be a compile error in one
+    /// place but a silently empty lineage in another.
+    fn plain(client: ClientKind, session_id: String) -> Self {
+        Self {
+            client,
+            session_id,
+            turn_id: String::new(),
+            model_hint: None,
+            parent_session_id: String::new(),
+        }
+    }
 }
 
 /// The client dialect a request was identified as.
@@ -100,12 +125,7 @@ impl ClientKind {
 impl SessionInfo {
     /// The fallback identity for a request that matched no dialect.
     pub fn unknown() -> Self {
-        SessionInfo {
-            client: ClientKind::Unknown,
-            session_id: String::new(),
-            turn_id: String::new(),
-            model_hint: None,
-        }
+        SessionInfo::plain(ClientKind::Unknown, String::new())
     }
 
     /// Whether a real session id was resolved.
@@ -205,12 +225,8 @@ fn session_from_claude_header(headers: &HeaderMap) -> Option<SessionInfo> {
             .flatten()
     })?;
 
-    looks_like_session_id(&raw).then(|| SessionInfo {
-        client: ClientKind::ClaudeCode,
-        session_id: format!("claude:{}", raw.trim()),
-        turn_id: String::new(),
-        model_hint: None,
-    })
+    looks_like_session_id(&raw)
+        .then(|| SessionInfo::plain(ClientKind::ClaudeCode, format!("claude:{}", raw.trim())))
 }
 
 /// The fixed word the harness prefixes every conversation id with.
@@ -264,11 +280,19 @@ fn session_from_dsh_identity(headers: &HeaderMap) -> Option<SessionInfo> {
     })?;
 
     let raw = raw.trim();
-    looks_like_session_id(raw).then(|| SessionInfo {
-        client: ClientKind::Dsh,
-        session_id: format!("dsh:{}", strip_dsh_session_prefix(raw)),
-        turn_id: String::new(),
-        model_hint: None,
+    looks_like_session_id(raw).then(|| {
+        let parent = header(headers, "x-deepseek-harness-parent-session-id")
+            .map(|value| value.trim().to_string())
+            .filter(|value| looks_like_session_id(value))
+            .map(|value| format!("dsh:{}", strip_dsh_session_prefix(&value)))
+            .unwrap_or_default();
+        SessionInfo {
+            client: ClientKind::Dsh,
+            session_id: format!("dsh:{}", strip_dsh_session_prefix(raw)),
+            turn_id: String::new(),
+            model_hint: None,
+            parent_session_id: parent,
+        }
     })
 }
 
@@ -304,22 +328,15 @@ fn session_from_cookies(raw: &str) -> Option<SessionInfo> {
 
     if let Some((_, value)) = pairs.iter().find(|(name, _)| name == "session_id") {
         if looks_like_session_id(value) {
-            return Some(SessionInfo {
-                client: ClientKind::ClaudeCode,
-                session_id: format!("claude:{}", value),
-                turn_id: String::new(),
-                model_hint: None,
-            });
+            return Some(SessionInfo::plain(
+                ClientKind::ClaudeCode,
+                format!("claude:{}", value),
+            ));
         }
     }
 
     if let Some((name, _)) = pairs.iter().find(|(name, _)| name.starts_with("dsh-auth")) {
-        return Some(SessionInfo {
-            client: ClientKind::Dsh,
-            session_id: format!("dsh:{}", name),
-            turn_id: String::new(),
-            model_hint: None,
-        });
+        return Some(SessionInfo::plain(ClientKind::Dsh, format!("dsh:{}", name)));
     }
 
     None
@@ -352,6 +369,8 @@ fn session_from_turn_metadata(raw: &str) -> Option<SessionInfo> {
         session_id: format!("codex:{}", session),
         turn_id: pick("turn_id").unwrap_or_default().to_string(),
         model_hint: pick("model").map(str::to_string),
+        // Codex reports no lineage; its conversations are always top-level.
+        parent_session_id: String::new(),
     })
 }
 
@@ -378,12 +397,10 @@ fn session_from_generic_headers(headers: &HeaderMap) -> Option<SessionInfo> {
                     ClientKind::Unknown => detect_client(headers),
                     known => known,
                 };
-                return Some(SessionInfo {
+                return Some(SessionInfo::plain(
                     client,
-                    session_id: format!("{}:{}", client.tag(), raw.trim()),
-                    turn_id: String::new(),
-                    model_hint: None,
-                });
+                    format!("{}:{}", client.tag(), raw.trim()),
+                ));
             }
         }
     }
@@ -509,23 +526,15 @@ pub fn detect_from_body(client: ClientKind, body: &Value) -> Option<SessionInfo>
         // the rare header-less Codex request.
         ClientKind::Codex => {
             let key = body.get("prompt_cache_key")?.as_str()?.trim();
-            looks_like_session_id(key).then(|| SessionInfo {
-                client: ClientKind::Codex,
-                session_id: format!("codex:{}", key),
-                turn_id: String::new(),
-                model_hint: None,
-            })
+            looks_like_session_id(key)
+                .then(|| SessionInfo::plain(ClientKind::Codex, format!("codex:{}", key)))
         }
         // Claude Code has no session header of its own, so the Anthropic
         // `metadata.user_id` field is authoritative here.
         ClientKind::ClaudeCode => {
             let user = body.get("metadata")?.get("user_id")?.as_str()?.trim();
-            looks_like_session_id(user).then(|| SessionInfo {
-                client: ClientKind::ClaudeCode,
-                session_id: format!("claude:{}", user),
-                turn_id: String::new(),
-                model_hint: None,
-            })
+            looks_like_session_id(user)
+                .then(|| SessionInfo::plain(ClientKind::ClaudeCode, format!("claude:{}", user)))
         }
         ClientKind::Dsh | ClientKind::Unknown => None,
     }
@@ -795,6 +804,86 @@ mod tests {
         assert_eq!(info.session_id, "dsh:7d3f2a10-9c4b-4e21-8f77-1a2b3c4d5e6f");
     }
 
+    /// A DSH subagent's parent id is read, namespaced, and prefix-stripped.
+    ///
+    /// Both ids arrive in the same bare form, so both must go through the same
+    /// two steps. Doing the transform on only one of them would store
+    /// `dsh:parent` beside `dsh:session-<uuid>` and the join would never match.
+    #[test]
+    fn dsh_parent_session_id_is_resolved_and_namespaced() {
+        let h = headers(&[
+            (
+                "x-deepseek-harness-session-id",
+                "session-7d3f2a10-9c4b-4e21-8f77-1a2b3c4d5e6f",
+            ),
+            (
+                "x-deepseek-harness-parent-session-id",
+                "session-10b430c6-b992-4ad5-b965-5f959126498d",
+            ),
+        ]);
+        let info = detect(&h);
+        assert_eq!(info.client, ClientKind::Dsh);
+        assert_eq!(info.session_id, "dsh:7d3f2a10-9c4b-4e21-8f77-1a2b3c4d5e6f");
+        assert_eq!(
+            info.parent_session_id,
+            "dsh:10b430c6-b992-4ad5-b965-5f959126498d"
+        );
+    }
+
+    /// A top-level DSH conversation has no parent, and the field is empty.
+    #[test]
+    fn a_dsh_top_level_session_reports_no_parent() {
+        let info = detect(&headers(&[(
+            "x-deepseek-harness-session-id",
+            "session-7d3f2a10-9c4b-4e21-8f77-1a2b3c4d5e6f",
+        )]));
+        assert_eq!(info.parent_session_id, "");
+    }
+
+    /// A malformed parent id is dropped rather than stored.
+    ///
+    /// Storing `dsh:null` or a one-character value would create rows that join
+    /// to no parent at all: the aggregate silently under-counts, and the only
+    /// symptom is a number that looks slightly too small. An empty field is the
+    /// honest answer and degrades to the pre-lineage behaviour.
+    #[test]
+    fn a_malformed_parent_session_id_is_discarded() {
+        for bad in ["", " ", "null", "none", "x", "a".repeat(200).as_str()] {
+            let info = detect(&headers(&[
+                (
+                    "x-deepseek-harness-session-id",
+                    "session-7d3f2a10-9c4b-4e21-8f77-1a2b3c4d5e6f",
+                ),
+                ("x-deepseek-harness-parent-session-id", bad),
+            ]));
+            assert_eq!(
+                info.parent_session_id, "",
+                "parent id {bad:?} should have been discarded"
+            );
+        }
+    }
+
+    /// Other dialects never carry a parent, even if they somehow send the header.
+    ///
+    /// The header name scopes it to the harness, and a request identified as
+    /// Claude Code or Codex must not have a harness concept grafted onto it —
+    /// a client's own headers are not proof that it is the client we think.
+    #[test]
+    fn other_clients_never_report_a_parent() {
+        let claude = detect(&headers(&[
+            (
+                "x-claude-code-session-id",
+                "aa11bb22-cc33-dd44-ee55-ff6677889900",
+            ),
+            (
+                "x-deepseek-harness-parent-session-id",
+                "session-10b430c6-b992-4ad5-b965-5f959126498d",
+            ),
+        ]));
+        assert_eq!(claude.client, ClientKind::ClaudeCode);
+        assert_eq!(claude.parent_session_id, "", "{claude:?}");
+    }
+
     #[test]
     fn dsh_session_prefix_is_stripped_but_a_peer_id_is_left_whole() {
         // The prefix is a fixed word, so two different conversations must still
@@ -964,6 +1053,7 @@ mod tests {
             session_id: format!("codex:{}", CODEX_SESSION),
             turn_id: CODEX_TURN.to_string(),
             model_hint: None,
+            parent_session_id: String::new(),
         };
         assert_eq!(
             info.log_tag(),
@@ -981,6 +1071,7 @@ mod tests {
             session_id: format!("codex:{}", CODEX_SESSION),
             turn_id: CODEX_TURN.to_string(),
             model_hint: None,
+            parent_session_id: String::new(),
         };
         assert_eq!(info.display_tag(), "[codex:01a0cc30 / turn 01a0cc31]");
     }
@@ -992,6 +1083,7 @@ mod tests {
             session_id: "claude:user_8f3a1c2e".to_string(),
             turn_id: String::new(),
             model_hint: None,
+            parent_session_id: String::new(),
         };
         assert_eq!(info.display_tag(), "[claude:user_8f3a1c2e]");
     }

@@ -94,6 +94,19 @@
   white-space: nowrap;
 }
 
+/* Subagent lineage under a session column's name.
+   Rendered only when at least one child was actually recorded, because the
+   column's numbers include those children — this line is what stops a
+   conversation's totals from reading as inflated. It stays on its own line so
+   the header geometry does not shift with the count. */
+.speed-sessions .session-subagents {
+  display: block;
+  font-weight: 400;
+  font-size: 11px;
+  opacity: 0.75;
+  margin-top: 2px;
+}
+
 /* The conversation the card above describes. Marked by a tinted column so it is
    findable without reading every header. */
 .speed-sessions th.col-session-cell.is-current,

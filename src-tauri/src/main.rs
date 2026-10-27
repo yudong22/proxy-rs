@@ -257,6 +257,16 @@ fn session_metrics_json(m: &proxy_rs::stats::SessionMetrics) -> Value {
         "input_tokens": m.input_tokens,
         "cache_read_tokens": m.cache_read_tokens,
         "cache_hit_pct": m.cache_hit_pct(),
+        // Session lineage. `turns`/tokens above already include the children, so
+        // the panel's hover text can say "含 N 个子智能体" and be consistent with
+        // the numbers beside it rather than needing a second query to explain a
+        // discrepancy that no longer exists.
+        //
+        // `subagent_sessions == 0` means "none recorded", NOT "none ran": rows
+        // written before lineage reporting carry an empty parent id and cannot
+        // be backfilled. The UI must word it as a count, never as an absence.
+        "subagent_sessions": m.subagent_sessions,
+        "is_subagent": m.is_subagent,
     })
 }
 

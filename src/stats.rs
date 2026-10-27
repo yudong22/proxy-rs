@@ -88,6 +88,15 @@ pub struct RequestOutcome<'a> {
     /// Namespaced session id resolved by `session::detect`, e.g.
     /// `codex:01a0cc30-….` Empty when the client could not be identified.
     pub session_id: &'a str,
+    /// Namespaced id of the session that *spawned* this one, or empty for a
+    /// top-level conversation.
+    ///
+    /// Only a client that knows its own session lineage can report this, and
+    /// only DSH does (`x-deepseek-harness-parent-session-id`, sent for subagent
+    /// children alone). Everything else stores empty — which is the same value
+    /// historical rows carry, because they were recorded before the header
+    /// existed and cannot be backfilled.
+    pub parent_session_id: &'a str,
     /// Client dialect tag (`codex` / `claude` / `dsh` / `unknown`).
     pub client: &'a str,
     /// Credential short id actually used after an exception override (failover
@@ -123,6 +132,7 @@ impl RequestOutcome<'_> {
             status: self.status,
             error: self.error.map(|e| e.to_string()),
             session_id: self.session_id.to_string(),
+            parent_session_id: self.parent_session_id.to_string(),
             client: self.client.to_string(),
             override_key: self.override_key.to_string(),
             override_model: self.override_model.to_string(),
@@ -154,6 +164,9 @@ struct RequestRow {
     status: u16,
     error: Option<String>,
     session_id: String,
+    /// Parent session for a subagent child, else empty (see
+    /// [`RequestOutcome::parent_session_id`]).
+    parent_session_id: String,
     client: String,
     override_key: String,
     override_model: String,
@@ -166,9 +179,9 @@ impl RequestRow {
             date, created_at, model, client_model, route,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
             duration_ms, ttft_ms, model_ms, ended_with_tool_call,
-            streamed, status, error, session_id, client,
+            streamed, status, error, session_id, parent_session_id, client,
             override_key, override_model, override_reason
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
     }
 
     fn bind_to(&self, stmt: &mut rusqlite::Statement<'_>) -> rusqlite::Result<()> {
@@ -190,6 +203,7 @@ impl RequestRow {
             self.status as i64,
             self.error,
             self.session_id,
+            self.parent_session_id,
             self.client,
             self.override_key,
             self.override_model,
@@ -225,6 +239,10 @@ pub struct RequestLogItem {
     pub error: Option<String>,
     /// Namespaced session id (`codex:…` / `claude:…` / `dsh:…`), or empty.
     pub session_id: String,
+    /// Namespaced parent session id for a subagent child, or empty for a
+    /// top-level conversation (and for every row recorded before the column
+    /// existed — an absence that is permanent, not a measurement of "no parent").
+    pub parent_session_id: String,
     /// Client dialect tag, or `unknown`.
     pub client: String,
     /// Credential short id used after an exception override, or empty when the
@@ -370,6 +388,20 @@ pub struct SessionMetrics {
     pub input_tokens: i64,
     /// Σ prompt tokens served from cache across the same window.
     pub cache_read_tokens: i64,
+    /// How many subagent child sessions were folded into this figure.
+    ///
+    /// Zero means either "this conversation spawned none" or "none of them were
+    /// recorded after lineage reporting existed". Those are not the same claim,
+    /// but the gateway cannot tell them apart: pre-lineage rows carry an empty
+    /// parent id and there is nothing to backfill from. The UI must therefore
+    /// present this as a count, never as "no subagents ran".
+    pub subagent_sessions: i64,
+    /// Whether this row *is* a subagent child rather than a top-level
+    /// conversation.
+    ///
+    /// Set from `parent_session_id`, so it is false for both a real top-level
+    /// conversation and every historical row.
+    pub is_subagent: bool,
 }
 
 impl SessionMetrics {
@@ -380,6 +412,30 @@ impl SessionMetrics {
             return None;
         }
         Some(self.output_tokens as f64 * 1000.0 / self.model_ms as f64)
+    }
+
+    /// Add one child session's measurements into this aggregate.
+    ///
+    /// Sums only — every field here is already a total or a sample count, so
+    /// adding two sessions' figures yields the combined session's figure. The
+    /// derived values ([`Self::tps`], [`Self::avg_ttft_ms`]) are computed after
+    /// the fact from these sums, which is what makes the combined rate a true
+    /// tokens-over-time rather than an average of two rates.
+    ///
+    /// `last_at`/`model`/`session_id` are *not* taken from the child: they
+    /// describe the conversation this row is labelled with, and letting a child
+    /// overwrite them would relabel a parent's column with a subagent's model.
+    fn absorb(&mut self, child: &SessionMetrics) {
+        self.turns += child.turns;
+        self.measured_turns += child.measured_turns;
+        self.output_tokens += child.output_tokens;
+        self.model_ms += child.model_ms;
+        self.ttft_sum_ms += child.ttft_sum_ms;
+        self.ttft_samples += child.ttft_samples;
+        self.tool_wait_ms += child.tool_wait_ms;
+        self.tool_waits += child.tool_waits;
+        self.input_tokens += child.input_tokens;
+        self.cache_read_tokens += child.cache_read_tokens;
     }
 
     /// Mean TTFT across the measured turns, or `None` when none was measured.
@@ -783,6 +839,7 @@ impl StatsDb {
                 status              INTEGER NOT NULL DEFAULT 0,
                 error               TEXT,
                 session_id          TEXT NOT NULL DEFAULT '',
+                parent_session_id   TEXT NOT NULL DEFAULT '',
                 client              TEXT NOT NULL DEFAULT '',
                 override_key        TEXT NOT NULL DEFAULT '',
                 override_model      TEXT NOT NULL DEFAULT '',
@@ -824,6 +881,7 @@ impl StatsDb {
         // keep the empty-string default.
         for column in [
             "session_id",
+            "parent_session_id",
             "client",
             "override_key",
             "override_model",
@@ -1074,7 +1132,7 @@ impl StatsDb {
             "SELECT id, created_at, model, client_model, route,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                     duration_ms, ttft_ms, model_ms, ended_with_tool_call,
-                    streamed, status, error, session_id, client,
+                    streamed, status, error, session_id, parent_session_id, client,
                     override_key, override_model, override_reason
              FROM request_logs
              {}
@@ -1112,10 +1170,11 @@ impl StatsDb {
                 status: status_int as u16,
                 error: row.get(15)?,
                 session_id: row.get(16)?,
-                client: row.get(17)?,
-                override_key: row.get(18)?,
-                override_model: row.get(19)?,
-                override_reason: row.get(20)?,
+                parent_session_id: row.get(17)?,
+                client: row.get(18)?,
+                override_key: row.get(19)?,
+                override_model: row.get(20)?,
+                override_reason: row.get(21)?,
             })
         })?;
 
@@ -1149,7 +1208,10 @@ impl StatsDb {
     ///
     /// A session with no id (unidentified client) is not a conversation, so it
     /// never wins here — the card would otherwise describe an anonymous request
-    /// that cannot be followed up.
+    /// that cannot be followed up. Likewise a subagent child: it is the newest
+    /// row in the table most of the time, so without the lineage exclusion the
+    /// card would describe a helper's traffic while the panel beside it is
+    /// labelled with the parent conversation's id.
     pub fn latest_session_id(&self) -> Result<Option<String>> {
         self.latest_session_id_on(&local_date_string())
     }
@@ -1164,8 +1226,12 @@ impl StatsDb {
         let id = handle
             .get()
             .query_row(
+                // Top-level conversations only: a subagent child's turn is
+                // usually the newest row in the table, and taking it would make
+                // the overview's "current session" card describe one of the
+                // conversation's helpers instead of the conversation.
                 "SELECT session_id FROM request_logs
-                  WHERE session_id != '' AND date = ?1
+                  WHERE session_id != '' AND date = ?1 AND parent_session_id = ''
                   ORDER BY id DESC
                   LIMIT 1",
                 params![date],
@@ -1229,9 +1295,22 @@ impl StatsDb {
         // is: the panel exists to compare *today's* conversations, and a session
         // that ran only yesterday would otherwise sit in the comparison with a
         // full-window figure beside today's partial ones.
+        //
+        // **Top-level conversations only.** The grouping is by `session_id`, so a
+        // subagent child would otherwise become a column of its own and the panel
+        // would compare "my conversation" against "one of my subagents" — two
+        // different units. A child's traffic is folded into its parent below
+        // instead.
+        //
+        // Rows written before lineage reporting existed carry an empty
+        // `parent_session_id`, so a *historical* child still appears as its own
+        // top-level conversation. That is unavoidable (the information was never
+        // recorded) and is why the aggregate reports a subagent **count** rather
+        // than claiming none ran.
         let mut stmt = conn.prepare(
             "SELECT session_id FROM request_logs
               WHERE session_id != '' AND date = ?1
+                AND parent_session_id = ''
               GROUP BY session_id
               ORDER BY MAX(id) DESC
               LIMIT ?2",
@@ -1242,9 +1321,58 @@ impl StatsDb {
 
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            out.push(Self::fold_session_on(conn, &id, Some(date))?);
+            out.push(Self::fold_session_tree_on(conn, &id, Some(date))?);
         }
         Ok(out)
+    }
+
+    /// Fold one top-level session together with its subagent children.
+    ///
+    /// One level only, deliberately. A grandchild's `parent_session_id` points at
+    /// its own parent, so it is folded into that parent — which is itself folded
+    /// here. Recursing would walk the same rows twice and, on a corrupt cycle,
+    /// never terminate.
+    ///
+    /// Tool wait is computed **per session and then summed**, never over the
+    /// interleaved turns: `fold_session_turns` attributes the gap after a
+    /// tool-calling turn to the *next* turn, and a parent and its child can be
+    /// alternating turns whose adjacency means nothing. Concatenating them would
+    /// invent tool waits that never happened.
+    fn fold_session_tree_on(
+        conn: &Connection,
+        session_id: &str,
+        date: Option<&str>,
+    ) -> Result<SessionMetrics> {
+        let mut metrics = Self::fold_session_on(conn, session_id, date)?;
+
+        // The statement is bound to a `let` rather than built inside the match
+        // arms: `query_map` borrows the statement for as long as its iterator
+        // lives, so an arm-local `stmt` would be dropped while still borrowed.
+        let mut stmt = match date {
+            Some(_) => conn.prepare(
+                "SELECT DISTINCT session_id FROM request_logs
+                  WHERE parent_session_id = ?1 AND date = ?2 AND session_id != ''",
+            )?,
+            None => conn.prepare(
+                "SELECT DISTINCT session_id FROM request_logs
+                  WHERE parent_session_id = ?1 AND session_id != ''",
+            )?,
+        };
+        let child_ids: Vec<String> = match date {
+            Some(d) => stmt
+                .query_map(params![session_id, d], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(params![session_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+
+        for child in &child_ids {
+            let child_metrics = Self::fold_session_on(conn, child, date)?;
+            metrics.absorb(&child_metrics);
+        }
+        metrics.subagent_sessions = child_ids.len() as i64;
+        Ok(metrics)
     }
 
     /// Session-level speed metrics for the overview's 输出速度 card, as of today.
@@ -1271,7 +1399,12 @@ impl StatsDb {
             return Ok(SessionMetrics::default());
         }
         let handle = self.read_conn();
-        Self::fold_session_on(handle.get(), session_id, Some(date))
+        // The tree fold, not the plain one: this figure and the comparison
+        // columns beside it are rendered on the same panel, so they must use the
+        // same rule. A session that reads 42k tokens in its own column and 47k
+        // in the current-session column would be the worst kind of wrong —
+        // two numbers, one screen, no way to tell which is the conversation.
+        Self::fold_session_tree_on(handle.get(), session_id, Some(date))
     }
 
     /// Read one session's window from `conn` and fold it.
@@ -1338,7 +1471,20 @@ impl StatsDb {
         let mut turns: Vec<SessionTurn> = rows;
         turns.reverse();
 
-        Ok(fold_session_turns(session_id, &turns))
+        let mut metrics = fold_session_turns(session_id, &turns);
+        // Whether this id is a child is a property of the rows, not of the fold:
+        // ask the database rather than threading the column through every turn.
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM request_logs
+                  WHERE session_id = ?1 AND parent_session_id != ''
+                  LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        metrics.is_subagent = parent.is_some();
+        Ok(metrics)
     }
 
     /// Return statistics for today (local date). Returns a zeroed `DayStats`
@@ -1517,7 +1663,42 @@ mod tests {
             status,
             error,
             session_id: "",
+            parent_session_id: "",
             client: "",
+            override_key: "",
+            override_model: "",
+            override_reason: "",
+        }
+    }
+
+    /// `outcome` tagged with a session id (and optionally a parent session).
+    ///
+    /// A variant rather than more positional parameters: almost every caller
+    /// cares about the session and nothing else, and a six-place predicate is
+    /// how the wrong argument silently lands in the wrong field.
+    fn session_outcome<'a>(
+        session_id: &'a str,
+        parent_session_id: &'a str,
+        tokens: &'a TokenRecord,
+        model_ms: i64,
+    ) -> RequestOutcome<'a> {
+        RequestOutcome {
+            model: "hy3",
+            client_model: "hy3",
+            route: "/v1/chat/completions",
+            tokens,
+            duration_ms: 1000,
+            timing: UpstreamTiming {
+                ttft_ms: 100,
+                model_ms,
+                ended_with_tool_call: false,
+            },
+            streamed: true,
+            status: 200,
+            error: None,
+            session_id,
+            parent_session_id,
+            client: "dsh",
             override_key: "",
             override_model: "",
             override_reason: "",
@@ -1838,6 +2019,186 @@ mod tests {
     ///
     /// `LIMIT` runs newest-first, so getting the order wrong would aggregate the
     /// oldest turns of a long conversation instead of its current behaviour.
+    /// A parent's aggregate includes its subagent children's traffic.
+    ///
+    /// This is the whole point of lineage: before it, a conversation that
+    /// delegated work to three subagents showed the parent's tokens only, and
+    /// the panel listed each child as an unrelated column.
+    #[test]
+    fn a_parent_session_absorbs_its_subagent_children() {
+        let db = StatsDb::in_memory().unwrap();
+        let parent_tokens = TokenRecord {
+            input: 1000,
+            output: 200,
+            ..Default::default()
+        };
+        let child_tokens = TokenRecord {
+            input: 500,
+            output: 300,
+            ..Default::default()
+        };
+        let grandchild_tokens = TokenRecord {
+            input: 10,
+            output: 10,
+            ..Default::default()
+        };
+        let mid_tokens = TokenRecord {
+            input: 20,
+            output: 40,
+            ..Default::default()
+        };
+
+        db.record_request_log(session_outcome("dsh:p", "", &parent_tokens, 1000))
+            .unwrap();
+        // Two children…
+        db.record_request_log(session_outcome("dsh:c1", "dsh:p", &child_tokens, 2000))
+            .unwrap();
+        db.record_request_log(session_outcome("dsh:c2", "dsh:p", &mid_tokens, 500))
+            .unwrap();
+        // …and a grandchild, whose parent is c1 rather than the root.
+        db.record_request_log(session_outcome("dsh:g", "dsh:c1", &grandchild_tokens, 100))
+            .unwrap();
+
+        let metrics = db
+            .query_session_metrics_on("dsh:p", &local_date_string())
+            .unwrap();
+
+        // Parent's own turn plus both direct children's; the grandchild is
+        // folded into c1, which this row then absorbs. One level at a time is
+        // what makes the totals add up exactly once instead of twice.
+        assert_eq!(metrics.turns, 3, "parent + two direct children");
+        assert_eq!(metrics.subagent_sessions, 2, "two direct children");
+        assert!(!metrics.is_subagent, "the root conversation is not a child");
+        assert_eq!(metrics.input_tokens, 1000 + 500 + 20);
+        assert_eq!(metrics.output_tokens, 200 + 300 + 40);
+        assert_eq!(metrics.model_ms, 1000 + 2000 + 500);
+
+        // The rate is tokens over time across the whole tree, not an average of
+        // three per-session rates.
+        let tps = metrics.tps().expect("tree has a measurable span");
+        let expected = (200.0 + 300.0 + 40.0) * 1000.0 / (1000.0 + 2000.0 + 500.0);
+        assert!((tps - expected).abs() < 1e-9, "{tps} vs {expected}");
+
+        // A child is still readable on its own, and says so.
+        let child = db
+            .query_session_metrics_on("dsh:c1", &local_date_string())
+            .unwrap();
+        assert!(child.is_subagent, "c1 was spawned by p");
+        assert_eq!(child.turns, 2, "its own turn plus the grandchild's");
+        assert_eq!(child.subagent_sessions, 1);
+    }
+
+    /// A subagent child never becomes a column of its own.
+    ///
+    /// The panel compares conversations; a child is part of one. If it kept its
+    /// own column, the parent's column and the child's would double-count the
+    /// same tokens in the same table.
+    #[test]
+    fn a_subagent_child_is_not_listed_as_its_own_recent_session() {
+        let db = StatsDb::in_memory().unwrap();
+        let tokens = TokenRecord {
+            input: 10,
+            output: 5,
+            ..Default::default()
+        };
+        db.record_request_log(session_outcome("dsh:root", "", &tokens, 100))
+            .unwrap();
+        db.record_request_log(session_outcome("dsh:kid", "dsh:root", &tokens, 100))
+            .unwrap();
+        db.record_request_log(session_outcome("dsh:other", "", &tokens, 100))
+            .unwrap();
+
+        let recent = db.query_recent_session_metrics(10).unwrap();
+        let ids: Vec<&str> = recent.iter().map(|m| m.session_id.as_str()).collect();
+        assert!(ids.contains(&"dsh:root"), "{ids:?}");
+        assert!(ids.contains(&"dsh:other"), "{ids:?}");
+        assert!(
+            !ids.contains(&"dsh:kid"),
+            "a subagent child must not get its own column: {ids:?}"
+        );
+        // Two top-level conversations, and the child's traffic lives in `root`.
+        assert_eq!(recent.len(), 2, "{ids:?}");
+    }
+
+    /// Rows recorded before lineage existed stay top-level, and say so honestly.
+    ///
+    /// They cannot be backfilled, so a historical child keeps its own column.
+    /// What must NOT happen is the aggregate claiming the conversation had no
+    /// subagents: `subagent_sessions == 0` here means "none recorded", and the
+    /// UI's wording depends on that distinction.
+    #[test]
+    fn a_pre_lineage_child_still_counts_as_a_top_level_conversation() {
+        let db = StatsDb::in_memory().unwrap();
+        let tokens = TokenRecord {
+            input: 7,
+            output: 3,
+            ..Default::default()
+        };
+        // An empty parent id is exactly what a pre-lineage row carries.
+        db.record_request_log(session_outcome("dsh:legacy", "", &tokens, 100))
+            .unwrap();
+
+        let recent = db.query_recent_session_metrics(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].session_id, "dsh:legacy");
+        assert_eq!(recent[0].subagent_sessions, 0);
+        assert!(!recent[0].is_subagent);
+    }
+
+    /// The speed card describes a conversation, never one of its subagents.
+    ///
+    /// A child's request is almost always the newest row, so picking "latest by
+    /// id" without the lineage filter made the card show a helper's traffic
+    /// under the parent's id — the panel was labelled with one conversation and
+    /// measuring another, which no label on screen could reveal.
+    #[test]
+    fn the_latest_session_is_never_a_subagent_child() {
+        let db = StatsDb::in_memory().unwrap();
+        let tokens = TokenRecord {
+            input: 10,
+            output: 5,
+            ..Default::default()
+        };
+        db.record_request_log(session_outcome("dsh:parent", "", &tokens, 100))
+            .unwrap();
+        // Inserted last, so it holds the highest id.
+        db.record_request_log(session_outcome("dsh:child", "dsh:parent", &tokens, 100))
+            .unwrap();
+
+        assert_eq!(
+            db.latest_session_id_on(&local_date_string())
+                .unwrap()
+                .as_deref(),
+            Some("dsh:parent"),
+            "the card must describe the conversation, not its helper"
+        );
+
+        // And the card's figures then include the child, since they are the
+        // conversation's cost.
+        let metrics = db.query_latest_session_metrics().unwrap();
+        assert_eq!(metrics.session_id, "dsh:parent");
+        assert_eq!(metrics.turns, 2, "parent's own turn plus the child's");
+        assert_eq!(metrics.subagent_sessions, 1);
+    }
+
+    /// The lineage column survives a write/read round trip.
+    #[test]
+    fn parent_session_id_round_trips_through_the_log() {
+        let db = StatsDb::in_memory().unwrap();
+        let tokens = TokenRecord::default();
+        db.record_request_log(session_outcome("dsh:kid", "dsh:parent", &tokens, 250))
+            .unwrap();
+
+        let res = db
+            .query_request_logs(&RequestLogFilter {
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.items[0].session_id, "dsh:kid");
+        assert_eq!(res.items[0].parent_session_id, "dsh:parent");
+    }
+
     #[test]
     fn session_metrics_window_keeps_the_recent_turns() {
         let db = StatsDb::in_memory().unwrap();

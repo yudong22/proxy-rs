@@ -121,6 +121,7 @@ impl Drop for StreamLedger {
                 status,
                 error: self.error.as_deref(),
                 session_id: &self.session.session_id,
+                parent_session_id: &self.session.parent_session_id,
                 client: self.session.client.tag(),
                 override_key: &self.override_key,
                 override_model: &self.override_model,

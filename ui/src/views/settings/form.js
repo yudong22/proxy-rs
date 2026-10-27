@@ -178,22 +178,18 @@ export function renderSettings() {
       跨机迁移时可勾选口令加密；导入不会影响其他设置，且写入前会自动备份。
     </div>
 
-    <div class="wb-schedule-row">
-      <label class="wb-checkbox-inline">
-        <input type="checkbox" id="wb-checkin-enabled">
-        <span>每日定时打卡</span>
-      </label>
-      <input type="time" id="wb-checkin-time" class="log-input wb-time-input" value="09:00">
-      <button type="button" class="btn btn-small" id="btn-wb-schedule-save">保存定时</button>
-      <span class="wb-schedule-hint" id="wb-schedule-hint"></span>
-    </div>
-
-    <div class="wb-schedule-row">
-      <label class="wb-checkbox-inline">
-        <input type="checkbox" id="wb-growth-enabled">
-        <span>自动跑成长任务</span>
-      </label>
-      <span class="wb-schedule-hint" id="wb-growth-hint"></span>
+    <!-- Both automation switches live in one dialog. They are a single policy
+         ("what runs by itself on this machine") that used to be two inline rows
+         in different parts of the pool section, so it was easy to leave one of
+         them running by accident. The summary line is what stays in the page:
+         an automation that is currently ON must still be visible without
+         opening anything, because a silent background job is exactly what a
+         user forgets about. -->
+    <div class="wb-auto-row">
+      <button type="button" class="btn btn-small" id="btn-wb-automation">
+        ⏱ 自动化设置
+      </button>
+      <span class="wb-schedule-hint" id="wb-automation-summary"></span>
     </div>
 
     <pre id="wb-growth-progress" class="wb-growth-progress" hidden></pre>

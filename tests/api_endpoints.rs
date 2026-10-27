@@ -110,6 +110,8 @@ fn row<'a>(
         status,
         error: None,
         session_id: "claude:abc",
+        // Claude Code reports no lineage; the gateway stores an empty parent.
+        parent_session_id: "",
         client: "claude",
         override_key: "",
         override_model: "",

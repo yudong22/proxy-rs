@@ -119,6 +119,23 @@
 
 /* ── WorkBuddy schedule row ─────────────────────────────────────── */
 
+/* The page-side row that opens the automation dialog and states what is
+   currently running. `is-on` is the load-bearing part: an automation left ON is
+   invisible once its dialog is closed, and an invisible unattended job is the
+   one a user forgets is touching their accounts. */
+.wb-auto-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.wb-auto-row .wb-schedule-hint.is-on {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .wb-schedule-row {
   display: flex;
   align-items: center;

@@ -680,6 +680,7 @@ async fn reject_request(
             status,
             error: Some(&message),
             session_id: &session.session_id,
+            parent_session_id: &session.parent_session_id,
             client: session.client.tag(),
             override_key: "",
             override_model: "",
@@ -829,6 +830,7 @@ async fn finalize_request(
                     status,
                     error: Some(&message),
                     session_id: &session.session_id,
+                    parent_session_id: &session.parent_session_id,
                     client: session.client.tag(),
                     override_key: &overrides.key,
                     override_model: &overrides.model,
@@ -2091,6 +2093,7 @@ async fn non_streaming_response(
             status: 200,
             error: None,
             session_id: &session.session_id,
+            parent_session_id: &session.parent_session_id,
             client: session.client.tag(),
             // One lock for both fields: two `.lock()` temporaries in the same
             // expression would leave the first guard alive while the second
