@@ -108,6 +108,9 @@ pub async fn proxy_handler(
     request: Request,
 ) -> ProxyResult<Response> {
     let start = Instant::now();
+    // Who called, when the inbound gate is on. Empty when the gate is off, so
+    // the log format stays uniform rather than sometimes dropping the field.
+    let account = crate::client_auth::account_label(&request);
     // Resolve the session before the body is consumed by `Json`. The raw bytes
     // are parsed because the translation type deliberately drops
     // `metadata.user_id` — the only session id Claude Code sends.
@@ -130,13 +133,22 @@ pub async fn proxy_handler(
     let is_streaming = req.stream.unwrap_or(false);
 
     let incoming_headers = format_headers(&headers);
+    let account_note = account_log_field(&account);
     gui_logs
         .push(
             "INFO",
-            format!("POST /v1/messages {} headers: {}", tag, incoming_headers),
+            format!(
+                "POST /v1/messages {} headers: {}{}",
+                tag, incoming_headers, account_note
+            ),
         )
         .await;
-    tracing::info!("POST /v1/messages {} headers: {}", tag, incoming_headers);
+    tracing::info!(
+        "POST /v1/messages {} headers: {}{}",
+        tag,
+        incoming_headers,
+        account_note
+    );
 
     // The console shares this listener; a stopped service must not take it
     // offline, so answer with 503 instead of closing the port.
@@ -274,6 +286,8 @@ pub async fn responses_proxy_handler(
     request: Request,
 ) -> ProxyResult<Response> {
     let start = Instant::now();
+    // See `proxy_handler`: empty when the inbound gate is off.
+    let account = crate::client_auth::account_label(&request);
     let limit = util::max_body_bytes();
     let peeked = util::peek_json_body(request, limit).await;
     let session = resolve_session(&headers, peeked.json.as_ref());
@@ -293,13 +307,22 @@ pub async fn responses_proxy_handler(
     let is_streaming = req.stream.unwrap_or(false);
 
     let incoming_headers = format_headers(&headers);
+    let account_note = account_log_field(&account);
     gui_logs
         .push(
             "INFO",
-            format!("POST /v1/responses {} headers: {}", tag, incoming_headers),
+            format!(
+                "POST /v1/responses {} headers: {}{}",
+                tag, incoming_headers, account_note
+            ),
         )
         .await;
-    tracing::info!("POST /v1/responses {} headers: {}", tag, incoming_headers);
+    tracing::info!(
+        "POST /v1/responses {} headers: {}{}",
+        tag,
+        incoming_headers,
+        account_note
+    );
 
     if !service.is_running() {
         return Ok(service::service_unavailable_response());
@@ -432,6 +455,8 @@ pub async fn chat_completions_proxy_handler(
     request: Request,
 ) -> ProxyResult<Response> {
     let start = Instant::now();
+    // See `proxy_handler`: empty when the inbound gate is off.
+    let account = crate::client_auth::account_label(&request);
     let limit = util::max_body_bytes();
     let peeked = util::peek_json_body(request, limit).await;
     let session = resolve_session(&headers, peeked.json.as_ref());
@@ -451,19 +476,21 @@ pub async fn chat_completions_proxy_handler(
     let is_streaming = req.stream.unwrap_or(false);
 
     let incoming_headers = format_headers(&headers);
+    let account_note = account_log_field(&account);
     gui_logs
         .push(
             "INFO",
             format!(
-                "POST /v1/chat/completions {} headers: {}",
-                tag, incoming_headers
+                "POST /v1/chat/completions {} headers: {}{}",
+                tag, incoming_headers, account_note
             ),
         )
         .await;
     tracing::info!(
-        "POST /v1/chat/completions {} headers: {}",
+        "POST /v1/chat/completions {} headers: {}{}",
         tag,
-        incoming_headers
+        incoming_headers,
+        account_note
     );
 
     if !service.is_running() {
@@ -734,6 +761,20 @@ fn record_stats_row(stats: &Arc<StatsDb>, outcome: RequestOutcome<'_>) {
 /// The client dialect is detected from the headers *before* the body is
 /// consulted, so a body field can only ever confirm an identity, never relabel
 /// a request that a different client clearly sent.
+/// The ` client_account=…` suffix for a handler's INFO log line.
+///
+/// Returns an empty string when no account authenticated the request (gate off,
+/// or an exempt path), so the line keeps one shape regardless of configuration —
+/// a field that only sometimes appears is a field every log query has to special
+/// case.
+fn account_log_field(account: &str) -> String {
+    if account.is_empty() {
+        String::new()
+    } else {
+        format!(" client_account={account}")
+    }
+}
+
 fn resolve_session(headers: &HeaderMap, body: Option<&serde_json::Value>) -> SessionInfo {
     let client = session::detect_client(headers);
     let body_info = body.and_then(|b| session::detect_from_body(client, b));

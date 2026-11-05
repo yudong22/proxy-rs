@@ -36,6 +36,13 @@ struct AppContext {
     /// Upstream credential pool (WorkBuddy login states / multi-key). Rebuilt
     /// on every proxy (re)start so saved credential changes hot-apply.
     credential_pool: Arc<proxy_rs::session_pool::CredentialPool>,
+    /// **Inbound** access-key gate (`x-proxy-rs-key`).
+    ///
+    /// Deliberately not rebuilt on restart: the GUI/HTTP CRUD commands mutate it
+    /// in place and call `reload_from_store`, so a key created or disabled takes
+    /// effect on the very next request. Rebuilding it per start would also reset
+    /// the throttled `last_used_ms` bookkeeping for no benefit.
+    client_auth: Arc<proxy_rs::client_accounts::ClientAuthState>,
 }
 
 struct TrayState {
@@ -468,6 +475,10 @@ struct SaveSettingsBody {
     /// `null` keeps following the provider preset's own setting.
     #[serde(default)]
     force_stream: Option<bool>,
+    /// Inbound access-key gate. Independent of everything above: the fields
+    /// here configure *what goes upstream*, this one decides *who may call in*.
+    #[serde(default)]
+    client_auth_enabled: bool,
 }
 
 /// Resolve the stored `GuiSettings::api_key` from what the settings form posted.
@@ -519,6 +530,7 @@ async fn save_settings(
     s.launch_at_login = body.launch_at_login;
     s.sanitize_terms = body.sanitize_terms.trim().to_string();
     s.force_stream = body.force_stream;
+    s.client_auth_enabled = body.client_auth_enabled;
 
     s.save().map_err(|e| format!("保存配置失败: {}", e))?;
 
@@ -1874,6 +1886,122 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     }
 }
 
+// ── Client access accounts (inbound) ────────────────────────────────────────
+//
+// The GUI half of the same store the HTTP admin routes manage. Both go through
+// `proxy_rs::client_accounts` and both reload the live state, so a change made
+// in one front-end applies to the other without a restart.
+
+/// One account, rendered for the list. Never carries `key_hash`.
+fn client_account_json(a: &proxy_rs::client_accounts::ClientAccount) -> Value {
+    json!({
+        "id": a.id,
+        "label": a.label,
+        "key_prefix": a.key_prefix,
+        "enabled": a.enabled,
+        "created_at_ms": a.created_at_ms,
+        "last_used_ms": a.last_used_ms,
+        "note": a.note,
+    })
+}
+
+#[tauri::command]
+async fn client_accounts_list(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    let accounts = ctx.client_auth.snapshot().await;
+    let list: Vec<Value> = accounts.iter().map(client_account_json).collect();
+    Ok(json!({
+        "accounts": list,
+        "total": list.len(),
+        // The switch's *effective* value: it may have been forced by
+        // `PROXY_CLIENT_AUTH`, in which case the GUI checkbox must show the
+        // truth, not the stored preference it cannot override.
+        "enabled": ctx.client_auth.is_enabled(),
+    }))
+}
+
+/// Create an account. The response is the **only** place the plaintext key ever
+/// appears on the GUI path — the store keeps a hash, so it cannot be re-read.
+#[tauri::command]
+async fn client_account_create(
+    ctx: State<'_, Arc<AppContext>>,
+    label: String,
+    note: Option<String>,
+) -> Result<Value, String> {
+    let note = note.unwrap_or_default();
+    let (account, key) = tokio::task::spawn_blocking(move || {
+        proxy_rs::client_accounts::create_account(&label, &note)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    ctx.client_auth.reload_from_store().await;
+    ctx.logs
+        .push(
+            "INFO",
+            format!("已创建访问账户 {} ({})", account.label, account.id),
+        )
+        .await;
+    Ok(json!({
+        "id": account.id,
+        "label": account.label,
+        "key_prefix": account.key_prefix,
+        "api_key": key,
+        "header": proxy_rs::client_accounts::KEY_HEADER,
+    }))
+}
+
+#[tauri::command]
+async fn client_account_toggle(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    let id_for_log = id.clone();
+    let ok =
+        tokio::task::spawn_blocking(move || proxy_rs::client_accounts::set_enabled(&id, enabled))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+    if !ok {
+        return Err(format!("访问账户 {id_for_log} 不存在"));
+    }
+    // Reload is what makes the change apply to the next request rather than the
+    // next restart — the whole point of holding the accounts in memory.
+    ctx.client_auth.reload_from_store().await;
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "访问账户 {} 已{}",
+                id_for_log,
+                if enabled { "启用" } else { "禁用" }
+            ),
+        )
+        .await;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+async fn client_account_delete(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<Value, String> {
+    let id_for_log = id.clone();
+    let ok = tokio::task::spawn_blocking(move || proxy_rs::client_accounts::delete_account(&id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    if !ok {
+        return Err(format!("访问账户 {id_for_log} 不存在"));
+    }
+    ctx.client_auth.reload_from_store().await;
+    ctx.logs
+        .push("INFO", format!("已删除访问账户 {id_for_log}"))
+        .await;
+    Ok(json!({ "ok": true }))
+}
+
 // ── Account-pool import / export ───────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -2184,6 +2312,7 @@ fn run_proxy_server(
             ctx.stats.clone(),
             metrics_handle,
             ctx.credential_pool.clone(),
+            ctx.client_auth.clone(),
         );
 
         let bind_addr = config_arc.bind.clone();
@@ -2312,6 +2441,10 @@ fn main() {
     // Deferred until the single-instance guard has accepted this process; see
     // the `.setup()` closure. Captured here because `settings` moves into `ctx`.
     let wants_launch_at_login = settings.launch_at_login;
+    // Resolved before `settings` moves into `ctx`, and run through the same
+    // env-aware helper the proxy config uses, so `PROXY_CLIENT_AUTH=true` in
+    // `.env` wins over the GUI switch (a headless server has no GUI to click).
+    let client_auth_enabled = proxy_rs::client_accounts::enabled_from(settings.client_auth_enabled);
 
     let client = reqwest::Client::builder()
         // Idle (read) timeout rather than a total one: a total timeout hard-kills
@@ -2348,6 +2481,9 @@ fn main() {
         // default (the pool picks the first usable entry).
         credential_pool: Arc::new(proxy_rs::session_pool::CredentialPool::new(
             proxy_rs::workbuddy_auth::ordered_credentials(),
+        )),
+        client_auth: Arc::new(proxy_rs::client_accounts::ClientAuthState::new(
+            client_auth_enabled,
         )),
     });
 
@@ -2580,6 +2716,10 @@ fn main() {
             api_keys_add,
             api_keys_delete,
             api_keys_toggle,
+            client_accounts_list,
+            client_account_create,
+            client_account_toggle,
+            client_account_delete,
             api_keys_set_default,
             pool_export,
             pool_import_preview,

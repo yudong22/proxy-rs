@@ -280,6 +280,258 @@ pub async fn scheduler_run_handler(
     }
 }
 
+// ── Client access accounts (admin, token-gated) ─────────────────────────────
+//
+// The one part of `/api` that is **not** in the "reads are safe to expose"
+// bucket alongside the observation routes. These routes can create a credential
+// that unlocks the whole `/v1/*` data plane, so every one of them goes through
+// `crate::api_token::authorize` exactly like `POST /api/scheduler/run/*` does:
+// a bearer token from `PROXY_API_TOKEN`, and any request carrying a browser
+// `Origin` is refused outright.
+//
+// The list route masks key material; the create route is the only place a
+// plaintext key is ever returned, and only once.
+
+/// Run the shared token gate, returning the error response when it fails.
+///
+/// Factored out so all four routes cannot drift into slightly different
+/// policies — the failure that matters here is a *new* route forgetting the
+/// check, and one shared entry point makes that omission impossible.
+fn require_admin(headers: &axum::http::HeaderMap) -> Result<(), Box<Response>> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .map(|v| v.to_str().unwrap_or(""));
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .map(|v| v.to_str().unwrap_or(""));
+
+    if let Err(failure) = crate::api_token::authorize(origin, authorization) {
+        let (status, detail) = match failure {
+            crate::api_token::AuthFailure::NotConfigured => (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "访问账户管理未启用：请在 ~/.proxy-rs/.env 或进程环境中设置 {} 后重启网关",
+                    crate::api_token::TOKEN_ENV
+                ),
+            ),
+            crate::api_token::AuthFailure::BrowserOrigin => (
+                StatusCode::FORBIDDEN,
+                "拒绝来自浏览器的调用：该接口只接受本机进程（curl / 脚本）的请求".to_string(),
+            ),
+            crate::api_token::AuthFailure::BadToken => (
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "缺少或错误的 Authorization: Bearer 令牌（见 {}）",
+                    crate::api_token::TOKEN_ENV
+                ),
+            ),
+        };
+        // Boxed because `Response` is large (128+ bytes) and this is the cold
+        // path; clippy's `result_large_err` is right that returning it inline
+        // would bloat every `Result` on the hot path.
+        return Err(Box::new(typed_error_response(
+            status,
+            failure.slug(),
+            detail,
+        )));
+    }
+    Ok(())
+}
+
+/// One account as the API renders it — **never** the hash.
+///
+/// The hash is not a usable key, but it is credential material and there is no
+/// reason for a list response to carry it. `key_prefix` is enough to tell rows
+/// apart.
+fn account_json(account: &crate::client_accounts::ClientAccount, now_ms: i64) -> Value {
+    json!({
+        "id": account.id,
+        "label": account.label,
+        "key_prefix": account.key_prefix,
+        "enabled": account.enabled,
+        "created_at_ms": account.created_at_ms,
+        "last_used_ms": account.last_used_ms,
+        "note": account.note,
+        "created_days_ago": ((now_ms - account.created_at_ms).max(0)) / 86_400_000,
+    })
+}
+
+/// `GET /api/admin/client-accounts`
+pub async fn client_accounts_list_handler(
+    headers: axum::http::HeaderMap,
+    Extension(state): Extension<Arc<crate::client_accounts::ClientAuthState>>,
+) -> Response {
+    if let Err(response) = require_admin(&headers) {
+        return *response;
+    }
+    let now = crate::util::unix_millis();
+    let accounts = state.snapshot().await;
+    let items: Vec<Value> = accounts.iter().map(|a| account_json(a, now)).collect();
+    json_response(json!({
+        "enabled": state.is_enabled(),
+        "accounts": items,
+        "total": items.len(),
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateAccountBody {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// `POST /api/admin/client-accounts` — the only response that carries the key.
+pub async fn client_accounts_create_handler(
+    headers: axum::http::HeaderMap,
+    Extension(state): Extension<Arc<crate::client_accounts::ClientAuthState>>,
+    Json(body): Json<CreateAccountBody>,
+) -> Response {
+    if let Err(response) = require_admin(&headers) {
+        return *response;
+    }
+    let result = tokio::task::spawn_blocking({
+        let label = body.label.clone();
+        let note = body.note.clone();
+        move || crate::client_accounts::create_account(&label, &note)
+    })
+    .await;
+
+    match result {
+        Ok(Ok((account, key))) => {
+            state.reload_from_store().await;
+            json_response(json!({
+                "account": account_json(&account, crate::util::unix_millis()),
+                // The one and only time this value exists. It is not stored, so
+                // it cannot be fetched again — only revoked and reissued.
+                "api_key": key,
+                "header": crate::client_accounts::KEY_HEADER,
+            }))
+        }
+        Ok(Err(e)) => typed_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "create_failed",
+            e.to_string(),
+        ),
+        Err(e) => typed_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "create_failed",
+            format!("任务异常终止: {e}"),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct UpdateAccountBody {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// `PATCH /api/admin/client-accounts/{id}`
+pub async fn client_accounts_update_handler(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    Extension(state): Extension<Arc<crate::client_accounts::ClientAuthState>>,
+    Json(body): Json<UpdateAccountBody>,
+) -> Response {
+    if let Err(response) = require_admin(&headers) {
+        return *response;
+    }
+
+    // Read-modify-write through the store rather than patching the in-memory
+    // copy, so the file stays the source of truth and a concurrent GUI edit is
+    // not silently overwritten by a stale snapshot.
+    let outcome = tokio::task::spawn_blocking({
+        let id = id.clone();
+        let label = body.label.clone();
+        let note = body.note.clone();
+        let enabled = body.enabled;
+        move || -> anyhow::Result<bool> {
+            let mut accounts = crate::client_accounts::load_accounts();
+            let Some(slot) = accounts.iter_mut().find(|a| a.id == id) else {
+                return Ok(false);
+            };
+            if let Some(label) = label {
+                slot.label = label.trim().to_string();
+            }
+            if let Some(note) = note {
+                slot.note = note.trim().to_string();
+            }
+            if let Some(enabled) = enabled {
+                slot.enabled = enabled;
+            }
+            crate::client_accounts::save_accounts(&accounts)?;
+            Ok(true)
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(true)) => {
+            state.reload_from_store().await;
+            json_response(json!({ "ok": true }))
+        }
+        Ok(Ok(false)) => typed_error_response(
+            StatusCode::NOT_FOUND,
+            "unknown_account",
+            format!("访问账户 {id} 不存在"),
+        ),
+        Ok(Err(e)) => typed_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "update_failed",
+            e.to_string(),
+        ),
+        Err(e) => typed_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "update_failed",
+            format!("任务异常终止: {e}"),
+        ),
+    }
+}
+
+/// `DELETE /api/admin/client-accounts/{id}`
+pub async fn client_accounts_delete_handler(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    Extension(state): Extension<Arc<crate::client_accounts::ClientAuthState>>,
+) -> Response {
+    if let Err(response) = require_admin(&headers) {
+        return *response;
+    }
+    let outcome = tokio::task::spawn_blocking({
+        let id = id.clone();
+        move || crate::client_accounts::delete_account(&id)
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(true)) => {
+            state.reload_from_store().await;
+            json_response(json!({ "ok": true }))
+        }
+        Ok(Ok(false)) => typed_error_response(
+            StatusCode::NOT_FOUND,
+            "unknown_account",
+            format!("访问账户 {id} 不存在"),
+        ),
+        Ok(Err(e)) => typed_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delete_failed",
+            e.to_string(),
+        ),
+        Err(e) => typed_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delete_failed",
+            format!("任务异常终止: {e}"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

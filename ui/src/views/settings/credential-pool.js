@@ -730,37 +730,6 @@ export function initCredentialPool() {
     }
   });
 
-  $('#btn-wb-schedule-save')?.addEventListener('click', async () => {
-    const enabled = Boolean($('#wb-checkin-enabled')?.checked);
-    const time = $('#wb-checkin-time')?.value || '09:00';
-    const growth = Boolean($('#wb-growth-enabled')?.checked);
-    const btn = $('#btn-wb-schedule-save');
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '保存中...';
-    }
-    try {
-      const res = await invoke('wb_set_schedule', { enabled, time, growthEnabled: growth });
-      const hint = $('#wb-schedule-hint');
-      if (hint) {
-        hint.textContent = res.daily_checkin_enabled
-          ? `已开启：每天 ${res.daily_checkin_time} 自动打卡（应用启动时若当天未打卡会立即补打卡）`
-          : '已关闭定时打卡';
-      }
-      toast(
-        res.daily_checkin_enabled ? `已开启每日 ${res.daily_checkin_time} 定时打卡` : '已关闭定时打卡',
-        'ok',
-      );
-    } catch (e) {
-      showWbStatus('保存定时打卡失败: ' + e, true);
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = '保存定时';
-      }
-    }
-  });
-
   // Key pool: visibility toggle mirrors the provider API-key field.
   $('#btn-wb-key-visibility')?.addEventListener('click', () => {
     const input = $('#wb-new-key');

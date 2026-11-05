@@ -236,6 +236,17 @@ impl StoreState {
 }
 
 /// Inspect one store file without changing it.
+///
+/// `pub(crate)` because `client_accounts.rs` describes its own file through the
+/// same rule: the export path iterates one health list, and a second copy of
+/// this logic would let "corrupt" mean two different things in two places.
+pub(crate) fn inspect_store_for<T: serde::de::DeserializeOwned>(
+    path: std::path::PathBuf,
+) -> StoreState {
+    inspect_store::<T>(path)
+}
+
+/// Inspect one store file without changing it.
 fn inspect_store<T: serde::de::DeserializeOwned>(path: std::path::PathBuf) -> StoreState {
     match std::fs::read_to_string(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => StoreState::Missing,

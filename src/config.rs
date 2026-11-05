@@ -156,6 +156,13 @@ pub struct Config {
     /// Whether a 429/402/quota-code/failed-refresh exception may relocate a
     /// session onto another credential. Default true.
     pub session_switch_enabled: bool,
+    /// Whether `/v1/*` requires an inbound access key (`x-proxy-rs-key`).
+    ///
+    /// Independent of [`Config::passthrough_api_key`] and of the credential
+    /// pool: those decide which credential goes **upstream**, this decides who
+    /// may call the gateway **at all**. They coexist, which is why the two use
+    /// different headers — see `client_accounts::KEY_HEADER`.
+    pub client_auth_enabled: bool,
 }
 
 impl Default for Config {
@@ -179,6 +186,7 @@ impl Default for Config {
             force_stream_upstream: false,
             credential_pool_enabled: false,
             session_switch_enabled: true,
+            client_auth_enabled: false,
         }
     }
 }
@@ -324,6 +332,12 @@ impl Config {
         if let Some(raw) = non_empty_env("PROXY_SESSION_SWITCH") {
             self.session_switch_enabled = raw == "1" || raw.eq_ignore_ascii_case("true");
         }
+        // Inbound access-key gate. Deliberately *not* mutually exclusive with
+        // `passthrough_api_key`: passthrough decides which credential travels
+        // upstream (on `x-api-key`), this decides who may call the gateway (on
+        // `x-proxy-rs-key`). The two headers are independent, so a deployment
+        // may legitimately want both — see `client_accounts::KEY_HEADER`.
+        self.client_auth_enabled = crate::client_accounts::enabled_from(self.client_auth_enabled);
 
         // Passthrough extracts the key per request, so a static key contradicts it.
         if self.passthrough_api_key && self.api_key.is_some() {

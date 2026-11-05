@@ -1,6 +1,8 @@
 pub mod api;
 pub mod api_token;
 pub mod claude_config;
+pub mod client_accounts;
+pub mod client_auth;
 pub mod codex_config;
 pub mod config;
 pub mod credits;

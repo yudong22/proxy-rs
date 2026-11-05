@@ -8,6 +8,7 @@
 import { $, html, setText } from '../../core/dom.js';
 import { invoke } from '../../core/ipc.js';
 import { captureBaseline, refreshSectionBadges } from './badges.js';
+import { renderClientAccounts } from './client-accounts.js';
 
 /** Populate the provider dropdown from the backend's built-in presets. */
 export async function loadProviders() {
@@ -46,6 +47,11 @@ export async function loadSettings() {
     // Reflect the user's persisted intent; whether the job is actually live is
     // reported separately by get_status as `launch_at_login_stale`.
     $('#setting-launch-at-login').checked = Boolean(s.launch_at_login);
+
+    // Inbound authentication switch. Absent from an older backend's payload, so
+    // it reads as off rather than leaving a stale checked state on screen.
+    $('#client-auth-enabled').checked = Boolean(s.client_auth_enabled);
+
     await applyDevGuards();
 
     // A null switch means "follow the provider preset": show the effective
@@ -59,6 +65,10 @@ export async function loadSettings() {
     );
 
     await loadClaudeConfig();
+    // The access-account list is server state, not form state: it is fetched
+    // rather than read off the settings payload, and it is independent of the
+    // badge baseline below.
+    await renderClientAccounts();
     // Everything loaded: this is the state the badges measure against.
     captureBaseline();
     refreshSectionBadges();

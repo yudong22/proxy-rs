@@ -23,6 +23,7 @@ use crate::util;
 use crate::Config;
 use axum::{
     extract::DefaultBodyLimit,
+    middleware,
     routing::{get, post},
     Extension, Router,
 };
@@ -35,6 +36,7 @@ use tower_http::trace::TraceLayer;
 ///
 /// `metrics_handle` is the handle returned by [`metrics::install`]; the
 /// `/metrics` route clones it per request.
+#[allow(clippy::too_many_arguments)]
 pub fn build_app_router(
     service_ctrl: Arc<ServiceController>,
     logs: Arc<LogBuffer>,
@@ -43,6 +45,7 @@ pub fn build_app_router(
     stats: Arc<StatsDb>,
     metrics_handle: metrics::PrometheusHandle,
     pool: crate::session_pool::SharedCredentialPool,
+    client_auth: Arc<crate::client_accounts::ClientAuthState>,
 ) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -85,6 +88,21 @@ pub fn build_app_router(
         // client pointed at the proxy cannot observe that they exist. The POST is
         // token-gated and origin-checked inside the handler — see `api_token`.
         .route("/api/scheduler", get(api::scheduler_handler))
+        // Client-access-account admin. Token-gated inside each handler (same
+        // `PROXY_API_TOKEN` as the scheduler trigger below), which is why the
+        // inbound gate above leaves all `/api/*` open: these routes carry their
+        // own, stronger check.
+        .route(
+            "/api/admin/client-accounts",
+            get(api::client_accounts_list_handler).post(api::client_accounts_create_handler),
+        )
+        .route(
+            // Axum 0.7 uses `:param`, not `{param}` — see the note on the
+            // scheduler route below.
+            "/api/admin/client-accounts/:id",
+            axum::routing::patch(api::client_accounts_update_handler)
+                .delete(api::client_accounts_delete_handler),
+        )
         .route(
             // Axum 0.7 path-parameter syntax is `:name` — braces became the
             // syntax only in 0.8. With braces this route registrations still
@@ -109,6 +127,15 @@ pub fn build_app_router(
         .layer(Extension(client))
         .layer(Extension(stats))
         .layer(Extension(pool))
+        .layer(Extension(client_auth.clone()))
+        // Inbound access-key gate. `.route_layer` keeps it off the fallback and
+        // out of the way of 404s; `TraceLayer`/`cors` sit *outside* it so a 401
+        // still carries CORS headers and reaches the browser as a readable
+        // error rather than an opaque network failure.
+        .route_layer(middleware::from_fn_with_state(
+            client_auth,
+            crate::client_auth::guard,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
 }

@@ -104,6 +104,7 @@ async fn router_against(upstream_base: &str) -> axum::Router {
         StatsDb::in_memory().expect("in-memory sqlite"),
         metrics::install(),
         Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        Arc::new(proxy_rs::client_accounts::ClientAuthState::disabled()),
     )
 }
 

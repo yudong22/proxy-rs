@@ -58,6 +58,7 @@ fn router() -> (axum::Router, Arc<LogBuffer>, Arc<StatsDb>) {
         stats.clone(),
         metrics::install(),
         std::sync::Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        Arc::new(proxy_rs::client_accounts::ClientAuthState::disabled()),
     );
     (app, logs, stats)
 }

@@ -198,9 +198,40 @@ export function renderSettings() {
     <div class="hint" id="wb-status"></div>
   `, { collapsible: false });
 
+  // 访问账户 (client access accounts).
+  //
+  // Deliberately its own section, placed immediately after 身份池 and stated as
+  // the opposite direction. Both are "lists of secrets", so the risk is real:
+  // 身份池 holds the credentials the gateway presents *to* the upstream, while
+  // these are the keys callers must present *to* the gateway. Merging them into
+  // one list would invite exactly the mistake of pasting an inbound key where an
+  // upstream key belongs (or the reverse), so the two never share a store, a
+  // command or a panel.
+  const clientAccounts = section('client-accounts', '访问账户 (客户端接入)', html`
+    <p class="wb-transfer-hint">
+      这是<b>入站</b>凭据（别人访问你的网关要用它），与上面的<b>上游</b>身份池方向相反，互不影响。
+      上游身份池决定网关拿什么身份去请求模型；这里决定谁可以调用你的网关。
+    </p>
+
+    ${raw(toggle(
+      'client-auth-enabled',
+      '启用入站鉴权',
+      '开启后，调用方必须带上 x-proxy-rs-key 请求头才能访问 /v1/*；关闭时所有调用方都可直接访问',
+    ))}
+
+    <div class="wb-pool-toolbar">
+      <button type="button" class="btn btn-small btn-primary" id="btn-client-account-add">
+        ＋ 添加访问账户
+      </button>
+    </div>
+
+    <div id="client-account-list" class="wb-credential-list"></div>
+  `);
+
   root.innerHTML = html`
     <form id="settings-form" class="settings-form">
       ${raw(identityPool)}
+      ${raw(clientAccounts)}
       ${raw(provider)}
       ${raw(claude)}
       ${raw(codex)}

@@ -1,6 +1,6 @@
 [package]
 name = "proxy-rs"
-version = "2.4.1"
+version = "3.0.0"
 edition = "2021"
 authors = [
     "yudong22 (孙东) <3cking@163.com>",
@@ -75,6 +75,14 @@ qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 argon2 = "0.5"
 aes-gcm = "0.10"
 base64 = "0.22"
+
+# SHA-256 for the client-access-key store (`src/client_accounts.rs`).
+#
+# Only the *hash* of an inbound key is persisted, so a leaked state file cannot
+# be replayed against the gateway. sha2 is already in the tree (argon2/aes-gcm
+# pull it in), so declaring it adds no new dependency graph — but a direct use
+# still has to be declared to be legal.
+sha2 = "0.10"
 
 [profile.release]
 opt-level = "z"        # Optimize for size

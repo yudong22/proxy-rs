@@ -29,6 +29,10 @@ export async function saveSettings() {
     launch_at_login: $('#setting-launch-at-login').checked,
     sanitize_terms: $('#setting-sanitize-terms').value,
     force_stream: $('#setting-force-stream').checked,
+    // Inbound authentication is a stored setting like any other, so it rides
+    // along with the same save. It is *not* a per-account fact — the accounts
+    // themselves are managed by their own commands and are untouched here.
+    client_auth_enabled: $('#client-auth-enabled').checked,
   };
 
   try {

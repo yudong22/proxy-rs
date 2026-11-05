@@ -68,6 +68,13 @@ const SENSITIVE_HEADERS: &[&str] = &[
     "anthropic-api-key",
     "x-anthropic-api-key",
     "x-api-token",
+    // The gateway's own inbound access key (`client_accounts::KEY_HEADER`).
+    // Its name contains none of the `SENSITIVE_NAME_FRAGMENTS` below, so without
+    // this entry a request that carries it would be logged in full. The
+    // middleware strips the header before the handler runs, but a request
+    // refused *by* that middleware never reaches the handler, and the debug
+    // branches log the raw header map — both paths must redact.
+    "x-proxy-rs-key",
 ];
 
 /// Substrings that mark a header as credential-bearing even when the exact name
@@ -362,11 +369,18 @@ fn system_utc_offset_secs() -> Option<i64> {
     let secs = now_secs()?;
     let mut local: libc::tm = unsafe { std::mem::zeroed() };
     let mut utc: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both are valid `libc::tm` out-params, as above.
-    if unsafe { libc::localtime_r(&(secs as libc::time_t), &mut local) }.is_null() {
+    // SAFETY: both are valid `libc::tm` out-params.
+    //
+    // These are the MSVC `_s` variants, not the POSIX `*_r` ones: Windows has
+    // no `localtime_r`/`gmtime_r` at all (libc exposes only `localtime_s` /
+    // `gmtime_s` there). The two differ in more than the name — the `_s` forms
+    // take the out-param **first** and return an `errno_t` (0 == success)
+    // instead of a pointer that is NULL on failure. A rename alone would
+    // therefore still be wrong, so the call shape changes with it.
+    if unsafe { libc::localtime_s(&mut local, &(secs as libc::time_t)) } != 0 {
         return None;
     }
-    if unsafe { libc::gmtime_r(&(secs as libc::time_t), &mut utc) }.is_null() {
+    if unsafe { libc::gmtime_s(&mut utc, &(secs as libc::time_t)) } != 0 {
         return None;
     }
 

@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-rs"
-version = "2.4.1"
+version = "3.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3158,6 +3158,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.17",
  "tokio",
  "tokio-util",
@@ -3168,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-rs-gui"
-version = "2.4.1"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "axum",

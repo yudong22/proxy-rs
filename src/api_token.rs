@@ -117,7 +117,7 @@ fn bearer_value(value: &str) -> Option<&str> {
 /// because equal-length inputs are the only ones that can match; that early
 /// return leaks the token length, which is not a secret in any meaningful sense
 /// (it is visible in whatever configures it).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

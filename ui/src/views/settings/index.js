@@ -19,6 +19,7 @@ import {
 } from './save.js';
 import { refreshSectionBadges } from './badges.js';
 import { initCredentialPool } from './credential-pool.js';
+import { initClientAccounts } from './client-accounts.js';
 import { initPoolTransfer } from './pool-transfer.js';
 import { applyDshConfig, loadDshConfig } from './dsh.js';
 
@@ -42,6 +43,10 @@ export function initSettings() {
   form?.addEventListener('change', refreshSectionBadges);
 
   initCredentialPool();
+  // Inbound access accounts are a separate list with their own commands; they
+  // never touch the identity pool, so they get their own init rather than being
+  // folded into initCredentialPool.
+  initClientAccounts();
   // Import/export lives in its own module: it is a distinct workflow (a modal
   // either way), and folding it into credential-pool.js would grow that file
   // past the point where its list rendering is readable.

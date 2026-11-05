@@ -13,6 +13,11 @@ env:
 jobs:
   build-tauri:
     strategy:
+      # One unrunnable leg blocks the whole release: `release` needs this matrix
+      # to finish, so anything that never gets a runner (a deprecated pool, a
+      # starved label) holds every artifact hostage. Keep every entry to a pool
+      # that actually provisions.
+      fail-fast: false
       matrix:
         include:
           # Apple Silicon only. The Intel leg (`macos-13`,
@@ -24,6 +29,30 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: macos-aarch64
+            # `-b app` (the macOS `.app` bundle) is what npm's build script
+            # does; the dmg adds the installer around it.
+            build_args: -b dmg
+            artifact_glob: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+
+          # Windows desktop build. Two things differ from the macOS leg and
+          # both are load-bearing:
+          #
+          #   1. `-b app` is a macOS-only bundle target. On Windows Tauri
+          #      produces `msi` (WiX) and/or `nsis` executables instead, so the
+          #      bundle kinds are named explicitly here rather than relying on
+          #      `bundle.targets` in tauri.conf.json — that file currently lists
+          #      `["app"]`, which is meaningless for this leg and would make the
+          #      build emit nothing.
+          #   2. The target triple must be passed explicitly; `windows-latest`
+          #      is x86_64 so the default would work, but pinning it keeps the
+          #      artifact path below correct even if the runner image changes.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: windows-x64
+            build_args: --bundles msi,nsis
+            artifact_glob: |
+              target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+              target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -46,13 +75,21 @@ jobs:
       - name: Install Tauri CLI
         run: npm ci
 
+      # Both legs go through the same invocation: the Tauri CLI is invoked
+      # directly (not through npm's `build`/`build:dmg` scripts) because those
+      # bake in `-b app`, which only macOS understands. `--bundles` is passed
+      # explicitly on both legs so neither depends on `tauri.conf.json`.
       - name: Build desktop app and installer
-        run: npm run build:dmg -- --target ${{ matrix.target }}
+        run: npx tauri build --target ${{ matrix.target }} ${{ matrix.build_args }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          # A glob that matches nothing fails the upload, which is what we want:
+          # a leg that "succeeded" while producing no installer is a broken
+          # release, not a warning.
+          if-no-files-found: error
+          path: ${{ matrix.artifact_glob }}
 
   release:
     needs: [build-tauri]
@@ -65,6 +102,12 @@ jobs:
         with:
           merge-multiple: true
           path: artifacts
+
+      - name: List artifacts
+        # Printed before the upload so a missing platform is visible in the log
+        # of the run that created the release, not discovered by a user who
+        # downloaded it.
+        run: ls -laR artifacts
 
       - name: Create release
         env:

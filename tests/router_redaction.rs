@@ -60,6 +60,7 @@ fn test_router(logs: Arc<LogBuffer>) -> axum::Router {
         StatsDb::in_memory().expect("in-memory sqlite"),
         handle,
         std::sync::Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        Arc::new(proxy_rs::client_accounts::ClientAuthState::disabled()),
     )
 }
 

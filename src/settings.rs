@@ -147,6 +147,17 @@ pub struct GuiSettings {
     /// as a stream and a non-streaming client still gets one JSON body.
     #[serde(default)]
     pub force_stream: Option<bool>,
+    /// Whether `/v1/*` requires an inbound access key (`x-proxy-rs-key`).
+    ///
+    /// Off by default, and that default is load-bearing: an upgrade that
+    /// silently started demanding a key would break every existing CLI config
+    /// at once. A headless server deployment turns it on explicitly via
+    /// `PROXY_CLIENT_AUTH=true` (see `client_accounts::enabled_from`).
+    ///
+    /// Note this is *not* the upstream key (`api_key` above) and not the
+    /// identity pool: those are outbound credentials and stay untouched.
+    #[serde(default)]
+    pub client_auth_enabled: bool,
 }
 
 impl Default for GuiSettings {
@@ -163,6 +174,7 @@ impl Default for GuiSettings {
             launch_at_login: false,
             sanitize_terms: String::new(),
             force_stream: None,
+            client_auth_enabled: false,
         }
     }
 }

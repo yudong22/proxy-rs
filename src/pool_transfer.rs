@@ -58,7 +58,7 @@ pub const BUNDLE_FORMAT: &str = "proxy-rs-pool";
 /// Transfer-format version, deliberately independent of the app version: the
 /// bundle layout changes far less often than the app, and a version that moved
 /// with the release number would make every upgrade look incompatible.
-pub const BUNDLE_VERSION: u32 = 1;
+pub const BUNDLE_VERSION: u32 = 2;
 
 /// Import ceiling. The pools are kilobytes at any realistic size, so anything
 /// larger is a mistake or a hostile input, and refusing early keeps a stray
@@ -133,6 +133,18 @@ struct BundlePayload {
     credentials: Vec<WorkBuddyCredential>,
     #[serde(default)]
     api_keys: Vec<ApiKeyEntry>,
+    /// **Inbound** gateway accounts (`client_accounts.rs`).
+    ///
+    /// Carried in the same file as the outbound identity pool because the user
+    /// is moving "my gateway" to another machine, and a gateway that arrives
+    /// without its client keys would lock its own users out. The two remain
+    /// separate lists — they are opposite directions and never merge.
+    ///
+    /// Only the *hash* travels, so even a plain bundle carries no replayable
+    /// key; the client's configured key keeps working on the target machine
+    /// because verification compares hashes.
+    #[serde(default)]
+    client_accounts: Vec<crate::client_accounts::ClientAccount>,
 }
 
 /// Plaintext counts, kept outside the ciphertext so an encrypted bundle can be
@@ -141,6 +153,9 @@ struct BundlePayload {
 pub struct BundleCounts {
     pub credentials: usize,
     pub api_keys: usize,
+    /// Defaulted so a v1 envelope (which has no such field) still deserializes.
+    #[serde(default)]
+    pub client_accounts: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +197,8 @@ struct BundleFile {
     credentials: Vec<WorkBuddyCredential>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     api_keys: Vec<ApiKeyEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    client_accounts: Vec<crate::client_accounts::ClientAccount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kdf: Option<KdfParams>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,7 +231,9 @@ pub struct ExportOutcome {
 impl ExportOutcome {
     /// Whether the bundle carries no identity at all.
     pub fn is_empty(&self) -> bool {
-        self.counts.credentials == 0 && self.counts.api_keys == 0
+        self.counts.credentials == 0
+            && self.counts.api_keys == 0
+            && self.counts.client_accounts == 0
     }
 }
 
@@ -236,6 +255,17 @@ pub struct ImportPreview {
     pub keys_updated: usize,
     pub keys_unchanged: usize,
     pub keys_removed: usize,
+    /// Inbound gateway accounts in the bundle / affected by this import.
+    #[serde(default)]
+    pub client_accounts_total: usize,
+    #[serde(default)]
+    pub client_accounts_added: usize,
+    #[serde(default)]
+    pub client_accounts_updated: usize,
+    #[serde(default)]
+    pub client_accounts_unchanged: usize,
+    #[serde(default)]
+    pub client_accounts_removed: usize,
     /// The default identity that will be in force after the import, or empty
     /// for "no explicit default (first usable wins)".
     pub default_identity_applied: String,
@@ -252,6 +282,7 @@ pub struct ImportPreview {
 struct PlannedState {
     credentials: Vec<WorkBuddyCredential>,
     api_keys: Vec<ApiKeyEntry>,
+    client_accounts: Vec<crate::client_accounts::ClientAccount>,
     prefs: PoolPreferences,
     /// Explicit legacy pointers (`default_credential_id` / `default_key_id`).
     /// Cleared on replace so a stale pointer cannot survive its target.
@@ -310,9 +341,23 @@ fn collect_payload() -> (BundlePayload, Vec<String>) {
         .map(normalize_credential)
         .collect();
     let api_keys = workbuddy_auth::load_api_keys();
+    let client_accounts = crate::client_accounts::load_accounts();
     let prefs = workbuddy_auth::load_preferences();
 
-    if credentials.is_empty() && api_keys.is_empty() && warnings.is_empty() {
+    if let crate::workbuddy_auth::StoreState::Corrupt(detail) =
+        crate::client_accounts::store_health()
+    {
+        warnings.push(format!(
+            "访问账户文件已损坏，本次导出会缺少客户端访问密钥（{detail}）。修复或删除该文件后重试：{}",
+            crate::client_accounts::accounts_path().display()
+        ));
+    }
+
+    if credentials.is_empty()
+        && api_keys.is_empty()
+        && client_accounts.is_empty()
+        && warnings.is_empty()
+    {
         warnings.push("本机身份池为空，导出的文件不包含任何账号或密钥".to_string());
     }
 
@@ -324,6 +369,7 @@ fn collect_payload() -> (BundlePayload, Vec<String>) {
         },
         credentials,
         api_keys,
+        client_accounts,
     };
     (payload, warnings)
 }
@@ -351,6 +397,7 @@ pub fn export_text(opts: &ExportOptions) -> Result<(String, ExportOutcome)> {
     let counts = BundleCounts {
         credentials: payload.credentials.len(),
         api_keys: payload.api_keys.len(),
+        client_accounts: payload.client_accounts.len(),
     };
     let checksum = payload_checksum(&payload)?;
     let passphrase = opts
@@ -370,6 +417,7 @@ pub fn export_text(opts: &ExportOptions) -> Result<(String, ExportOutcome)> {
         preferences: Some(payload.preferences.clone()),
         credentials: payload.credentials.clone(),
         api_keys: payload.api_keys.clone(),
+        client_accounts: payload.client_accounts.clone(),
         kdf: None,
         cipher: None,
     };
@@ -382,6 +430,11 @@ pub fn export_text(opts: &ExportOptions) -> Result<(String, ExportOutcome)> {
         bundle.preferences = None;
         bundle.credentials = Vec::new();
         bundle.api_keys = Vec::new();
+        // Same rule as the two above: nothing secret may survive in the
+        // envelope. The account hashes are not usable keys, but they are still
+        // credential-derived material and the envelope's contract is "counts
+        // and KDF parameters only".
+        bundle.client_accounts = Vec::new();
         bundle.kdf = Some(kdf);
         bundle.cipher = Some(cipher);
     }
@@ -611,6 +664,7 @@ fn decode(text: &str, passphrase: Option<&str>) -> Result<Decoded> {
                 preferences: bundle.preferences.clone().unwrap_or_default(),
                 credentials: bundle.credentials.clone(),
                 api_keys: bundle.api_keys.clone(),
+                client_accounts: bundle.client_accounts.clone(),
             },
             false,
         ),
@@ -698,6 +752,25 @@ fn reconcile_ids(payload: &mut BundlePayload, warnings: &mut Vec<String>) {
             k.id = expected;
         }
     }
+    // Gateway accounts: the id must be `ca-<first 6 hex of key_hash>`. This can
+    // be checked without any plaintext — which is the whole reason the id is
+    // derived from the hash rather than the key.
+    for account in payload.client_accounts.iter_mut() {
+        let expected = crate::client_accounts::id_from_hash(&account.key_hash);
+        if account.id != expected {
+            warnings.push(format!(
+                "访问账户 {} 的 id 与密钥哈希不一致，已重新计算为 {}",
+                if account.id.is_empty() {
+                    "(空)"
+                } else {
+                    &account.id
+                },
+                expected
+            ));
+            account.id = expected;
+        }
+    }
+
     // A duplicate id inside one bundle collapses to the last occurrence, which
     // is exactly what a set of upserts would do anyway.
     let mut seen = std::collections::HashSet::new();
@@ -728,6 +801,22 @@ fn reconcile_ids(payload: &mut BundlePayload, warnings: &mut Vec<String>) {
         warnings.push("导出文件内存在重复密钥，已按 id 去重".to_string());
         payload.api_keys = deduped;
     }
+    let mut seen = std::collections::HashSet::new();
+    if payload
+        .client_accounts
+        .iter()
+        .any(|a| !seen.insert(a.id.clone()))
+    {
+        let mut deduped: Vec<crate::client_accounts::ClientAccount> = Vec::new();
+        for a in payload.client_accounts.drain(..) {
+            match deduped.iter_mut().find(|e| e.id == a.id) {
+                Some(slot) => *slot = a,
+                None => deduped.push(a),
+            }
+        }
+        warnings.push("导出文件内存在重复访问账户，已按 id 去重".to_string());
+        payload.client_accounts = deduped;
+    }
 }
 
 /// Drop entries that cannot authenticate: a credential with an empty token or a
@@ -750,6 +839,18 @@ fn drop_empty(payload: &mut BundlePayload, warnings: &mut Vec<String>) {
         warnings.push(format!(
             "已跳过 {} 个内容为空的密钥",
             before - payload.api_keys.len()
+        ));
+    }
+    // An account with no hash can never authenticate anything, so importing it
+    // would only plant a row that looks usable and is not.
+    let before = payload.client_accounts.len();
+    payload
+        .client_accounts
+        .retain(|a| !a.key_hash.trim().is_empty());
+    if before != payload.client_accounts.len() {
+        warnings.push(format!(
+            "已跳过 {} 个缺少密钥哈希的访问账户",
+            before - payload.client_accounts.len()
         ));
     }
 }
@@ -781,6 +882,7 @@ fn plan(decoded: &Decoded, mode: ImportMode) -> Result<(ImportPreview, PlannedSt
 
     let local_creds = workbuddy_auth::load_credentials();
     let local_keys = workbuddy_auth::load_api_keys();
+    let local_accounts = crate::client_accounts::load_accounts();
     let local_prefs = workbuddy_auth::load_preferences();
 
     let mut credentials: Vec<WorkBuddyCredential> = match mode {
@@ -789,6 +891,10 @@ fn plan(decoded: &Decoded, mode: ImportMode) -> Result<(ImportPreview, PlannedSt
     };
     let mut api_keys: Vec<ApiKeyEntry> = match mode {
         ImportMode::Merge => local_keys.clone(),
+        ImportMode::Replace => Vec::new(),
+    };
+    let mut client_accounts: Vec<crate::client_accounts::ClientAccount> = match mode {
+        ImportMode::Merge => local_accounts.clone(),
         ImportMode::Replace => Vec::new(),
     };
 
@@ -849,12 +955,38 @@ fn plan(decoded: &Decoded, mode: ImportMode) -> Result<(ImportPreview, PlannedSt
         }
     }
 
+    let mut client_accounts_added = 0;
+    let mut client_accounts_updated = 0;
+    let mut client_accounts_unchanged = 0;
+    for incoming in &payload.client_accounts {
+        // Matched by id, like API keys: the id is a hash prefix, so it is both
+        // stable across machines and unique per key material.
+        match client_accounts.iter_mut().find(|a| a.id == incoming.id) {
+            Some(slot) => {
+                if records_equal(slot, incoming) {
+                    client_accounts_unchanged += 1;
+                } else {
+                    client_accounts_updated += 1;
+                }
+                *slot = incoming.clone();
+            }
+            None => {
+                client_accounts.push(incoming.clone());
+                client_accounts_added += 1;
+            }
+        }
+    }
+
     let credentials_removed = match mode {
         ImportMode::Replace => local_creds.len(),
         ImportMode::Merge => 0,
     };
     let keys_removed = match mode {
         ImportMode::Replace => local_keys.len(),
+        ImportMode::Merge => 0,
+    };
+    let client_accounts_removed = match mode {
+        ImportMode::Replace => local_accounts.len(),
         ImportMode::Merge => 0,
     };
 
@@ -931,6 +1063,11 @@ fn plan(decoded: &Decoded, mode: ImportMode) -> Result<(ImportPreview, PlannedSt
         keys_updated,
         keys_unchanged,
         keys_removed,
+        client_accounts_total: payload.client_accounts.len(),
+        client_accounts_added,
+        client_accounts_updated,
+        client_accounts_unchanged,
+        client_accounts_removed,
         default_identity_applied: prefs.default_identity_id.clone(),
         default_identity_dropped,
         checkin_enabled: payload.preferences.daily_checkin_enabled,
@@ -941,6 +1078,7 @@ fn plan(decoded: &Decoded, mode: ImportMode) -> Result<(ImportPreview, PlannedSt
     let state = PlannedState {
         credentials,
         api_keys,
+        client_accounts,
         prefs,
         clear_legacy_defaults: mode == ImportMode::Replace,
     };
@@ -1019,6 +1157,13 @@ fn commit(state: &PlannedState) -> Result<()> {
         true,
     )?;
     write_json_atomic(&workbuddy_auth::api_keys_path(), &state.api_keys, true)?;
+    // Client accounts are written last: they are the newest store, so an
+    // interrupted import leaves the two long-standing pools consistent first.
+    write_json_atomic(
+        &crate::client_accounts::accounts_path(),
+        &state.client_accounts,
+        true,
+    )?;
     write_json_atomic(&workbuddy_auth::preferences_path(), &prefs, false)?;
     Ok(())
 }
@@ -1535,6 +1680,7 @@ mod tests {
             preferences: BundlePreferences::default(),
             credentials: vec![incoming],
             api_keys: Vec::new(),
+            client_accounts: Vec::new(),
         };
 
         let preview = apply_import(&plain_bundle(&bundle), None, ImportMode::Merge).unwrap();
@@ -1567,6 +1713,7 @@ mod tests {
             preferences: BundlePreferences::default(),
             credentials: vec![traveling],
             api_keys: Vec::new(),
+            client_accounts: Vec::new(),
         };
         let text = plain_bundle(&bundle);
 
@@ -1598,6 +1745,7 @@ mod tests {
             preferences: BundlePreferences::default(),
             credentials: vec![cred("token-new", "新账号")],
             api_keys: vec![key("sk-new", "新密钥")],
+            client_accounts: Vec::new(),
         };
         let preview = apply_import(&plain_bundle(&bundle), None, ImportMode::Replace).unwrap();
 
@@ -1635,6 +1783,7 @@ mod tests {
             },
             credentials: vec![cred("token-a", "工作号")],
             api_keys: Vec::new(),
+            client_accounts: Vec::new(),
         };
         let preview = apply_import(&plain_bundle(&bundle), None, ImportMode::Merge).unwrap();
 
@@ -1659,6 +1808,7 @@ mod tests {
             preferences: BundlePreferences::default(),
             credentials: vec![tampered],
             api_keys: Vec::new(),
+            client_accounts: Vec::new(),
         };
 
         let preview = preview_import(&plain_bundle(&bundle), None, ImportMode::Merge).unwrap();
@@ -1677,6 +1827,7 @@ mod tests {
             preferences: BundlePreferences::default(),
             credentials: vec![cred("token-a", "工作号")],
             api_keys: Vec::new(),
+            client_accounts: Vec::new(),
         };
         let mut file: BundleFile = serde_json::from_str(&plain_bundle(&bundle)).unwrap();
         file.checksum = Some("deadbeef".to_string());
@@ -1721,6 +1872,7 @@ mod tests {
             preferences: BundlePreferences::default(),
             credentials: vec![cred("token-a", "工作号")],
             api_keys: Vec::new(),
+            client_accounts: Vec::new(),
         };
         let mut file: BundleFile = serde_json::from_str(&plain_bundle(&bundle)).unwrap();
         file.version = BUNDLE_VERSION + 7;
@@ -1815,15 +1967,232 @@ mod tests {
             counts: BundleCounts {
                 credentials: payload.credentials.len(),
                 api_keys: payload.api_keys.len(),
+                client_accounts: payload.client_accounts.len(),
             },
             checksum: Some(payload_checksum(payload).unwrap()),
             preferences: Some(payload.preferences.clone()),
             credentials: payload.credentials.clone(),
             api_keys: payload.api_keys.clone(),
+            client_accounts: payload.client_accounts.clone(),
             kdf: None,
             cipher: None,
         };
         serde_json::to_string_pretty(&file).unwrap()
+    }
+
+    // ── Client access accounts in the bundle (v2) ──────────────────────────
+
+    /// Seed the access-account store the way the GUI would.
+    fn seed_accounts(labels: &[&str]) -> Vec<String> {
+        let mut keys = Vec::new();
+        for label in labels {
+            let (_account, key) = crate::client_accounts::create_account(label, "").unwrap();
+            keys.push(key);
+        }
+        keys
+    }
+
+    #[test]
+    fn accounts_travel_with_the_pool_and_still_authenticate_after_import() {
+        let _dir = TempDataDir::new("accounts-roundtrip");
+        seed(&[cred("token-a", "工作号")], &[key("sk-aaa", "主密钥")]);
+        let plaintext_keys = seed_accounts(&["笔记本", "CI"]);
+
+        let (text, outcome) = export_text(&ExportOptions::default()).unwrap();
+        assert_eq!(outcome.counts.client_accounts, 2);
+        assert!(!outcome.is_empty());
+
+        // Wipe every store, then import into the empty machine.
+        workbuddy_auth::save_credentials(&[]).unwrap();
+        workbuddy_auth::save_api_keys(&[]).unwrap();
+        crate::client_accounts::save_accounts(&[]).unwrap();
+        assert!(crate::client_accounts::load_accounts().is_empty());
+
+        let preview = apply_import(&text, None, ImportMode::Replace).unwrap();
+        assert_eq!(preview.client_accounts_added, 2);
+        assert_eq!(crate::client_accounts::load_accounts().len(), 2);
+
+        // The decisive property: the key the *client* already holds keeps
+        // working on the target machine, because verification is a hash compare
+        // and only the hash travelled.
+        let accounts = crate::client_accounts::load_accounts();
+        for key in &plaintext_keys {
+            let verified = crate::client_accounts::verify(key, &accounts)
+                .expect("a migrated key must still authenticate");
+            assert!(verified.id.starts_with("ca-"));
+        }
+    }
+
+    #[test]
+    fn a_plain_bundle_never_contains_a_usable_key() {
+        let _dir = TempDataDir::new("accounts-plaintext");
+        let plaintext_keys = seed_accounts(&["笔记本"]);
+
+        let (text, _) = export_text(&ExportOptions::default()).unwrap();
+        for key in &plaintext_keys {
+            assert!(
+                !text.contains(key.as_str()),
+                "a plain bundle must not carry the usable key"
+            );
+        }
+        // The hash is what travels instead.
+        let accounts = crate::client_accounts::load_accounts();
+        assert!(text.contains(&accounts[0].key_hash));
+    }
+
+    #[test]
+    fn an_encrypted_bundle_hides_the_accounts_in_the_envelope() {
+        let _dir = TempDataDir::new("accounts-encrypted");
+        seed_accounts(&["笔记本"]);
+
+        let opts = ExportOptions {
+            passphrase: Some("correct horse".to_string()),
+        };
+        let (text, outcome) = export_text(&opts).unwrap();
+        assert!(outcome.encrypted);
+        // Counts stay readable so the file can be previewed before unlocking.
+        assert_eq!(outcome.counts.client_accounts, 1);
+
+        let accounts = crate::client_accounts::load_accounts();
+        // Neither the hash nor any plaintext may survive in the envelope.
+        assert!(!text.contains(&accounts[0].key_hash));
+        assert!(
+            !text.contains("笔记本"),
+            "even the label is inside the cipher"
+        );
+
+        // And it round-trips through the passphrase.
+        crate::client_accounts::save_accounts(&[]).unwrap();
+        apply_import(&text, Some("correct horse"), ImportMode::Merge).unwrap();
+        assert_eq!(crate::client_accounts::load_accounts().len(), 1);
+    }
+
+    /// A v1 bundle (no `client_accounts` field at all) must still import, and
+    /// must not resurrect accounts it never carried.
+    #[test]
+    fn a_v1_bundle_without_the_accounts_field_still_imports() {
+        let _dir = TempDataDir::new("v1-compat");
+        seed(&[cred("token-a", "工作号")], &[]);
+
+        // Build the document a 2.x writer produced: version 1, and no
+        // `client_accounts` key in the JSON at all.
+        let payload = BundlePayload {
+            preferences: BundlePreferences::default(),
+            credentials: vec![cred("token-a", "工作号")],
+            api_keys: Vec::new(),
+            client_accounts: Vec::new(),
+        };
+        let mut file: BundleFile = serde_json::from_str(&plain_bundle(&payload)).unwrap();
+        file.version = 1;
+        let text = serde_json::to_string(&file).unwrap();
+        // `skip_serializing_if = "Vec::is_empty"` already omits the *top-level*
+        // array, which is exactly what a 2.x writer produced — so this is a
+        // faithful v1 document without hand-editing the JSON. (`counts` still
+        // carries a zeroed counter; that field is `#[serde(default)]` on the
+        // reader side, so its absence in a real v1 file is equally harmless.)
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            value.get("client_accounts").is_none(),
+            "a v1 document carries no top-level client_accounts array: {text}"
+        );
+
+        let preview = apply_import(&text, None, ImportMode::Replace).unwrap();
+        assert_eq!(preview.credentials_added, 1);
+        assert_eq!(preview.client_accounts_added, 0);
+        // No scary version warning: v1 is older, not newer.
+        assert!(
+            !preview.warnings.iter().any(|w| w.contains("更新版本")),
+            "a v1 bundle is not a future version: {:?}",
+            preview.warnings
+        );
+    }
+
+    /// An account whose id disagrees with its hash is repaired, because the id
+    /// is derivable from the hash without any plaintext.
+    #[test]
+    fn an_account_id_that_disagrees_with_its_hash_is_recomputed() {
+        let _dir = TempDataDir::new("accounts-id-repair");
+        let (_a, _key) = crate::client_accounts::create_account("x", "").unwrap();
+        let mut accounts = crate::client_accounts::load_accounts();
+        let expected = accounts[0].id.clone();
+        accounts[0].id = "ca-000000".to_string();
+
+        let payload = BundlePayload {
+            preferences: BundlePreferences::default(),
+            credentials: Vec::new(),
+            api_keys: Vec::new(),
+            client_accounts: accounts,
+        };
+        let preview = apply_import(&plain_bundle(&payload), None, ImportMode::Merge).unwrap();
+        assert!(
+            preview.warnings.iter().any(|w| w.contains("重新计算")),
+            "the repair must be reported: {:?}",
+            preview.warnings
+        );
+        let restored = crate::client_accounts::load_accounts();
+        assert_eq!(restored[0].id, expected);
+    }
+
+    #[test]
+    fn an_account_without_a_hash_is_dropped_with_a_warning() {
+        let _dir = TempDataDir::new("accounts-empty-hash");
+        let payload = BundlePayload {
+            preferences: BundlePreferences::default(),
+            credentials: Vec::new(),
+            api_keys: Vec::new(),
+            client_accounts: vec![crate::client_accounts::ClientAccount {
+                id: "ca-abcdef".to_string(),
+                label: "broken".to_string(),
+                key_hash: String::new(),
+                ..Default::default()
+            }],
+        };
+        let preview = apply_import(&plain_bundle(&payload), None, ImportMode::Merge).unwrap();
+        assert_eq!(preview.client_accounts_added, 0);
+        assert!(
+            preview.warnings.iter().any(|w| w.contains("缺少密钥哈希")),
+            "the drop must be reported: {:?}",
+            preview.warnings
+        );
+    }
+
+    #[test]
+    fn merge_keeps_local_accounts_and_replace_drops_them() {
+        let _dir = TempDataDir::new("accounts-modes");
+        seed_accounts(&["本地账户"]);
+        let local_count = crate::client_accounts::load_accounts().len();
+        assert_eq!(local_count, 1, "the temp dir starts empty");
+
+        let payload = BundlePayload {
+            preferences: BundlePreferences::default(),
+            credentials: Vec::new(),
+            api_keys: Vec::new(),
+            client_accounts: vec![crate::client_accounts::ClientAccount {
+                id: crate::client_accounts::id_from_hash(&crate::client_accounts::hash_key(
+                    "prs_bundled",
+                )),
+                label: "来自导出".to_string(),
+                key_hash: crate::client_accounts::hash_key("prs_bundled"),
+                key_prefix: "prs_bundled".to_string(),
+                enabled: true,
+                ..Default::default()
+            }],
+        };
+        let text = plain_bundle(&payload);
+
+        let preview = apply_import(&text, None, ImportMode::Merge).unwrap();
+        assert_eq!(preview.client_accounts_added, 1);
+        assert_eq!(preview.client_accounts_removed, 0, "merge never removes");
+        assert_eq!(
+            crate::client_accounts::load_accounts().len(),
+            local_count + 1
+        );
+
+        let preview = apply_import(&text, None, ImportMode::Replace).unwrap();
+        assert_eq!(preview.client_accounts_removed, local_count + 1);
+        let remaining = crate::client_accounts::load_accounts();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].label, "来自导出");
     }
 
     /// The most recent `*.proxy-rs-backup-*` beside `path`, if one exists.

@@ -20,6 +20,10 @@ const baseline = new Map();
 const SECTION_FIELDS = {
   provider: ['setting-provider', 'setting-custom-url'],
   network: ['setting-port', 'setting-bind', 'setting-launch-at-login'],
+  // Only the enable switch is a form field here; the account list is server
+  // state managed by its own commands, so it has nothing to compare against and
+  // must not make the section read as "已修改".
+  'client-accounts': ['client-auth-enabled'],
   claude: ['setting-claude-model', 'setting-claude-sonnet', 'setting-claude-opus', 'setting-claude-haiku'],
   codex: [],
   advanced: [
