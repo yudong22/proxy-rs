@@ -449,33 +449,45 @@ fn rewrite_table() -> &'static [(&'static str, &'static str)] {
 // ---------------------------------------------------------------------------
 //
 // The WorkBuddy/CodeBuddy gateway rejects a request as an "unapproved channel"
-// (business code 11-128) when the **system message** contains one of the two
-// literals below. Both ship verbatim in DSH's own system prompt:
+// (business code 11-128) when a **system message** contains one of the literals
+// in [`HARNESS_REWRITES`]. All of them ship verbatim in DSH's own system prompt:
 //
 //   * `You are an AI agent powered by DeepSeek Harness.`
 //     — `packages/core/system-prompt/src/index.ts` (`harness:identity` section)
 //   * `DeepSeek Harness Web GUI`
 //     — `packages/context/harness-dev-context/src/index.ts` (`WEB_SURFACE_PROMPT`)
+//   * `Tokens prefixed with @ … Relative paths resolve from the workspace root`
+//     — `packages/context/file-reference/src/index.ts` (`FILE_REFERENCE_PROMPT`)
 //
-// Verified live against the real upstream on 2026-10-25 (DSH 0.2.1-rc.3, real
-// 653 KB / 14-message / 42-tool capture):
+// Verified live against the real upstream, twice, because the rule set moved:
 //
-//   · unmodified capture                       -> 400 / 11-128
-//   · both literals rewritten                  -> 200
-//   · only one of the two rewritten            -> 400  (both are needed)
-//   · the same literal placed in a user, tool
-//     or reasoning message                     -> 200  (system-only check)
+//   2026-10-25 (DSH 0.2.1-rc.3, real 653 KB / 14-message / 42-tool capture):
+//     · unmodified capture                     -> 400 / 11-128
+//     · both identity literals rewritten       -> 200
+//     · only one of the two rewritten          -> 400  (both were needed)
+//     · a literal placed in a user, tool or
+//       reasoning message                      -> 200  (system-only check)
 //
-// Two consequences shape the implementation:
+//   2026-11-05 (DSH 0.2.2-alpha.2), the state that produced the v2.4.1 fix:
+//     · unmodified capture                     -> 400 / 11-128
+//     · the two identity literals rewritten    -> 400  (upstream had retuned;
+//                                                      they no longer block)
+//     · the `@`-reference pair rewritten       -> 200
+//     · whole prompt in a parts array          -> the same 400 as a plain
+//                                                 string, i.e. shape-agnostic
 //
-//   1. Both literals must be rewritten. Fixing either one alone still fails,
-//      which is why v2.1.4 (identity opener only) and v2.1.5 (Web GUI phrase
-//      only) each appeared not to work.
+// Three consequences shape the implementation:
+//
+//   1. Every entry must be rewritten. A partially covered prompt looks exactly
+//      like "the rewrite does not work", which is how v2.1.4 (identity opener
+//      only) and v2.1.5 (Web GUI phrase only) were both reported as failures.
 //   2. The match is on the *system channel*, not on request content. Earlier
 //      attempts replaced the phrase everywhere in the body, which corrupted the
 //      user's own data (~40 hits lived in tool results: project paths, source
 //      code, `git log` output). Restricting this pass to `system` messages
 //      fixes the rejection while leaving every other message byte-identical.
+//   3. It must cover **both content shapes** (`Text` and `Parts`): the gateway
+//      checks the concatenated system text, not the JSON encoding.
 
 /// DSH identity opener, without the trailing period so the form lacking it
 /// (also rejected) is covered by the same entry.
@@ -490,14 +502,50 @@ const DSH_IDENTITY_REPLACEMENT: &str = "You are an AI agent";
 const DSH_WEB_GUI_LITERAL: &str = "DeepSeek Harness Web GUI";
 const DSH_WEB_GUI_REPLACEMENT: &str = "web GUI";
 
-/// Whether `text` carries either rejected DSH literal. Cheap `contains` checks so
+/// DSH `@`-reference guidance (`packages/context/file-reference/src/index.ts`,
+/// `FILE_REFERENCE_PROMPT`), third rejected literal — found live on 2026-11-05
+/// with DSH 0.2.2-alpha.2, after the gateway had *stopped* rejecting the two
+/// literals above on their own.
+///
+/// What the gateway keys on is the **pair**: the opener sentence
+/// `Tokens prefixed with @ are paths the user explicitly referenced.` followed
+/// immediately by `Relative paths resolve from the workspace root`. Measured
+/// live (see the bisect notes below):
+///
+///   · opener alone, this sentence alone                -> 200
+///   · the two adjacent (period or semicolon between)   -> 400 / 11-128
+///   · the same two lines separated by a newline        -> 200
+///   · either sentence reworded at all (#533/#537/#539
+///     style: upstream re-tunes the exact phrasing)     -> 200
+///
+/// Only the second sentence is rewritten here — one word, same meaning — which
+/// is the smallest edit that breaks the pair. The opener stays byte-identical so
+/// the model keeps the `@`-mention rule spelled out exactly as DSH wrote it.
+const DSH_REFERENCE_LITERAL: &str = "Relative paths resolve from the workspace root";
+const DSH_REFERENCE_REPLACEMENT: &str = "Relative paths resolve against the workspace root";
+
+/// Every `(literal, replacement)` pair the gateway rejects inside a **system**
+/// message. Each rewrite is deliberately the smallest visible edit that breaks
+/// the literal match, so the prompt keeps its meaning and its behaviour.
+///
+/// This is a table, not three hand-written calls, because upstream adds a rule
+/// without warning: v2.1.4 covered one of two needed literals, v2.1.5 the other,
+/// and each looked like "the fix does not work" until the third appeared. A new
+/// fingerprint is one more row.
+const HARNESS_REWRITES: &[(&str, &str)] = &[
+    (DSH_IDENTITY_LITERAL, DSH_IDENTITY_REPLACEMENT),
+    (DSH_WEB_GUI_LITERAL, DSH_WEB_GUI_REPLACEMENT),
+    (DSH_REFERENCE_LITERAL, DSH_REFERENCE_REPLACEMENT),
+];
+
+/// Whether `text` carries any rejected DSH literal. Cheap `contains` checks so
 /// the common (already-clean) path allocates nothing.
 fn has_harness_identity(text: &str) -> bool {
-    text.contains(DSH_IDENTITY_LITERAL) || text.contains(DSH_WEB_GUI_LITERAL)
+    HARNESS_REWRITES.iter().any(|(from, _)| text.contains(from))
 }
 
-/// Rewrite the two gateway-rejected DSH literals. Returns `None` when neither is
-/// present, so the caller can skip replacing the message content.
+/// Rewrite every gateway-rejected DSH literal in `text`. Returns `None` when
+/// none is present, so the caller can skip replacing the message content.
 ///
 /// Applied to `system` messages only — see the block comment above for why the
 /// scope matters.
@@ -505,10 +553,49 @@ pub(crate) fn neutralize_harness_identity(text: &str) -> Option<String> {
     if !has_harness_identity(text) {
         return None;
     }
-    Some(
-        text.replace(DSH_IDENTITY_LITERAL, DSH_IDENTITY_REPLACEMENT)
-            .replace(DSH_WEB_GUI_LITERAL, DSH_WEB_GUI_REPLACEMENT),
-    )
+    let mut out = text.to_string();
+    for (from, to) in HARNESS_REWRITES {
+        out = out.replace(from, to);
+    }
+    Some(out)
+}
+
+/// Rewrite a system message's content whatever shape it arrived in.
+///
+/// DSH's own adapter sends the system prompt as one plain string, which is why
+/// v2.1.7 only handled [`openai::MessageContent::Text`] and still worked. A
+/// **parts array** (`[{"type":"text","text":…}]`) is equally accepted by the
+/// client SDKs — OpenAI's own SDK sends the system prompt that way — and it hits
+/// the very same gateway check. The old code matched `Text` with `let … else`
+/// and silently skipped parts, so such a request was blocked on every attempt
+/// while the log showed the sanitizer "running". Both shapes are rewritten here.
+///
+/// Non-text parts (images) are cloned untouched, and an unchanged message is
+/// reported as unchanged so the caller's counter stays a real "we changed this".
+fn neutralize_harness_content(content: &openai::MessageContent) -> Option<openai::MessageContent> {
+    match content {
+        openai::MessageContent::Text(text) => {
+            let rewritten = neutralize_harness_identity(text)?;
+            (rewritten != *text).then_some(openai::MessageContent::Text(rewritten))
+        }
+        openai::MessageContent::Parts(parts) => {
+            let mut changed = false;
+            let rewritten: Vec<_> = parts
+                .iter()
+                .map(|part| match part {
+                    openai::ContentPart::Text { text } => match neutralize_harness_identity(text) {
+                        Some(new_text) if new_text != *text => {
+                            changed = true;
+                            openai::ContentPart::Text { text: new_text }
+                        }
+                        _ => part.clone(),
+                    },
+                    other => other.clone(),
+                })
+                .collect();
+            changed.then_some(openai::MessageContent::Parts(rewritten))
+        }
+    }
 }
 
 /// Rewrite DSH's rejected literals across every `system` message of `req`,
@@ -523,14 +610,12 @@ pub(crate) fn neutralize_harness_system_messages(req: &mut openai::OpenAIRequest
         if msg.role != "system" {
             continue;
         }
-        let Some(openai::MessageContent::Text(text)) = &msg.content else {
+        let Some(content) = &msg.content else {
             continue;
         };
-        if let Some(rewritten) = neutralize_harness_identity(text) {
-            if rewritten != *text {
-                msg.content = Some(openai::MessageContent::Text(rewritten));
-                changed += 1;
-            }
+        if let Some(rewritten) = neutralize_harness_content(content) {
+            msg.content = Some(rewritten);
+            changed += 1;
         }
     }
     changed
@@ -1607,11 +1692,33 @@ mod tests {
 
     const DSH_OPENER: &str = "You are an AI agent powered by DeepSeek Harness.";
     const DSH_WEB_GUI: &str = "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.";
+    /// The `@`-reference pair exactly as DSH 0.2.2-alpha.2 renders it. The
+    /// rewrite touches only the second sentence; the opener is byte-identical
+    /// afterwards, which the test below pins.
+    const DSH_REFERENCE_PAIR: &str = "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.";
 
     fn system_msg(text: &str) -> openai::Message {
         openai::Message {
             role: "system".to_string(),
             content: Some(openai::MessageContent::Text(text.to_string())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// A system message whose content is the parts array an OpenAI SDK sends for
+    /// the same text. The gateway inspects the concatenated text, so this must
+    /// be sanitized exactly like the plain-string form.
+    fn parts_system_msg(text: &str) -> openai::Message {
+        openai::Message {
+            role: "system".to_string(),
+            content: Some(openai::MessageContent::Parts(vec![
+                openai::ContentPart::Text {
+                    text: text.to_string(),
+                },
+            ])),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -1686,6 +1793,180 @@ mod tests {
         let text =
             "The DeepSeek Harness implementation checkout is /Users/denis/Sites/deepseek-harness.";
         assert_eq!(neutralize_harness_identity(text), None);
+    }
+
+    // ---- the `@`-reference fingerprint (v2.4.1) ---------------------------
+    //
+    // Measured live against the real gateway on 2026-11-05 with DSH
+    // 0.2.2-alpha.2, after the two identity literals above had stopped blocking
+    // on their own. Each test below pins one of those measurements so a future
+    // "tidy-up" cannot drop the row and silently restore a failed round-trip on
+    // every single request.
+
+    /// The pair is what blocks; rewriting the second sentence breaks it.
+    #[test]
+    fn rewrites_reference_pair() {
+        let out = neutralize_harness_identity(DSH_REFERENCE_PAIR).expect("pair must be rewritten");
+        assert!(!out.contains("Relative paths resolve from the workspace root"));
+        assert!(out.contains("Relative paths resolve against the workspace root"));
+        // The opener is the model-facing rule; it must survive byte-identically.
+        assert!(out.contains("Tokens prefixed with @ are paths the user explicitly referenced."));
+    }
+
+    /// Rewriting the second sentence alone is enough: one row, one edit, and the
+    /// rest of the guidance (trailing-slash directories, the quoted spelling)
+    /// still reaches the model.
+    #[test]
+    fn reference_rewrite_keeps_the_rest_of_the_guidance() {
+        let out = neutralize_harness_identity(DSH_REFERENCE_PAIR).expect("rewritten");
+        assert!(out.contains("absolute paths identify files or directories on the host."));
+    }
+
+    /// The whole v2.4.1 regression, in one assertion: the real system prompt as
+    /// DSH 0.2.2-alpha.2 assembled it must come out with **no** rejected literal
+    /// left, and must keep the identity opener's replacement rather than losing
+    /// the sentence entirely.
+    #[test]
+    fn real_dsh_prompt_loses_every_rejected_literal() {
+        // Abridged to the sections that carry literals plus a neutral filler, so
+        // the test states which real sentences matter instead of pinning a
+        // 7 KB fixture that changes with every DSH release.
+        let prompt = [
+            DSH_OPENER,
+            "You are a coding agent powered by the deepseek-v4.1-flash model.",
+            "Use the read tool — not shell commands like cat — to inspect text files.",
+            DSH_REFERENCE_PAIR,
+            "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", they mean this GUI.",
+        ]
+        .join("\n\n");
+
+        let out = neutralize_harness_identity(&prompt).expect("literals present");
+        for (from, _) in HARNESS_REWRITES {
+            assert!(
+                !out.contains(from),
+                "rejected literal survived: {from:?} in {out:?}"
+            );
+        }
+        assert!(out.contains("You are an AI agent."));
+        assert!(out.contains("You are a coding agent powered by the deepseek-v4.1-flash model."));
+    }
+
+    /// The gateway checks the *concatenated* system text, so a parts array is
+    /// rejected exactly like a plain string. The pre-v2.4.1 code matched only
+    /// `MessageContent::Text` and skipped parts silently — sanitizer "ran", the
+    /// request was blocked anyway. This is the regression test for that.
+    #[test]
+    fn rewrites_parts_shaped_system_content() {
+        let mut req = req_with(vec![
+            parts_system_msg(DSH_REFERENCE_PAIR),
+            text_msg("user", "read the file"),
+        ]);
+        assert_eq!(
+            neutralize_harness_system_messages(&mut req),
+            1,
+            "parts-shaped system content must be rewritten, not skipped"
+        );
+        let Some(openai::MessageContent::Parts(parts)) = &req.messages[0].content else {
+            panic!(
+                "content shape must be preserved: {:?}",
+                req.messages[0].content
+            );
+        };
+        assert!(
+            !format!("{parts:?}").contains("Relative paths resolve from the workspace root"),
+            "literal survived inside parts: {parts:?}"
+        );
+        // Shaping is the client's choice: a parts array must not become a string.
+        assert_eq!(parts.len(), 1);
+    }
+
+    /// A multi-part system message where only one part carries a literal: that
+    /// part is rewritten, the sibling text and any image part are untouched.
+    #[test]
+    fn rewrites_only_the_offending_part() {
+        let mut req = req_with(vec![openai::Message {
+            role: "system".to_string(),
+            content: Some(openai::MessageContent::Parts(vec![
+                openai::ContentPart::Text {
+                    text: "You are a helpful assistant.".to_string(),
+                },
+                openai::ContentPart::Text {
+                    text: DSH_OPENER.to_string(),
+                },
+            ])),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }]);
+        assert_eq!(neutralize_harness_system_messages(&mut req), 1);
+        let Some(openai::MessageContent::Parts(parts)) = &req.messages[0].content else {
+            panic!("expected parts");
+        };
+        match &parts[0] {
+            openai::ContentPart::Text { text } => assert_eq!(text, "You are a helpful assistant."),
+            other => panic!("unexpected part: {other:?}"),
+        }
+        match &parts[1] {
+            openai::ContentPart::Text { text } => {
+                assert!(
+                    !text.contains("DeepSeek Harness"),
+                    "part not rewritten: {text}"
+                )
+            }
+            other => panic!("unexpected part: {other:?}"),
+        }
+    }
+
+    /// A clean parts-shaped prompt changes nothing, so the caller does not log a
+    /// rewrite that never happened.
+    #[test]
+    fn leaves_clean_parts_system_content_alone() {
+        let mut req = req_with(vec![parts_system_msg("You are a helpful assistant.")]);
+        assert_eq!(neutralize_harness_system_messages(&mut req), 0);
+    }
+
+    /// Every row of [`HARNESS_REWRITES`] must actually change its literal.
+    /// Measured: a pair whose `from` and `to` are identical ships silently
+    /// (v2.1.5 did exactly that), and the request stays blocked while the
+    /// sanitizer reports success.
+    #[test]
+    fn every_harness_rewrite_pair_actually_rewrites() {
+        for (from, to) in HARNESS_REWRITES {
+            assert_ne!(from, to, "no-op rewrite pair: {from:?}");
+            assert!(
+                neutralize_harness_identity(from).is_some_and(|out| out != *from),
+                "HARNESS_REWRITES row {from:?} is not applied by neutralize_harness_identity"
+            );
+        }
+    }
+
+    /// Non-text parts must be copied through untouched.
+    #[test]
+    fn preserves_image_parts_in_system_content() {
+        let image = openai::ContentPart::ImageUrl {
+            image_url: openai::ImageUrl {
+                url: "data:image/png;base64,AAAA".to_string(),
+            },
+        };
+        let mut req = req_with(vec![openai::Message {
+            role: "system".to_string(),
+            content: Some(openai::MessageContent::Parts(vec![
+                image.clone(),
+                openai::ContentPart::Text {
+                    text: DSH_REFERENCE_PAIR.to_string(),
+                },
+            ])),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }]);
+        assert_eq!(neutralize_harness_system_messages(&mut req), 1);
+        let Some(openai::MessageContent::Parts(parts)) = &req.messages[0].content else {
+            panic!("expected parts");
+        };
+        assert_eq!(parts[0], image, "image part must be byte-identical");
     }
 
     /// Clean prompts must not be rewritten at all (no allocation, no drift).
