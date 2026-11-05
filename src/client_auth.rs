@@ -107,26 +107,100 @@ pub async fn guard(
         return next.run(request).await;
     }
 
-    // The key never reaches the handler: taken out before the check so a failed
-    // request cannot be logged with it present either.
-    let presented = request
-        .headers_mut()
-        .remove(HeaderName::from_static(client_accounts::KEY_HEADER))
-        .and_then(|value| value.to_str().ok().map(str::to_owned));
+    // Candidate headers, in priority order.
+    //
+    // `x-proxy-rs-key` is the explicit form and always wins. The other two are
+    // the standard client headers, accepted so an off-the-shelf client works
+    // after the user pastes only a key and a base URL — that is the whole point
+    // of this list.
+    //
+    // The standard headers are **only** treated as a gateway key when the value
+    // is one of our own keys (see `looks_like_gateway_key`). Otherwise they are
+    // left completely alone for the upstream passthrough path, which is how the
+    // two credential systems keep coexisting: a request can carry a real
+    // upstream key there, and this gate never consumes it.
+    let mut candidates: Vec<(HeaderName, String)> = Vec::new();
 
-    let Some(presented) = presented else {
-        return unauthorized(VerifyFailure::Missing);
-    };
-
-    match state.verify(&presented).await {
-        Ok(identity) => {
-            let id = identity.id.clone();
-            request.extensions_mut().insert(identity);
-            // Observational only, throttled internally; cannot fail the request.
-            state.touch(&id).await;
-            next.run(request).await
+    if let Some(value) = request
+        .headers()
+        .get(HeaderName::from_static(client_accounts::KEY_HEADER))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    {
+        candidates.push((HeaderName::from_static(client_accounts::KEY_HEADER), value));
+    }
+    // Claude clients: `x-api-key`, and `ANTHROPIC_AUTH_TOKEN` which Claude Code
+    // ships as `Authorization: Bearer <token>`.
+    for name in [header::AUTHORIZATION, HeaderName::from_static("x-api-key")] {
+        if let Some(raw) = request.headers().get(&name).and_then(|v| v.to_str().ok()) {
+            let token = if name == header::AUTHORIZATION {
+                raw.strip_prefix("Bearer ")
+                    .or_else(|| raw.strip_prefix("bearer "))
+                    .unwrap_or(raw)
+            } else {
+                raw
+            };
+            let token = token.trim();
+            if client_accounts::looks_like_gateway_key(token) {
+                candidates.push((name, token.to_string()));
+            }
         }
-        Err(failure) => unauthorized(failure),
+    }
+
+    // Try each candidate in order. A value that is recognised as one of our keys
+    // but fails verification (disabled / unknown) is a definitive answer: the
+    // caller meant it as a gateway key, so report that rather than falling
+    // through to "missing".
+    let mut last_failure: Option<VerifyFailure> = None;
+    for (name, presented) in candidates {
+        match state.verify(&presented).await {
+            Ok(identity) => {
+                // Only strip the header we actually consumed. A standard header
+                // that authenticated here is ours, so it must not reach the
+                // upstream; one that was not consumed is left for passthrough.
+                //
+                // This is the rule the whole feature rests on: **the gateway key
+                // is for this gateway only**. It authenticates the caller here
+                // and is then gone from the request; the upstream is
+                // authenticated separately, by the credential pool or a static
+                // upstream key.
+                let consumed_standard_header =
+                    name != HeaderName::from_static(client_accounts::KEY_HEADER);
+                request.headers_mut().remove(&name);
+
+                // Footgun worth naming: if the deployment runs in upstream
+                // *passthrough* mode, the upstream credential normally comes
+                // from this very header. Consuming it here therefore leaves the
+                // outbound request with no credential. That combination (client
+                // key in a standard header + passthrough) is a
+                // misconfiguration, not something to fail on — but staying
+                // silent about it would surface as an unexplained upstream 401.
+                if consumed_standard_header
+                    && crate::config::env_value("UPSTREAM_API_KEY_PASSTHROUGH")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                {
+                    tracing::warn!(
+                        header = %name,
+                        "网关访问 key 出现在标准头中并已被消费，但当前启用了 UPSTREAM_API_KEY_PASSTHROUGH：\
+                         上游将没有凭据。请把上游 key 放进账号池/静态 key，或改用 {} 发送网关 key。",
+                        client_accounts::KEY_HEADER
+                    );
+                }
+
+                let id = identity.id.clone();
+                request.extensions_mut().insert(identity);
+                // Observational only, throttled internally; cannot fail.
+                state.touch(&id).await;
+                return next.run(request).await;
+            }
+            Err(failure) => last_failure = Some(failure),
+        }
+    }
+
+    match last_failure {
+        Some(failure) => unauthorized(failure),
+        None => unauthorized(VerifyFailure::Missing),
     }
 }
 

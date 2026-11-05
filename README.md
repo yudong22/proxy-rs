@@ -263,7 +263,7 @@ curl -X POST http://localhost:3456/v1/messages \
 | `PROXY_SESSION_SWITCH` | 否 | `true` | 会话遇到 429/402/配额码/刷新失败时自动切换到备用凭据；关闭后错误原样透传 |
 | `PROXY_SESSION_AFFINITY_TTL` | 否 | `86400000` (24h) | 切换后会话粘滞时长（毫秒），超时后回到默认凭据 |
 | `PROXY_API_TOKEN` | 否 | - | `/api/*` **写路由**的 Bearer 令牌（`POST /api/scheduler/run/{loop}` 与全部 `/api/admin/*`）。不配则写路由一律 `403 mutation_disabled`；启动时读一次，改后需重启 |
-| `PROXY_CLIENT_AUTH` | 否 | 跟随 GUI 开关 | **入站访问密钥**总开关，覆盖 `gui-settings.json`（`=0`/`false` 强制关闭）。开启后 `/v1/*` 必须带 `x-proxy-rs-key`。无 GUI 的服务器部署用它显式开启 |
+| `PROXY_CLIENT_AUTH` | 否 | 跟随 GUI 开关 | **入站访问密钥**总开关，覆盖 `gui-settings.json`（`=0`/`false` 强制关闭）。开启后 `/v1/*` 必须带访问 key（`x-proxy-rs-key`，或标准头 `Authorization: Bearer` / `x-api-key`）。无 GUI 的服务器部署用它显式开启 |
 
 \* 上游需要鉴权时必填。当启用 `UPSTREAM_API_KEY_PASSTHROUGH=true` 时，不得同时指定 `UPSTREAM_API_KEY`。
 
@@ -281,7 +281,7 @@ curl -X POST http://localhost:3456/v1/messages \
 | `~/.proxy-rs/api-keys.json` | 上游 API 密钥池（0600，与账号统一在「身份池」中管理） |
 | `~/.proxy-rs/workbuddy-pool.json` | 身份池偏好：默认身份、每日定时打卡设置 |
 | `~/.proxy-rs/scheduler-state.json` | 三个后台循环的「上次运行 / 上次跳过」记录（`/api/scheduler` 的数据源，纯观测，不参与调度决策） |
-| `~/.proxy-rs/client-accounts.json` | **入站**访问账户（`x-proxy-rs-key`）。只存密钥的 SHA-256，不存明文；与上面的**出站**身份池方向相反、互不影响（0600） |
+| `~/.proxy-rs/client-accounts.json` | **入站**访问账户。只存密钥的 SHA-256，不存明文；与上面的**出站**身份池方向相反、互不影响（0600） |
 
 **跨机迁移**：GUI「身份池 → 📤 导出账号池」把上述**四个**文件的内容（含**入站**访问账户）打包成一个文件（系统保存面板里自选位置，可选口令加密），在另一台机器上「📥 导入账号池」即可恢复；导入前会对每个文件各生成一份 `<文件名>.proxy-rs-backup-<时间戳>` 备份，替换式导入后可手工回滚。访问账户导出的是**哈希**，因此客户端手里那把 key 在新机器上**照常可用**，无需重发。
 

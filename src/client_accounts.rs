@@ -20,6 +20,20 @@
 //! A request may therefore carry both headers: the upstream key goes upstream,
 //! the gateway key stops at the door.
 //!
+//! ## Standard headers are accepted too (v3.0.1)
+//!
+//! The dedicated header is the explicit form, but requiring it would force every
+//! user to configure a custom header before a stock client could talk to the
+//! gateway. So the gate also inspects `authorization: Bearer <k>` and
+//! `x-api-key: <k>` — and consumes the value **only when it is shaped like one of
+//! our keys** ([`looks_like_gateway_key`]). Anything else is left untouched for
+//! the upstream passthrough path.
+//!
+//! That conditional is what keeps the two credential systems from colliding: a
+//! real upstream key in `x-api-key` is not gateway-shaped, so it is forwarded
+//! exactly as before. This is the difference between "accepts standard headers"
+//! and "hijacks standard headers".
+//!
 //! ## What is stored
 //!
 //! Only `sha256(key)`, never the key. The plaintext is returned to the caller
@@ -312,6 +326,38 @@ impl VerifyFailure {
     }
 }
 
+/// Whether a value is *shaped* like one of our gateway keys.
+///
+/// This is a shape test, not an authentication decision — [`verify`] still has to
+/// accept it. Its job is narrower and load-bearing: when the gate looks inside
+/// the **standard** client headers (`authorization`, `x-api-key`), it must be
+/// able to tell "this is my gateway key" from "this is an upstream key meant for
+/// passthrough". Getting that wrong in either direction is a real bug:
+///
+///   * too loose → a real upstream key gets consumed and swallowed here, and the
+///     request reaches the upstream unauthenticated;
+///   * too strict → a legitimate user who pasted only the gateway key has their
+///     request refused.
+///
+/// So the rule is deliberately the whole shape: the `prs_` prefix **and** the
+/// exact length a generated key has. A generated key is `prs_` + 43 base64url
+/// chars (32 random bytes), so the total is always 47. Upstream keys — OpenAI's
+/// `sk-…`, Anthropic's `sk-ant-…`, WorkBuddy session tokens — never satisfy both,
+/// which is what keeps the two credential systems from interfering.
+pub fn looks_like_gateway_key(value: &str) -> bool {
+    let value = value.trim();
+    let Some(rest) = value.strip_prefix(KEY_PREFIX) else {
+        return false;
+    };
+    // 32 bytes → 43 base64url chars, no padding.
+    rest.len() == 43 && rest.bytes().all(is_base64url_byte)
+}
+
+/// Base64url alphabet, no padding (`URL_SAFE_NO_PAD` output).
+fn is_base64url_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
 /// Verify a presented key against the store. Pure: never writes.
 ///
 /// Linear over the accounts, which is fine at any realistic pool size (tens);
@@ -578,6 +624,74 @@ mod tests {
         let masked = account.masked();
         assert!(masked.ends_with('…'));
         assert!(masked.len() < 20, "masked form stays short: {masked}");
+    }
+
+    // ── Standard-header compatibility (shape test) ─────────────────────────
+
+    /// A generated key is recognised by shape, byte for byte.
+    #[test]
+    fn a_generated_key_looks_like_a_gateway_key() {
+        let (key, _hash, _prefix) = generate_key();
+        assert!(
+            looks_like_gateway_key(&key),
+            "a freshly generated key must be recognisable: {key}"
+        );
+        // Padding or stray whitespace must not defeat the check.
+        assert!(looks_like_gateway_key(&format!("  {}  ", key)));
+    }
+
+    /// The direction that matters for correctness: **upstream** keys must never
+    /// be mistaken for gateway keys, or the gate would swallow a credential that
+    /// the passthrough path needs.
+    #[test]
+    fn upstream_keys_are_never_mistaken_for_gateway_keys() {
+        for upstream in [
+            // OpenAI-style
+            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ",
+            "sk-abcdefghijklmnopqrstuvwxyz",
+            // Anthropic-style
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789",
+            // WorkBuddy / Keycloak session tokens (opaque, long, no `prs_`)
+            "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.c2ln",
+            // A bare word
+            "nouse",
+            "",
+        ] {
+            assert!(
+                !looks_like_gateway_key(upstream),
+                "must NOT be treated as a gateway key: {upstream}"
+            );
+        }
+    }
+
+    /// Right prefix, wrong length: still not ours (a truncated paste, or an
+    /// upstream key that happens to start with the prefix).
+    #[test]
+    fn the_shape_test_requires_the_exact_length() {
+        assert!(!looks_like_gateway_key("prs_"));
+        assert!(!looks_like_gateway_key("prs_short"));
+        let (key, _h, _p) = generate_key();
+        assert!(
+            !looks_like_gateway_key(&key[..key.len() - 1]),
+            "one char short"
+        );
+        assert!(!looks_like_gateway_key(&format!("{key}x")), "one char long");
+    }
+
+    /// Base64url only — a key carrying `+` / `/` / `=` is not one of ours.
+    #[test]
+    fn the_shape_test_rejects_non_base64url_bytes() {
+        let body = "A".repeat(43);
+        assert!(looks_like_gateway_key(&format!("prs_{body}")));
+        for bad in ["+", "/", "=", " ", "!"] {
+            let mut chars: Vec<char> = body.chars().collect();
+            chars[10] = bad.chars().next().unwrap();
+            let candidate = format!("prs_{}", chars.into_iter().collect::<String>());
+            assert!(
+                !looks_like_gateway_key(&candidate),
+                "must reject {bad:?} inside the body"
+            );
+        }
     }
 
     #[tokio::test]

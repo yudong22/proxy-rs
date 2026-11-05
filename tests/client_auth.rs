@@ -293,6 +293,268 @@ async fn a_disabled_account_takes_effect_without_a_restart() {
     );
 }
 
+// ── Standard client headers work with only a key + base URL ────────────────
+
+/// The usability requirement: an off-the-shelf client configured with just a
+/// base URL and an API key must work, without knowing about `x-proxy-rs-key`.
+#[tokio::test]
+async fn the_key_works_in_authorization_bearer() {
+    let _iso = isolate("std-auth").await;
+    let (_account, key) = client_accounts::create_account("client", "").expect("create");
+    let state = Arc::new(ClientAuthState::new(true));
+    state.reload_from_store().await;
+    let app = router_with(state, unreachable_upstream_config());
+
+    // This is what `ANTHROPIC_AUTH_TOKEN` / OpenAI SDK `api_key` produce.
+    let (status, _) = post_messages(app, &[("authorization", &format!("Bearer {key}"))]).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a gateway key in `Authorization: Bearer` must authenticate"
+    );
+}
+
+#[tokio::test]
+async fn the_key_works_in_x_api_key() {
+    let _iso = isolate("std-xapikey").await;
+    let (_account, key) = client_accounts::create_account("client", "").expect("create");
+    let state = Arc::new(ClientAuthState::new(true));
+    state.reload_from_store().await;
+    let app = router_with(state, unreachable_upstream_config());
+
+    // Claude Code's `ANTHROPIC_API_KEY` lands here.
+    let (status, _) = post_messages(app, &[("x-api-key", &key)]).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a gateway key in `x-api-key` must authenticate"
+    );
+}
+
+#[tokio::test]
+async fn the_explicit_header_still_wins() {
+    let _iso = isolate("explicit-wins").await;
+    let (_account, key) = client_accounts::create_account("client", "").expect("create");
+    let state = Arc::new(ClientAuthState::new(true));
+    state.reload_from_store().await;
+    let app = router_with(state, unreachable_upstream_config());
+
+    // Both present: the dedicated header is authoritative and the standard one
+    // is simply left for the upstream path (here it is junk, which is fine —
+    // the gate is satisfied by the explicit header).
+    let (status, _) = post_messages(
+        app,
+        &[
+            (KEY_HEADER, &key),
+            ("authorization", "Bearer some-upstream-key"),
+        ],
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The safety direction: an upstream key in a standard header must be **left
+/// alone** by the gate, not swallowed.
+///
+/// This is the case that would silently break passthrough deployments if the
+/// header check were loose: the gate would consume the upstream key, decide it
+/// is not a gateway key, and either refuse the request or forward it with no
+/// credential at all.
+#[tokio::test]
+async fn an_upstream_key_in_a_standard_header_is_left_for_passthrough() {
+    let _iso = isolate("passthrough-intact").await;
+    let (base_url, captured) = mock_upstream().await;
+
+    let state = Arc::new(ClientAuthState::new(true));
+    state.reload_from_store().await;
+
+    let config = Config {
+        upstream_urls: vec![base_url],
+        passthrough_api_key: true,
+        models_flavor: ModelsFlavor::WorkBuddyConfig,
+        client_auth_enabled: true,
+        ..Default::default()
+    };
+    let app = router_with(state.clone(), config);
+
+    // Only an upstream key, no gateway key. With no gateway accounts at all,
+    // nothing can match, so this must be refused — and crucially the upstream
+    // key must NOT be the reason it is stored or consumed.
+    let (status, _) = post_messages(app, &[("x-api-key", "sk-upstream-only")]).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an upstream key alone is not a gateway credential"
+    );
+    assert!(
+        captured.lock().expect("lock").is_empty(),
+        "nothing may reach the upstream on an unauthenticated request"
+    );
+}
+
+/// A gateway key presented in a standard header is consumed, so it must not be
+/// forwarded upstream — the same rule as the dedicated header.
+///
+/// This is the leak that would matter if the standard-header support were added
+/// carelessly: a user pasting their gateway key into `x-api-key` (the natural
+/// thing to do) would otherwise have that key forwarded to the upstream.
+#[tokio::test]
+async fn a_gateway_key_in_a_standard_header_is_not_forwarded_upstream() {
+    let _iso = isolate("std-no-leak").await;
+    let (base_url, captured) = mock_upstream().await;
+    let (_account, gateway_key) = client_accounts::create_account("client", "").expect("create");
+    let state = Arc::new(ClientAuthState::new(true));
+    state.reload_from_store().await;
+
+    // A static upstream key is configured, so the upstream has a credential of
+    // its own and does not depend on the client's header.
+    let config = Config {
+        upstream_urls: vec![base_url],
+        api_key: Some("sk-static-upstream".to_string()),
+        models_flavor: ModelsFlavor::WorkBuddyConfig,
+        client_auth_enabled: true,
+        ..Default::default()
+    };
+    let app = router_with(state, config);
+
+    let (status, _) = post_messages(app, &[("x-api-key", &gateway_key)]).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the gateway key authenticates"
+    );
+
+    let requests = captured.lock().expect("capture lock").clone();
+    assert_eq!(requests.len(), 1);
+    for value in requests[0].values() {
+        if let Ok(text) = value.to_str() {
+            assert!(
+                !text.contains(&gateway_key),
+                "the gateway key leaked upstream via a standard header: {text}"
+            );
+        }
+    }
+    // The upstream still got its own configured static key.
+    assert_eq!(
+        requests[0]
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "Bearer sk-static-upstream"
+    );
+}
+
+/// **The deployment shape this release is designed for.**
+///
+/// A client is configured with nothing but a base URL and an API key. That key
+/// is a *gateway* key: it proves the caller may use this gateway, and nothing
+/// else. The upstream is authenticated by the **credential pool**, which is
+/// entirely independent of what the client sent.
+///
+/// Asserts three things at once:
+///   1. a standard header alone is enough to get in;
+///   2. the upstream credential is the pool's account token, not the client's;
+///   3. the gateway key appears nowhere in the outbound request.
+#[tokio::test]
+async fn a_gateway_key_authenticates_here_while_the_pool_authenticates_upstream() {
+    let _iso = isolate("pool-upstream").await;
+    let (base_url, captured) = mock_upstream().await;
+
+    let (_account, gateway_key) = client_accounts::create_account("我们家", "").expect("create");
+    let state = Arc::new(ClientAuthState::new(true));
+    state.reload_from_store().await;
+
+    // The upstream credential lives in the pool — never in the client request.
+    let pool = proxy_rs::session_pool::CredentialPool::new(vec![pool_credential()]);
+    let config = Config {
+        upstream_urls: vec![base_url],
+        models_flavor: ModelsFlavor::WorkBuddyConfig,
+        credential_pool_enabled: true,
+        client_auth_enabled: true,
+        // Passthrough OFF: the upstream key comes from the pool, which is the
+        // normal shape for this deployment.
+        passthrough_api_key: false,
+        ..Default::default()
+    };
+
+    let app = build_app_router(
+        {
+            let ctrl = ServiceController::new(false);
+            ctrl.mark_running();
+            ctrl
+        },
+        Arc::new(LogBuffer::new(200)),
+        Arc::new(config),
+        reqwest::Client::new(),
+        StatsDb::in_memory().expect("in-memory sqlite"),
+        metrics::install(),
+        Arc::new(pool),
+        state.clone(),
+    );
+
+    // Only the gateway key, in a standard header — the "paste key + host" setup.
+    let (status, _) = post_messages(app, &[("x-api-key", &gateway_key)]).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a standard header carrying a gateway key must authenticate"
+    );
+
+    let requests = captured.lock().expect("capture lock").clone();
+    assert_eq!(requests.len(), 1, "the request reached the upstream");
+    let outbound = &requests[0];
+
+    // 1. Upstream credential is the pool's account token.
+    let outbound_auth = outbound
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        outbound_auth, "Bearer account-access-token",
+        "the upstream must be authenticated by the credential pool"
+    );
+
+    // 2. The gateway key is nowhere outbound — not on its own header, not in any
+    //    header value, not as the upstream credential.
+    assert!(outbound.get(KEY_HEADER).is_none());
+    for value in outbound.values() {
+        if let Ok(text) = value.to_str() {
+            assert!(
+                !text.contains(&gateway_key),
+                "the gateway key must never be forwarded upstream: {text}"
+            );
+        }
+    }
+}
+
+/// A pool credential, taking it from the existing helper's shape.
+///
+/// `needless_update` would fire if every field were listed; they are not — the
+/// credential struct carries cooldown/points/error bookkeeping this test has no
+/// opinion about — so the update is meaningful and the lint is wrong here.
+#[allow(clippy::needless_update)]
+fn pool_credential() -> proxy_rs::workbuddy_auth::WorkBuddyCredential {
+    proxy_rs::workbuddy_auth::WorkBuddyCredential {
+        id: "wb-abc123".to_string(),
+        label: "test account".to_string(),
+        access_token: "account-access-token".to_string(),
+        refresh_token: None,
+        expires_at_ms: None,
+        domain: "www.codebuddy.cn".to_string(),
+        account: proxy_rs::workbuddy_auth::WorkBuddyAccount {
+            uid: "uid-1".to_string(),
+            enterprise_id: "ent-1".to_string(),
+            nickname: "test".to_string(),
+            ..Default::default()
+        },
+        machine_id: "machine-abc".to_string(),
+        enabled: true,
+        // Several credential fields (cooldown, last_error, points, …) are not
+        // listed above; this keeps the test resilient to the struct growing.
+        ..Default::default()
+    }
+}
+
 // ── The two keys must not interfere (the decisive test) ────────────────────
 
 /// A mock upstream that records the request headers it received.
