@@ -2733,9 +2733,21 @@ fn main() {
             // (closed into the tray) fires `Reopen`. Tauri does not auto-show the
             // window, so without this the only way back is the tray menu. Restore
             // it here so the Dock is a first-class way to reopen the console.
+            //
+            // macOS-only, and the `cfg` is load-bearing rather than cosmetic:
+            // `RunEvent::Reopen` is declared `#[cfg(target_os = "macos")]` in
+            // tauri, so referring to it on Windows is a hard compile error
+            // (E0599: no variant named `Reopen`). The macOS Dock has no Windows
+            // counterpart anyway — re-launching the exe goes through the
+            // single-instance plugin, which focuses the window itself.
+            #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
                 focus_main_window(app);
             }
+            // Other platforms: `event` is unused, so bind it away to keep the
+            // closure warning-free under `-D warnings`.
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
         });
 }
 
