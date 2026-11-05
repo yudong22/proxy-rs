@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 /// Claude Code's user settings file.
 pub fn settings_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".claude/settings.json"))
+    let home = crate::settings::home_dir()?;
+    Some(home.join(".claude/settings.json"))
 }
 
 /// Token written to `ANTHROPIC_AUTH_TOKEN`.

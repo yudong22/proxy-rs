@@ -27,11 +27,7 @@ pub fn config_path() -> Option<PathBuf> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".codex"))
-        })?;
+        .or_else(|| crate::settings::home_dir().map(|h| h.join(".codex")))?;
     Some(home.join("config.toml"))
 }
 

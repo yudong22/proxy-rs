@@ -80,12 +80,7 @@ pub fn dsh_home() -> Option<PathBuf> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|h| !h.trim().is_empty())
-                .map(|h| PathBuf::from(h).join(".dsh"))
-        })
+        .or_else(|| crate::settings::home_dir().map(|h| h.join(".dsh")))
 }
 
 /// Directory holding every profile.

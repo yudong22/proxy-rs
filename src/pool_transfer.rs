@@ -462,8 +462,8 @@ pub fn default_export_path() -> PathBuf {
         crate::util::local_utc_offset_secs(),
     );
     let name = format!("proxy-rs-pool-{stamp}.json");
-    if let Some(home) = std::env::var_os("HOME") {
-        let downloads = PathBuf::from(home).join("Downloads");
+    if let Some(home) = crate::settings::home_dir() {
+        let downloads = home.join("Downloads");
         if downloads.is_dir() {
             return downloads.join(name);
         }

@@ -179,18 +179,69 @@ impl Default for GuiSettings {
     }
 }
 
+/// The user's home directory, cross-platform.
+///
+/// ## Why this is not just `HOME`
+///
+/// `HOME` is a Unix convention. **Windows does not set it** — the standard
+/// variable there is `USERPROFILE` (and `HOMEDRIVE`+`HOMEPATH` as a legacy
+/// fallback). Reading only `HOME` therefore returns `None` on a stock Windows
+/// box, and every caller that does `Option::unwrap_or(".")` silently degrades.
+///
+/// That degradation is not theoretical — it shipped. On a real Windows Server
+/// install launched from Explorer, `data_dir()` returned `None`, so
+/// `settings_path()` fell back to `current_dir()/gui-settings.json`, and the
+/// whole state directory (settings, credentials, stats.db, logs) landed in
+/// `C:\Program Files\Proxy RS\` next to the executable, because that is the
+/// working directory of an Explorer-launched process. Two consequences:
+///
+///   * the write succeeded only via UAC virtualisation — a real hazard, and a
+///     silent one;
+///   * the data sat inside the install directory, so an upgrade or uninstall
+///     took the user's credentials with it.
+///
+/// Resolution order: `HOME` (Unix, and what a shell sets on Windows when present)
+/// → `USERPROFILE` (Windows) → `HOMEDRIVE`+`HOMEPATH` (legacy Windows).
+pub fn home_dir() -> Option<PathBuf> {
+    // `HOME` first: on Unix it is the answer, and on Windows a user who has set
+    // it explicitly (Git Bash, MSYS2, some CI runners) means it.
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = PathBuf::from(home);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    // Windows standard.
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let path = PathBuf::from(profile);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    // Legacy Windows: the two halves are separate variables.
+    if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+    {
+        let mut combined = PathBuf::from(drive);
+        combined.push(path);
+        if !combined.as_os_str().is_empty() {
+            return Some(combined);
+        }
+    }
+    None
+}
+
 /// Canonical data directory: `~/.proxy-rs`.
 ///
 /// [`DATA_DIR_ENV`] relocates the whole directory — settings, `stats.db`,
 /// `logs/` and `.env` together — which is what keeps a development run from
 /// writing request statistics into the installed app's database.
+///
+/// The home lookup goes through [`home_dir`], so this works on Windows (where
+/// `HOME` is normally unset) instead of collapsing to a relative path.
 pub fn data_dir() -> Option<PathBuf> {
     let dir = match env_data_dir() {
         Some(dir) => dir,
-        None => {
-            let home = std::env::var("HOME").ok()?;
-            PathBuf::from(home).join(".proxy-rs")
-        }
+        None => home_dir()?.join(".proxy-rs"),
     };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
@@ -224,10 +275,7 @@ fn env_data_dir() -> Option<PathBuf> {
         return None;
     }
     match raw.strip_prefix("~/") {
-        Some(rest) => {
-            let home = std::env::var("HOME").ok()?;
-            Some(PathBuf::from(home).join(rest))
-        }
+        Some(rest) => Some(home_dir()?.join(rest)),
         None => Some(PathBuf::from(raw)),
     }
 }
@@ -590,6 +638,100 @@ pub fn normalize_chat_url(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cross-platform home resolution ────────────────────────────────────
+
+    /// `HOME` wins when set, and is what Unix relies on.
+    #[test]
+    fn home_dir_prefers_home() {
+        let _guard = home_env_lock();
+        let saved = snapshot_home_env();
+        std::env::set_var("HOME", "/tmp/home-definitely");
+        std::env::set_var("USERPROFILE", "C:/Users/fallback");
+        assert_eq!(
+            home_dir(),
+            Some(PathBuf::from("/tmp/home-definitely")),
+            "HOME must win over USERPROFILE"
+        );
+        restore_home_env(saved);
+    }
+
+    /// **The Windows bug, as a test.** With `HOME` unset — the stock Windows
+    /// situation — the lookup must fall back to `USERPROFILE` rather than
+    /// returning `None`. Before this fix `data_dir()` returned `None`, so every
+    /// store fell back to `current_dir()`, which for an Explorer-launched app is
+    /// the install directory (`C:\Program Files\Proxy RS\`).
+    #[test]
+    fn home_dir_falls_back_to_userprofile_when_home_is_unset() {
+        let _guard = home_env_lock();
+        let saved = snapshot_home_env();
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", "C:/Users/someone");
+        assert_eq!(
+            home_dir(),
+            Some(PathBuf::from("C:/Users/someone")),
+            "USERPROFILE is the Windows standard and must be used"
+        );
+        restore_home_env(saved);
+    }
+
+    /// Legacy Windows: `HOMEDRIVE` + `HOMEPATH`, joined.
+    #[test]
+    fn home_dir_accepts_the_legacy_windows_pair() {
+        let _guard = home_env_lock();
+        let saved = snapshot_home_env();
+        std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
+        std::env::set_var("HOMEDRIVE", "C:");
+        std::env::set_var("HOMEPATH", "Users/legacy");
+        // `PathBuf::push` inserts the separator, so the two halves join to
+        // `C:/Users/legacy` — the important part is that they are combined at
+        // all rather than each being tried alone.
+        assert_eq!(
+            home_dir(),
+            Some(PathBuf::from("C:/Users/legacy")),
+            "HOMEDRIVE+HOMEPATH must be combined"
+        );
+        restore_home_env(saved);
+    }
+
+    /// An empty value is not a home. Treating `HOME=""` as valid would make
+    /// `data_dir()` resolve to a bare `.proxy-rs` relative to the CWD — the same
+    /// class of bug this fix is about.
+    #[test]
+    fn home_dir_rejects_empty_values() {
+        let _guard = home_env_lock();
+        let saved = snapshot_home_env();
+        std::env::set_var("HOME", "");
+        std::env::set_var("USERPROFILE", "");
+        std::env::remove_var("HOMEDRIVE");
+        std::env::remove_var("HOMEPATH");
+        assert_eq!(home_dir(), None);
+        restore_home_env(saved);
+    }
+
+    /// Serialises the tests above: they mutate process-global env vars.
+    fn home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// `(key, previous value)` for every var [`home_dir`] consults.
+    fn snapshot_home_env() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect()
+    }
+
+    fn restore_home_env(saved: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 
     /// Terminator for the long bodies in the concurrency test, so a line that
     /// got cut short is detectable rather than looking merely shorter.

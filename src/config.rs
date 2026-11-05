@@ -41,10 +41,13 @@ fn parse_dotenv(path: &std::path::Path) -> Option<std::collections::HashMap<Stri
 /// this never calls.
 fn load_dotenv_file() -> std::collections::HashMap<String, String> {
     let mut candidates = vec![PathBuf::from(".env")];
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(&home).join(".proxy-rs").join(".env"));
-        candidates.push(PathBuf::from(&home).join(".proxy-rs.env"));
-        candidates.push(PathBuf::from(home).join(".anthropic-proxy.env"));
+    // `home_dir` rather than `HOME`: Windows does not set `HOME`, and without
+    // this the documented `~/.proxy-rs/.env` location is never even probed
+    // there.
+    if let Some(home) = crate::settings::home_dir() {
+        candidates.push(home.join(".proxy-rs").join(".env"));
+        candidates.push(home.join(".proxy-rs.env"));
+        candidates.push(home.join(".anthropic-proxy.env"));
     }
     candidates.push(PathBuf::from("/etc/proxy-rs/.env"));
     candidates.push(PathBuf::from("/etc/anthropic-proxy/.env"));

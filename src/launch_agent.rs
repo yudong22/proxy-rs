@@ -6,9 +6,11 @@ use std::path::PathBuf;
 const LABEL: &str = "com.proxy-rs.gui";
 
 pub fn plist_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join("Library/LaunchAgents")
+    // macOS-only code, but the lookup goes through the shared helper so a
+    // Windows build (where this is a no-op) does not carry a second, subtly
+    // different notion of "the user's home".
+    let home = crate::settings::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    home.join("Library/LaunchAgents")
         .join(format!("{}.plist", LABEL))
 }
 

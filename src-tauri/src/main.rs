@@ -542,6 +542,28 @@ async fn save_settings(
         .push("INFO", format!("设置已保存 (服务商: {})", provider))
         .await;
 
+    // Hot-apply the inbound gate *before* the proxy restarts.
+    //
+    // `ClientAuthState` is built once at process start and deliberately not
+    // rebuilt on a proxy restart (it holds the throttled `last_used_ms`
+    // bookkeeping). That made the GUI switch feel broken: the value was saved
+    // and the listener restarted, yet requests kept being served without a key
+    // until the whole app was quit and relaunched. Updating the live state here
+    // — and re-reading the store, so accounts added elsewhere are picked up
+    // too — makes the switch mean what it says.
+    let auth_enabled = proxy_rs::client_accounts::enabled_from(body.client_auth_enabled);
+    ctx.client_auth.set_enabled(auth_enabled);
+    ctx.client_auth.reload_from_store().await;
+    ctx.logs
+        .push(
+            "INFO",
+            format!(
+                "入站鉴权已{}（重启代理使其对新配置完全生效）",
+                if auth_enabled { "启用" } else { "关闭" }
+            ),
+        )
+        .await;
+
     // Toggle launch at login.
     //
     // The launchd copy skips `install()`: this process *is* the job, and
