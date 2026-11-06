@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod admin_auth;
 pub mod admin_routes;
+pub mod admin_rpc;
 pub mod api;
 pub mod api_token;
 pub mod claude_config;
@@ -8,6 +9,7 @@ pub mod client_accounts;
 pub mod client_auth;
 pub mod codex_config;
 pub mod config;
+pub mod console;
 pub mod credits;
 pub mod dsh_config;
 pub mod error;

@@ -66,11 +66,27 @@ impl ProcessInfo {
             // with the desktop payload.
             "running": true,
             "service_running": true,
+            // Read by the shared front-end to label the process lifecycle. The
+            // console cannot hide the start/stop button (that file is shared
+            // with the desktop app), so clicking it surfaces the bridge's
+            // explanation instead of a silent no-op.
             "managed_by": "systemd",
+            "can_control_service": false,
             "uptime_secs": self.started_at.elapsed().as_secs(),
             "version": self.version,
             "provider": settings.provider_id,
-            "upstream": settings.chat_url(&presets),
+            "upstream_url": settings.chat_url(&presets),
+            "config_path": settings::settings_path().display().to_string(),
+            "log_path": settings::log_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            // Desktop-only fields the shared front-end reads. They are answered
+            // honestly rather than omitted: a missing key renders as the empty
+            // string in a `<code>` element, which looks like a bug, while an
+            // explicit "由 systemd 托管" reads as the truth.
+            "launch_at_login": false,
+            "launch_at_login_stale": false,
+            "managed_by": "systemd",
             "port": self.bound_port,
             "configured_port": settings.port,
             "bind": self.bind_addr,
@@ -484,6 +500,90 @@ pub fn save_schedule(enabled: bool, time: &str, growth: Option<bool>) -> Result<
     Ok(preferences_json())
 }
 
+// ── Overview cards ─────────────────────────────────────────────────────────
+
+/// The identity currently in force, for the overview header's three cards.
+///
+/// Resolved through `effective_default_identity` rather than the stored
+/// preference: with no explicit default the first usable entry wins, and the
+/// card must describe what is *actually* serving traffic.
+pub fn current_identity_summary() -> Value {
+    let id = workbuddy_auth::effective_default_identity();
+    let (label, points) = match id.as_str() {
+        id if id.starts_with("wb-") => workbuddy_auth::load_credentials()
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| (c.label, c.points))
+            .unwrap_or_else(|| ("未知账号".to_string(), None)),
+        id if id.starts_with("k-") => workbuddy_auth::load_api_keys()
+            .into_iter()
+            .find(|k| k.id == id)
+            .map(|k| (k.label, k.points))
+            .unwrap_or_else(|| ("未知密钥".to_string(), None)),
+        _ => ("静态 API Key".to_string(), None),
+    };
+    json!({ "id": id, "label": label, "points": points })
+}
+
+/// Credentials list in the shape the desktop console's identity pool expects.
+pub async fn credentials_list(pool: &CredentialPool) -> Result<Value> {
+    let items = workbuddy_auth::load_credentials();
+    let prefs = workbuddy_auth::load_preferences();
+    let now = crate::util::unix_millis();
+    let effective_default = items
+        .iter()
+        .find(|c| c.is_usable(now))
+        .map(|c| c.id.clone())
+        .unwrap_or_default();
+    let default_id = if prefs.default_credential_id.is_empty() {
+        effective_default
+    } else {
+        prefs.default_credential_id.clone()
+    };
+    let mut list: Vec<Value> = Vec::with_capacity(items.len());
+    for c in &items {
+        let sessions = pool.sticky_sessions_for(&c.id).await;
+        list.push(credential_json(c, sessions, c.id == default_id));
+    }
+    Ok(json!({
+        "credentials": list,
+        "default_credential_id": prefs.default_credential_id,
+        "default_identity_id": prefs.default_identity_id,
+        "identity_order": prefs.identity_order,
+    }))
+}
+
+/// Upstream API keys in the shape the identity pool expects.
+pub fn api_keys_list() -> Result<Value> {
+    let items = workbuddy_auth::load_api_keys();
+    let prefs = workbuddy_auth::load_preferences();
+    let effective = workbuddy_auth::active_api_key();
+    let list: Vec<Value> = items
+        .iter()
+        .map(|k| {
+            let is_default = if !prefs.default_key_id.is_empty() {
+                k.id == prefs.default_key_id
+            } else {
+                effective.as_deref() == Some(k.key.as_str())
+            };
+            json!({
+                "id": k.id,
+                "label": k.label,
+                "masked": k.masked(),
+                "enabled": k.enabled,
+                "points": k.points,
+                "is_default": is_default,
+                "kind": "key",
+            })
+        })
+        .collect();
+    Ok(json!({
+        "keys": list,
+        "default_key_id": prefs.default_key_id,
+        "default_identity_id": prefs.default_identity_id,
+    }))
+}
+
 // ── Inbound access accounts ────────────────────────────────────────────────
 
 pub fn client_account_json(a: &client_accounts::ClientAccount, now_ms: i64) -> Value {
@@ -610,6 +710,139 @@ fn parse_import_mode(mode: &str) -> Result<pool_transfer::ImportMode> {
         "replace" => Ok(pool_transfer::ImportMode::Replace),
         other => bail!("未知的导入模式: {other}（可选 merge / replace）"),
     }
+}
+
+// ── DSH / points ───────────────────────────────────────────────────────────
+
+/// Report the DSH provider wiring so the console can show the current state.
+pub fn read_dsh_config() -> Result<Value> {
+    let Some(patch_path) = crate::dsh_config::patch_path() else {
+        return Ok(json!({
+            "supported": false,
+            "reason": "DSH_HOME / HOME is not set",
+        }));
+    };
+    let credentials_path = crate::dsh_config::credentials_path();
+    if !patch_path.exists() {
+        return Ok(json!({
+            "supported": true,
+            "profile": crate::dsh_config::active_profile(),
+            "settings_path": patch_path.display().to_string(),
+            "settings_exists": false,
+            "provider_exists": false,
+            "model_count": 0,
+            "base_url": null,
+            "credential_present": false,
+            "session_header": false,
+        }));
+    }
+    let settings_text =
+        std::fs::read_to_string(&patch_path).map_err(|e| anyhow!("读取 DSH 配置失败: {e}"))?;
+    let credentials_text = credentials_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let state = crate::dsh_config::read_state(&settings_text, credentials_text.as_deref());
+    Ok(json!({
+        "supported": true,
+        "profile": crate::dsh_config::active_profile(),
+        "settings_path": patch_path.display().to_string(),
+        "settings_exists": true,
+        "provider_exists": state.provider_exists,
+        "model_count": state.model_ids.len(),
+        "base_url": state.base_url,
+        "credential_present": state.credential_present,
+        "session_header": state.session_header,
+    }))
+}
+
+/// Write this proxy into the active DSH profile's patch file.
+pub async fn apply_dsh_config(
+    state: &std::sync::Arc<crate::admin_routes::AdminState>,
+) -> Result<Value> {
+    let Some(patch_path) = crate::dsh_config::patch_path() else {
+        bail!("DSH_HOME / HOME 未设置，无法定位 DSH 配置");
+    };
+    let Some(credentials_path) = crate::dsh_config::credentials_path() else {
+        bail!("DSH_HOME / HOME 未设置，无法定位 DSH 凭据文件");
+    };
+    let settings = GuiSettings::load();
+    let preset = settings.models_preset();
+    if settings.api_key.is_empty() {
+        bail!("尚未配置 API Key，无法拉取模型列表");
+    }
+    let client = reqwest::Client::new();
+    let models = crate::providers::fetch_models(&client, &preset, &settings.api_key)
+        .await
+        .map_err(|e| anyhow!("从上游 {} 拉取模型失败，未改动 DSH 配置: {e}", preset.id))?;
+    if models.is_empty() {
+        bail!("上游 {} 未返回任何模型，未改动 DSH 配置", preset.id);
+    }
+    let base_url = format!("http://127.0.0.1:{}/v1", state.process.bound_port);
+    let dsh_models: Vec<crate::dsh_config::DshModel> =
+        models.iter().map(crate::dsh_config::to_dsh_model).collect();
+    let (patch, credentials, credential_added) =
+        crate::dsh_config::apply(&patch_path, &credentials_path, &base_url, &dsh_models)
+            .map_err(|e| anyhow!("写入 DSH 配置失败: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "models": dsh_models.len(),
+        "profile": crate::dsh_config::active_profile(),
+        "settings_path": patch.display().to_string(),
+        "credentials_path": credentials.display().to_string(),
+        "credential_added": credential_added,
+    }))
+}
+
+/// Refresh every identity's point balance.
+pub async fn refresh_all_points(
+    state: &std::sync::Arc<crate::admin_routes::AdminState>,
+) -> Result<Value> {
+    let report = workbuddy_auth::refresh_all_points(&state.client).await;
+    let known = report.results.iter().filter(|r| r.points.is_some()).count();
+    state
+        .logs
+        .push(
+            "INFO",
+            format!(
+                "已刷新身份池积分: 共 {} 个（账号+密钥），{} 个读取成功",
+                report.results.len(),
+                known
+            ),
+        )
+        .await;
+    Ok(json!({
+        "results": report.results,
+        "current_identity": current_identity_summary(),
+    }))
+}
+
+/// Refresh one identity's point balance.
+pub async fn refresh_one_points(
+    state: &std::sync::Arc<crate::admin_routes::AdminState>,
+    id: &str,
+) -> Result<Value> {
+    let Some(result) = workbuddy_auth::refresh_one_points(&state.client, id).await else {
+        bail!("身份不存在: {id}");
+    };
+    state
+        .logs
+        .push(
+            "INFO",
+            format!(
+                "已刷新积分: {} ({}) → {}",
+                result.label,
+                result.id,
+                match result.points {
+                    Some(p) => format!("{p:.2}"),
+                    None => "读取失败".to_string(),
+                }
+            ),
+        )
+        .await;
+    Ok(json!({
+        "result": result,
+        "current_identity": current_identity_summary(),
+    }))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

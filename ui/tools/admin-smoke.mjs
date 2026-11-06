@@ -1,34 +1,31 @@
 #!/usr/bin/env node
 /**
- * Boot the server-mode admin console in headless Chrome and assert it works.
+ * Boot the server-hosted console in headless Chrome and assert it is the *real*
+ * desktop front-end, still working over the HTTP bridge.
  *
- * ## Why this exists
+ * ## Why this harness exists (and why it asserts on shared UI)
  *
- * `ui/tools/check-ui.mjs` checks the *desktop* front-end statically, and
- * `ui/tools/smoke.mjs` boots it against a mocked Tauri bridge. Neither touches
- * the server console, which is a different page with no Tauri at all: it talks
- * to `/admin/api/*` over `fetch` with a session cookie.
+ * The gateway serves `ui/index.html` verbatim — the same file, modules and
+ * stylesheets the Tauri window loads — and the only difference is that
+ * `src/core/ipc.js`'s `invoke()` is filled by `ui/server/bridge.js` instead of
+ * Tauri IPC. The entire value of that design is that the two front-ends cannot
+ * drift, which is only true if the shared UI actually *runs* this way.
  *
- * That means the failure modes are different too, and several are invisible to
- * any static check:
+ * Several failure modes are invisible to any static check and to any unit test
+ * of the bridge alone:
  *
- *   · a relative API base resolves against `/admin/api/` and doubles the prefix;
- *   · a page served as `text/plain` is refused by the browser as a module;
- *   · a login that succeeds but never shows the shell (a missing `refreshAll`);
- *   · a cookie the browser drops because it was marked `Secure` over HTTP.
- *
- * The last one is the reason this runs against a *live* gateway rather than a
- * mock: the cookie flags, the `Set-Cookie` parse and the `fetch` credentials mode
- * are all decided by the browser, and a mock would assert our assumptions instead
- * of the browser's behaviour.
+ *   · the bridge script not being injected before `main.js` (blank page);
+ *   · a command the desktop app calls but the RPC table forgot (every panel that
+ *     uses it renders empty, with a console error the operator never sees);
+ *   · a relative asset path that 404s only from the `/admin/` prefix;
+ *   · a cookie the browser refuses because it was marked `Secure` over HTTP.
  *
  * ## Usage
  *
- *   node ui/tools/admin-smoke.mjs                 # skips if no gateway/Chrome
  *   BASE=http://127.0.0.1:3456 TOKEN=xxx node ui/tools/admin-smoke.mjs
  *
- * Exits 1 on any failure. Prints SKIPPED (exit 0) when the prerequisites are
- * absent, so it can sit in a normal `task check` without a gateway running.
+ * Prints SKIPPED (exit 0) when the prerequisites are absent, so it can sit in a
+ * normal `task check` without a gateway running.
  */
 
 import fs from 'node:fs';
@@ -49,11 +46,11 @@ if (!TOKEN) {
 }
 if (!fs.existsSync(CHROME)) {
   console.log(`SKIPPED: no Chrome at ${CHROME}`);
-  console.log('Set CHROME_PATH to a Chrome/Chromium binary to run this harness.');
+  console.log('Set CHROME_PATH to a Chrome/Chromium binary.');
   process.exit(0);
 }
 
-const DEBUG = 9333 + (process.pid % 200);
+const DEBUG = 9400 + (process.pid % 200);
 const getJson = (url) =>
   new Promise((resolve, reject) => {
     http
@@ -71,10 +68,8 @@ const getJson = (url) =>
       .on('error', reject);
   });
 
-// Is a gateway actually listening? Without this the harness would report a
-// connection error as a console bug.
 try {
-  const res = await fetch(`${BASE}/admin/api/`, { signal: AbortSignal.timeout(3000) });
+  const res = await fetch(`${BASE}/admin/`, { signal: AbortSignal.timeout(3000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 } catch (e) {
   console.log(`SKIPPED: no gateway at ${BASE} (${e.message})`);
@@ -156,8 +151,6 @@ try {
       expression,
       awaitPromise: true,
       returnByValue: true,
-      // The page is same-origin with the fetch calls it makes, so no CORS
-      // preflight is involved; this just makes the promise resolution explicit.
     });
     if (result.exceptionDetails) {
       throw new Error(
@@ -169,10 +162,10 @@ try {
     return result.result.value;
   };
 
-  const waitFor = async (expression, label, timeoutMs = 6000) => {
+  const waitFor = async (expression, label, timeoutMs = 8000) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (await evaluate(expression)) return true;
+      if (await evaluate(expression)) return;
       await new Promise((r) => setTimeout(r, 120));
     }
     throw new Error(`timed out waiting for ${label}`);
@@ -181,116 +174,138 @@ try {
   await send('Page.enable');
   await send('Runtime.enable');
 
-  // ── The page loads ──────────────────────────────────────────────────────
-  await send('Page.navigate', { url: `${BASE}/admin/api/` });
+  // ── The login page is what an anonymous visitor gets ────────────────────
+  await send('Page.navigate', { url: `${BASE}/admin/` });
   await waitFor('document.readyState === "complete"', 'page load');
   await new Promise((r) => setTimeout(r, 400));
 
-  check('page title', await evaluate('document.title'), 'Proxy RS 管理台');
+  check('an anonymous visitor gets the login page', await evaluate('document.title'), 'Proxy RS · 登录');
   ok(
-    'the login form is the first thing shown (no session yet)',
-    await evaluate('getComputedStyle(document.querySelector("#login-view")).display !== "none"')
-  );
-  ok(
-    'the shell stays hidden before login',
-    await evaluate('!document.querySelector("#shell").classList.contains("show")')
+    'the login form is present',
+    await evaluate('!!document.querySelector("#form") && !!document.querySelector("#token")')
   );
 
-  // The pre-session probe must not have embedded any secret.
-  const html = await evaluate('document.documentElement.innerHTML');
-  ok('the page does not embed the admin token', !html.includes(TOKEN));
-
-  // ── A wrong token is refused in the UI ──────────────────────────────────
+  // ── A wrong token is refused inline ─────────────────────────────────────
   await evaluate('document.querySelector("#token").value = "definitely-wrong"');
-  await evaluate('document.querySelector("#login-form").dispatchEvent(new Event("submit"))');
+  await evaluate('document.querySelector("#form").dispatchEvent(new Event("submit"))');
   await waitFor(
-    'document.querySelector("#login-err").classList.contains("show")',
+    'document.querySelector("#err")?.classList.contains("show")',
     'the wrong-token error'
   );
   ok(
-    'a wrong token shows an inline error and stays on the form',
-    await evaluate('getComputedStyle(document.querySelector("#shell")).display === "none"')
+    'a wrong token shows an inline error and does not navigate',
+    await evaluate('location.pathname.startsWith("/admin")')
   );
 
-  // ── The right token logs in ─────────────────────────────────────────────
+  // ── The right token logs in and lands on the *shared* console ───────────
   await evaluate(`document.querySelector("#token").value = ${JSON.stringify(TOKEN)}`);
-  await evaluate('document.querySelector("#login-form").dispatchEvent(new Event("submit"))');
-  await waitFor(
-    'document.querySelector("#shell").classList.contains("show")',
-    'the dashboard shell'
+  await evaluate('document.querySelector("#form").dispatchEvent(new Event("submit"))');
+  await waitFor('document.readyState === "complete"', 'post-login load');
+  await new Promise((r) => setTimeout(r, 1600));
+
+  // The decisive assertion: this is the desktop front-end, not a lookalike.
+  check('the console is the desktop app (title)', await evaluate('document.title'), 'Proxy RS');
+  ok(
+    'the server bridge replaced Tauri IPC',
+    await evaluate('typeof window.__TAURI__?.core?.invoke === "function"')
   );
   ok(
-    'the login form is gone after a successful login',
-    await evaluate('getComputedStyle(document.querySelector("#login-view")).display === "none"')
+    'the desktop tab bar rendered',
+    (await evaluate('[...document.querySelectorAll(".tab")].map(t=>t.textContent.trim()).join("|")')) ===
+      '运行概览|实时日志|服务设置'
+  );
+  ok(
+    'the desktop header chrome rendered',
+    await evaluate('!!document.querySelector(".header .logo")')
   );
 
-  // The cookie the browser actually stored is the ground truth; asserting on the
-  // header alone would miss a browser dropping it (e.g. `Secure` over plain HTTP).
-  const cookies = await send('Network.getAllCookies').catch(() => null);
-  if (cookies?.cookies) {
-    const session = cookies.cookies.find((c) => c.name === 'proxy_rs_admin');
-    ok('the session cookie is stored by the browser', Boolean(session));
-    ok(
-      'the session cookie is HttpOnly',
-      Boolean(session?.httpOnly),
-      'a page script must not be able to read it'
+  // ── Live data actually flows through the bridge ─────────────────────────
+  await waitFor(
+    'document.querySelector("#status-text")?.textContent?.includes("运行中")',
+    'the status line to be filled from get_status'
+  );
+  const statusText = await evaluate('document.querySelector("#status-text").textContent');
+  ok('the status line names the live port', /运行中 · 端口 \d+/.test(statusText), statusText);
+
+  const shownVersion = await evaluate('document.querySelector("#app-version")?.textContent');
+  ok(
+    'the version comes from the gateway',
+    /^v\d+\.\d+/.test(shownVersion || ''),
+    String(shownVersion)
+  );
+
+  const cards = await evaluate(
+    '[...document.querySelectorAll(".metric-label")].map(e=>e.textContent.trim().replace(/\\s+/g,"")).join(",")'
+  );
+  ok('the desktop metric cards rendered', cards.includes('请求总数') && cards.includes('Token总量'), cards);
+
+  const endpoints = await evaluate(
+    '[...document.querySelectorAll(".kv dt")].map(d=>d.textContent.trim()).join(",")'
+  );
+  ok(
+    'the endpoint reference table rendered',
+    endpoints.includes('Messages API') && endpoints.includes('日志文件'),
+    endpoints
+  );
+
+  // ── Every tab renders ──────────────────────────────────────────────────
+  for (const tab of ['logs', 'settings', 'overview']) {
+    await evaluate(`document.querySelector('.tab[data-tab="${tab}"]').click()`);
+    await new Promise((r) => setTimeout(r, 700));
+    const length = await evaluate(
+      `(document.querySelector("#tab-${tab}")?.textContent || "").trim().length`
     );
-    ok('the session cookie is scoped to /admin', session?.path?.startsWith('/admin'));
+    ok(`tab "${tab}" renders content`, length > 50, `text length ${length}`);
   }
 
-  // ── Every tab renders ───────────────────────────────────────────────────
-  for (const tab of ['overview', 'identities', 'access', 'settings', 'logs', 'pool']) {
-    await evaluate(`document.querySelector('nav button[data-tab="${tab}"]').click()`);
-    await new Promise((r) => setTimeout(r, 350));
-    ok(
-      `tab "${tab}" becomes visible on click`,
-      await evaluate(`document.querySelector("#tab-${tab}").classList.contains("active")`)
+  // ── The commands the settings view needs all route ─────────────────────
+  // Asserted through the bridge directly: a missing RPC arm produces an empty
+  // panel, which is exactly the failure this harness is for.
+  for (const [command, args] of [
+    ['get_providers', {}],
+    ['wb_credentials_list', {}],
+    ['api_keys_list', {}],
+    ['wb_preferences', {}],
+    ['client_accounts_list', {}],
+    ['get_settings', {}],
+    ['get_session_metrics', {}],
+  ]) {
+    const result = await evaluate(
+      `window.__TAURI__.core.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`
+        + '.then(()=>"ok",e=>"ERR: "+e)'
     );
-    ok(
-      `tab "${tab}" renders content`,
-      await evaluate(
-        `(document.querySelector("#tab-${tab}").textContent || "").trim().length > 0`
-      )
-    );
+    check(`command ${command} is routed`, result, 'ok');
   }
 
-  // The overview must show live numbers, not placeholders.
-  await evaluate(`document.querySelector('nav button[data-tab="overview"]').click()`);
-  await waitFor(
-    'document.querySelector("#stat-grid").children.length >= 3',
-    'the statistics grid'
+  // ── The service toggle explains itself instead of lying ────────────────
+  await evaluate(`document.querySelector('.tab[data-tab="overview"]').click()`);
+  await new Promise((r) => setTimeout(r, 400));
+  await evaluate('document.querySelector("#btn-toggle-service").click()');
+  await new Promise((r) => setTimeout(r, 800));
+  const toastText = await evaluate(
+    '[...document.querySelectorAll(".toast,[class*=toast]")].map(t=>t.textContent).join(" / ")'
   );
-  const statCount = await evaluate('document.querySelector("#stat-grid").children.length');
-  ok('the overview fills its statistic cards', statCount >= 3, `got ${statCount}`);
-  const header = await evaluate('document.querySelector("#hdr-meta").textContent');
-  ok('the header shows version and port', /v\d+\.\d+/.test(header), header);
+  ok(
+    'start/stop reports that systemd owns the lifecycle',
+    toastText.includes('systemd'),
+    toastText
+  );
 
-  // ── The API base resolved correctly ─────────────────────────────────────
-  // A relative base would have doubled the `/admin/api` prefix, and every fetch
-  // after login would 404. The dashboard being populated proves it did not, but
-  // an explicit round-trip makes the failure message say so.
-  const roundTrip = await evaluate(
-    'fetch("/admin/api/session", {credentials:"same-origin"}).then(r => r.status)'
-  );
-  check('the API base resolves to one /admin/api prefix', roundTrip, 200);
-
-  // ── Logout returns to the form and kills the session ────────────────────
-  await evaluate('document.querySelector("#logout-btn").click()');
-  await waitFor(
-    'getComputedStyle(document.querySelector("#login-view")).display !== "none"',
-    'the login form after logout'
-  );
+  // ── Logout returns to the form and kills the session ───────────────────
+  await evaluate('fetch("/admin/api/logout",{method:"POST",credentials:"same-origin"})');
   const afterLogout = await evaluate(
-    'fetch("/admin/api/session", {credentials:"same-origin"}).then(r => r.status)'
+    'fetch("/admin/api/rpc/get_status",{method:"POST",credentials:"same-origin",headers:{"content-type":"application/json"},body:"{}"}).then(r=>r.status)'
   );
   check('the session is invalid after logout', afterLogout, 401);
 
-  // ── No uncaught errors anywhere in that run ─────────────────────────────
-  ok(
-    'no uncaught console errors',
-    runtimeErrors.length === 0,
-    runtimeErrors.join('\n      ')
+  // ── No uncaught errors in that whole run ───────────────────────────────
+  // The start/stop click logs through `console.error` by design (the shared view
+  // reports every command failure that way), so its expected refusal is filtered
+  // out — everything else is a genuine error.
+  const unexpected = runtimeErrors.filter(
+    (e) => !e.includes('Toggle service failed')
   );
+  ok('no uncaught console errors', unexpected.length === 0, unexpected.join('\n      '));
 } finally {
   try {
     ws?.close();

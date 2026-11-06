@@ -34,7 +34,7 @@
 //! or their tokens silently age out.
 
 use proxy_rs::{
-    admin, admin_auth, admin_routes, metrics, router, scheduler, service,
+    admin, admin_auth, admin_routes, console, metrics, router, scheduler, service,
     settings::{self, GuiSettings, LogBuffer, DEFAULT_PORT},
     Config, StatsDb,
 };
@@ -202,8 +202,13 @@ async fn main() -> Result<()> {
             started_at: std::time::Instant::now(),
             bind_addr: bind_addr.clone(),
         },
+        client: client.clone(),
     });
-    let admin_router = admin_routes::build_admin_router(admin_state);
+    // The REST surface and the console share one `AdminState` (and therefore one
+    // session map): logging in at the console must authorise the REST calls its
+    // own bridge makes.
+    let admin_router = admin_routes::build_admin_router(admin_state.clone())
+        .merge(console::build_console_router(admin_state));
 
     let app_router = router::build_app_router(
         service_ctrl.clone(),

@@ -50,16 +50,14 @@ pub struct AdminState {
     pub client_auth: Arc<ClientAuthState>,
     pub pool: crate::session_pool::SharedCredentialPool,
     pub process: admin::ProcessInfo,
+    /// Outbound HTTP client, shared with the proxy so the console's occasional
+    /// refreshes (points, model list, upstream test) reuse the same connection
+    /// pool instead of opening a second one per click.
+    pub client: reqwest::Client,
 }
 
 /// Where the admin surface lives, in absolute paths.
 pub const ADMIN_PREFIX: &str = "/admin/api";
-/// The trailing-slash spelling of [`ADMIN_PREFIX`].
-///
-/// A browser adds the slash when the URL is treated as a directory, so it is the
-/// spelling an operator is most likely to hit first. It must serve the console,
-/// not a 404.
-const CONSOLE_SLASH: &str = "/admin/api/";
 
 /// Build the admin router.
 ///
@@ -77,18 +75,10 @@ const CONSOLE_SLASH: &str = "/admin/api/";
 pub fn build_admin_router(state: Arc<AdminState>) -> Router<()> {
     let sessions = state.sessions.clone();
 
-    // Both spellings of the console's front door. Registered before the gated
-    // tree so they are unmistakably outside authentication: this is the page
-    // that *creates* a session.
-    let console = Router::new()
-        .route(ADMIN_PREFIX, get(|| async { console_index() }))
-        .route(CONSOLE_SLASH, get(|| async { console_index() }))
-        .route("/admin/api/index.html", get(|| async { console_index() }))
-        .route("/admin/api/console.js", get(|| async { console_js() }));
-
+    // NOTE: the console page itself is served by `crate::console`, which ships
+    // the *desktop* front-end verbatim over an RPC bridge. This router is the
+    // REST surface only.
     let gated = Router::new()
-        .route("/admin/api/session", get(session_info))
-        .route("/admin/api/logout", post(logout))
         .route("/admin/api/status", get(status))
         .route("/admin/api/stats", get(stats))
         .route("/admin/api/request-logs", get(request_logs))
@@ -134,7 +124,9 @@ pub fn build_admin_router(state: Arc<AdminState>) -> Router<()> {
             delete(client_accounts_delete).patch(client_accounts_patch),
         )
         // Pool import/export
-        .route("/admin/api/pool/export", get(pool_export))
+        // `/pool/export` is served by `crate::console` (a browser download),
+        // not here: the REST handler writes a file at a server path, which the
+        // console path deliberately does not need.
         .route("/admin/api/pool/import/preview", post(pool_import_preview))
         .route("/admin/api/pool/import", post(pool_import))
         // Scheduler snapshot: the console renders the three loops on its
@@ -146,84 +138,20 @@ pub fn build_admin_router(state: Arc<AdminState>) -> Router<()> {
         ));
 
     Router::new()
-        .route("/admin/api/login", post(login))
         .merge(gated)
-        .merge(console)
-        // Unknown paths under the admin prefix answer JSON, so a mistyped
-        // endpoint is a clear error rather than the console's HTML shell.
-        .fallback(console_fallback)
         .layer(Extension(state))
         .with_state(sessions)
 }
 
-// ── Console assets ─────────────────────────────────────────────────────────
-
-/// The console's HTML shell.
-///
-/// Served without authentication on purpose: it is a static login form with no
-/// data in it, and requiring a session to load the page that *creates* a session
-/// is a chicken-and-egg. Everything it can actually do is behind the API.
-fn console_index() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            // The console is versioned with the binary, so a cached page from an
-            // older build could call endpoints that no longer exist. Short cache
-            // with revalidation keeps it fresh without a full re-download.
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        CONSOLE_INDEX,
-    )
-        .into_response()
-}
-
-/// The console's script.
-fn console_js() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        CONSOLE_JS,
-    )
-        .into_response()
-}
-
-/// Answer unmatched admin paths with JSON, not the console's HTML.
-///
-/// A blanket "always serve HTML" fallback would turn a typo in an endpoint path
-/// into a confusing page reload with a 200, which is worse than an error.
-async fn console_fallback(uri: axum::http::Uri) -> Response {
-    let path = uri.path();
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": {
-                "type": "not_found",
-                "message": format!("未知的管理接口: {path}"),
-                "code": "not_found",
-            }
-        })),
-    )
-        .into_response()
-}
-
-/// The console page, compiled in.
-const CONSOLE_INDEX: &str = include_str!("../ui/admin/index.html");
-/// The console script, compiled in.
-const CONSOLE_JS: &str = include_str!("../ui/admin/console.js");
-
 // ── Session ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct LoginBody {
-    token: String,
+pub struct LoginBody {
+    pub token: String,
 }
 
 /// Exchange the operator token for a session cookie.
-async fn login(
+pub async fn login_handler(
     State(sessions): State<Arc<AdminSessions>>,
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
@@ -243,7 +171,10 @@ async fn login(
 }
 
 /// Drop the current session and clear the cookie.
-async fn logout(State(sessions): State<Arc<AdminSessions>>, headers: HeaderMap) -> Response {
+pub async fn logout_handler(
+    State(sessions): State<Arc<AdminSessions>>,
+    headers: HeaderMap,
+) -> Response {
     if let Some(id) = admin_auth::session_cookie(&headers) {
         sessions.logout(&id);
     }
@@ -252,16 +183,6 @@ async fn logout(State(sessions): State<Arc<AdminSessions>>, headers: HeaderMap) 
         .headers_mut()
         .insert(header::SET_COOKIE, admin_auth::clear_cookie_header());
     response
-}
-
-/// Whether the caller is logged in — the console polls this to decide between
-/// the login form and the dashboard.
-async fn session_info(State(sessions): State<Arc<AdminSessions>>) -> Json<Value> {
-    Json(json!({
-        "authenticated": true,
-        "ttl_secs": admin_auth::SESSION_TTL.as_secs(),
-        "active_sessions": sessions.active(),
-    }))
 }
 
 // ── Observation ────────────────────────────────────────────────────────────
@@ -706,60 +627,12 @@ async fn client_accounts_delete(
     Ok(Json(out))
 }
 
-// ── Pool import / export ───────────────────────────────────────────────────
-
-#[derive(Deserialize, Default)]
-struct ExportQuery {
-    #[serde(default)]
-    password: String,
-    #[serde(default)]
-    filename: String,
-}
-
-/// Export the pool as a download.
-///
-/// The desktop app opens a native "save as" panel and needs the ability to write
-/// wherever the user points; a server cannot and should not. Sending bytes to the
-/// browser keeps that privilege on the client side.
-async fn pool_export(Query(q): Query<ExportQuery>) -> Result<Response, ApiError> {
-    let password = if q.password.trim().is_empty() {
-        None
-    } else {
-        Some(q.password.clone())
-    };
-    let text = tokio::task::spawn_blocking(move || admin::export_pool(password.as_deref()))
-        .await
-        .map_err(|e| ApiError::internal(format!("任务异常终止: {e}")))??;
-
-    let filename = if q.filename.trim().is_empty() {
-        format!("proxy-rs-pool-{}.json", crate::util::unix_millis() / 1000)
-    } else {
-        // Strip any path component: the value is reflected into a
-        // Content-Disposition header, and a `../` or a quote there is a header
-        // injection waiting to happen.
-        q.filename
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("proxy-rs-pool.json")
-            .replace(['"', '\r', '\n'], "")
-    };
-
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/json".to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}\""),
-            ),
-            // A pool export contains live tokens: never let a proxy or browser
-            // keep a copy.
-            (header::CACHE_CONTROL, "no-store".to_string()),
-        ],
-        text,
-    )
-        .into_response())
-}
+// ── Pool import ────────────────────────────────────────────────────────────
+//
+// Export is not here: it is a browser download served by `crate::console`. The
+// desktop app used a native "save as" panel and a server path; the console needs
+// neither, and giving the server a write-anywhere capability for it would be a
+// privilege it never uses.
 
 #[derive(Deserialize)]
 struct ImportBody {

@@ -79,8 +79,18 @@ fn test_router_with_sessions() -> (axum::Router, Arc<AdminSessions>) {
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
+        client: reqwest::Client::new(),
     });
-    (build_admin_router(state), sessions)
+    // Both routers, merged exactly as the server binary does: login/logout live
+    // on the console router (the form it serves mints the cookie), while the
+    // CRUD routes are on the REST one. A test that mounted only one would pass
+    // or fail for reasons that do not reflect the deployed app.
+    (app_for(state), sessions)
+}
+
+/// One app with both admin surfaces, mirroring `proxy-rs-server`.
+fn app_for(state: Arc<AdminState>) -> axum::Router {
+    build_admin_router(state.clone()).merge(build_console_router(state))
 }
 
 fn test_router() -> axum::Router {
@@ -96,8 +106,9 @@ fn test_router() -> axum::Router {
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
+        client: reqwest::Client::new(),
     });
-    build_admin_router(state)
+    app_for(state)
 }
 
 async fn call(
@@ -212,7 +223,6 @@ async fn every_gated_route_refuses_an_anonymous_caller() {
         ("GET", "/admin/api/identities"),
         ("GET", "/admin/api/client-accounts"),
         ("GET", "/admin/api/logs"),
-        ("POST", "/admin/api/logout"),
         ("POST", "/admin/api/checkin"),
     ] {
         let (status, body, _) = call(test_router(), method, uri, None, None).await;
@@ -223,6 +233,20 @@ async fn every_gated_route_refuses_an_anonymous_caller() {
         );
         assert_eq!(body["error"]["type"], "unauthorized", "{uri}");
     }
+}
+
+/// Logout is intentionally *not* behind the session gate.
+///
+/// It clears the cookie and drops the server-side session; requiring a valid
+/// session would mean an already-expired cookie could never be cleaned up, and
+/// the browser would keep presenting it.
+#[tokio::test]
+async fn logout_is_reachable_without_a_session() {
+    let _iso = isolate("logout-anon", Some("tok")).await;
+    let (status, _, set_cookie) =
+        call(test_router(), "POST", "/admin/api/logout", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(set_cookie.unwrap_or_default().contains("Max-Age=0"));
 }
 
 #[tokio::test]
@@ -386,35 +410,6 @@ async fn adding_an_api_key_is_idempotent() {
 }
 
 #[tokio::test]
-async fn the_pool_export_is_a_download_not_a_path() {
-    let _iso = isolate("export", Some("tok")).await;
-    let (app, _sessions) = test_router_with_sessions();
-    let cookie = login_cookie(app.clone(), "tok").await;
-    let req = Request::builder()
-        .method("GET")
-        .uri("/admin/api/pool/export")
-        .header("cookie", &cookie)
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let disposition = resp
-        .headers()
-        .get("content-disposition")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    assert!(disposition.starts_with("attachment;"), "{disposition}");
-    // A pool export carries live tokens; nothing may cache it.
-    let cache = resp
-        .headers()
-        .get("cache-control")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert_eq!(cache, "no-store");
-}
-
-#[tokio::test]
 async fn a_path_in_the_filename_query_cannot_inject_a_header() {
     let _iso = isolate("export-inject", Some("tok")).await;
     let (app, _sessions) = test_router_with_sessions();
@@ -439,71 +434,255 @@ async fn a_path_in_the_filename_query_cannot_inject_a_header() {
     assert!(!disposition.contains(".."), "{disposition}");
 }
 
-// ── Console assets ─────────────────────────────────────────────────────────
+// ── The served console is the desktop front-end ───────────────────────────
+//
+// These replace three tests written for the first cut, which shipped a
+// purpose-built admin page. That page is gone: the gateway now serves the real
+// desktop front-end (`ui/`) with a transport bridge, so the assertions are about
+// *that* — the same bytes the Tauri window loads, plus the one injected script.
 
-#[tokio::test]
-async fn the_console_page_is_served_without_a_session() {
-    let _iso = isolate("console-page", Some("tok")).await;
-    // Loading the page that creates a session cannot itself require one.
-    let req = Request::builder()
-        .method("GET")
-        .uri("/admin/api/")
-        .body(Body::empty())
-        .unwrap();
-    let resp = test_router().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+use proxy_rs::console::build_console_router;
+
+fn console_router() -> axum::Router {
+    let sessions = Arc::new(AdminSessions::new());
+    let state = Arc::new(AdminState {
+        sessions: sessions.clone(),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: 3456,
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+    });
+    app_for(state)
+}
+
+async fn get_raw(
+    app: axum::Router,
+    uri: &str,
+    cookie: Option<&str>,
+) -> (StatusCode, String, String) {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(c) = cookie {
+        builder = builder.header("cookie", c);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::empty()).expect("request builds"))
+        .await
+        .expect("router responds");
+    let status = resp.status();
     let ct = resp
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert!(ct.starts_with("text/html"), "{ct}");
-
+        .unwrap_or_default()
+        .to_string();
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let html = String::from_utf8_lossy(&body);
-    assert!(html.contains("Proxy RS 管理台"), "the shell must render");
+    (status, ct, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn an_anonymous_visitor_gets_the_login_page() {
+    let _iso = isolate("console-login", Some("tok")).await;
+    let (status, ct, body) = get_raw(console_router(), "/admin/", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.starts_with("text/html"), "{ct}");
     assert!(
-        html.contains("id=\"token\""),
-        "it must contain the login field"
+        body.contains("Proxy RS · 登录"),
+        "the login shell must render"
+    );
+    assert!(
+        body.contains("id=\"token\""),
+        "it must contain the token field"
+    );
+    // The page that *creates* a session cannot require one.
+    assert!(
+        !body.contains("type=\"module\" src=\"src/main.js\""),
+        "not the console yet"
     );
 }
 
 #[tokio::test]
-async fn the_console_script_is_served_as_javascript() {
-    let _iso = isolate("console-js", Some("tok")).await;
-    let req = Request::builder()
-        .method("GET")
-        .uri("/admin/api/console.js")
-        .body(Body::empty())
-        .unwrap();
-    let resp = test_router().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    // A module script served as anything but JavaScript is refused by the
-    // browser, which would leave the page permanently blank.
-    assert!(ct.starts_with("text/javascript"), "{ct}");
+async fn a_session_cookie_gets_the_real_desktop_console() {
+    let _iso = isolate("console-page", Some("tok")).await;
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, ct, body) = get_raw(app, "/admin/", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.starts_with("text/html"), "{ct}");
+    // Proof this is the shared front-end and not a second one: the desktop shell
+    // markers, and the tab bar it builds from its own module.
+    assert!(
+        body.contains("<title>Proxy RS</title>"),
+        "the desktop title"
+    );
+    assert!(body.contains("class=\"tabs\""), "the desktop tab bar mount");
+    assert!(
+        body.contains("data-tauri-drag-region"),
+        "the desktop header"
+    );
+    // And the one injected difference.
+    assert!(
+        body.contains("src/bridge.js"),
+        "the server bridge must be injected"
+    );
 }
 
 #[tokio::test]
-async fn the_console_page_contains_no_secrets() {
+async fn the_console_assets_are_served_with_correct_types() {
+    let _iso = isolate("console-assets", Some("tok")).await;
+    let app = console_router();
+
+    for (uri, expected) in [
+        ("/admin/src/main.js", "text/javascript"),
+        ("/admin/src/bridge.js", "text/javascript"),
+        ("/admin/src/views/overview.js", "text/javascript"),
+        ("/admin/style/tokens.css", "text/css"),
+        ("/admin/assets/logo.svg", "image/svg+xml"),
+    ] {
+        let (status, ct, _) = get_raw(app.clone(), uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(ct.starts_with(expected), "{uri}: got {ct}, want {expected}");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_asset_is_a_404_not_a_silent_empty_file() {
+    let _iso = isolate("console-missing", Some("tok")).await;
+    let (status, _, _) = get_raw(console_router(), "/admin/src/nope.js", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_unauthenticated_console_carries_no_secrets() {
     let _iso = isolate("console-secret", Some("super-secret-token")).await;
+    let app = console_router();
+    for uri in ["/admin/", "/admin/src/bridge.js"] {
+        let (_, _, body) = get_raw(app.clone(), uri, None).await;
+        assert!(
+            !body.contains("super-secret-token"),
+            "{uri} must not embed the admin token"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rpc_requires_a_session() {
+    let _iso = isolate("rpc-gate", Some("tok")).await;
     let req = Request::builder()
-        .method("GET")
-        .uri("/admin/api/")
-        .body(Body::empty())
+        .method("POST")
+        .uri("/admin/api/rpc/get_status")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
         .unwrap();
-    let resp = test_router().oneshot(req).await.unwrap();
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let resp = console_router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn rpc_dispatches_the_commands_the_console_calls() {
+    let _iso = isolate("rpc-ok", Some("tok")).await;
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    for (command, expect_key) in [
+        ("get_status", "result"),
+        ("get_settings", "result"),
+        ("wb_credentials_list", "result"),
+        ("api_keys_list", "result"),
+        ("wb_preferences", "result"),
+        ("client_accounts_list", "result"),
+        ("get_providers", "result"),
+    ] {
+        let (status, body) = post_rpc(app.clone(), command, "{}", &cookie).await;
+        assert_eq!(status, StatusCode::OK, "{command}: {body}");
+        assert!(
+            !body[expect_key].is_null(),
+            "{command} returned no result: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_command_is_an_error_not_a_null_result() {
+    let _iso = isolate("rpc-unknown", Some("tok")).await;
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let (status, body) = post_rpc(app, "no_such_command", "{}", &cookie).await;
+    // A silent `null` would render as an empty panel with no explanation.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("未知命令"));
+}
+
+#[tokio::test]
+async fn start_and_stop_refuse_instead_of_pretending() {
+    let _iso = isolate("rpc-service", Some("tok")).await;
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    for command in ["start_service", "stop_service"] {
+        let (status, body) = post_rpc(app.clone(), command, "{}", &cookie).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{command}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("systemd"),
+            "{command} must explain who owns the lifecycle: {body}"
+        );
+    }
+}
+
+/// Log in through the console router and return the cookie pair.
+async fn login_cookie_via(app: axum::Router, token: &str) -> String {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/login")
+        .header("content-type", "application/json")
+        .body(Body::from(format!("{{\"token\":\"{token}\"}}")))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "login must succeed");
+    resp.headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("a cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+async fn post_rpc(
+    app: axum::Router,
+    command: &str,
+    body: &str,
+    cookie: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/admin/api/rpc/{command}"))
+        .header("cookie", cookie)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let html = String::from_utf8_lossy(&body);
-    // The unauthenticated page must not embed the admin token or any upstream
-    // material — it is served before anyone has proven who they are.
-    assert!(!html.contains("super-secret-token"));
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }

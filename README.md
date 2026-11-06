@@ -205,15 +205,25 @@ cargo build --release --bin proxy-rs-server
 - **`PROXY_CLIENT_AUTH=true` 必须显式设置**：桌面版默认关闭是为了不让升级打断存量客户端，而服务器一旦可达就必须有入站鉴权。启动日志会打印实际开关状态，关闭时另有一条 WARN。
 - **`/api/*`、`/metrics`、`/health` 应在反代层直接 404**：它们只对回环有意义，其中还含一条会改上游账号状态的 `POST`。
 
-#### Web 管理台
+#### Web 管理台：就是桌面版那份 UI
 
-服务器版带一个浏览器管理台，地址 **`https://<域名>/admin/`**：
+服务器版带一个浏览器管理台，地址 **`https://<域名>/admin/`**。
 
-- **登录**：用 `PROXY_API_TOKEN` 换一个 HttpOnly + SameSite=Strict 的会话 Cookie（默认 12 小时，每次请求续期）。
-- **能做什么**：看运行状态与今日统计、管理身份池（登录态 / API Key / 默认身份 / 打卡与成长任务）、增删访问密钥、改设置、看日志、账号池导入导出。
-- **不做什么**：启停服务（归 systemd）、开机自启、打开日志目录、扫码登录（服务器没有浏览器可回跳）。少一个按钮好过一个点了没反应的按钮。
+**它不是另写的一套界面。** 网关直接提供 `ui/` 里的**同一个** `index.html`、同一批模块、同一批样式表——浏览器里跑的就是桌面版那个控制台，布局、文案、空态、快捷键、交互全部一致。唯一的差别在传输层：
 
-桌面版仍然走 Tauri IPC，不暴露任何 HTTP 管理面——多一个浏览器可达的入口就是多一处要鉴权的东西。接口契约见 [`docs/admin-api.md`](docs/admin-api.md)。
+```
+桌面版：invoke('get_status')  →  Tauri IPC
+服务器：invoke('get_status')  →  POST /admin/api/rpc/get_status
+```
+
+`ui/src/core/ipc.js` 本来就把所有调用收敛到一个 `invoke()`，所以服务器只需要在页面加载前用 [`ui/server/bridge.js`](../ui/server/bridge.js) 填上 `window.__TAURI__`。`ui/src/**` 一行没改。
+
+这样做不只是省事：**两份前端就是两个要同步的产品**。第一版服务器控制台曾经是单独写的，一个版本内就和桌面版长得不一样了，而且修了一处不会自动带到另一处。
+
+- **登录**：独立的登录页，用 `PROXY_API_TOKEN` 换 HttpOnly + SameSite=Strict 的会话 Cookie（12 小时，每次请求续期）。
+- **做不了的三件事**：启停服务（归 systemd）、打开日志目录（没有文件管理器）、扫码登录（浏览器回调只能指向本机）。会明确告诉你原因，而不是给一个点了没反应的按钮。
+
+桌面版仍然走 Tauri IPC，不暴露任何 HTTP 管理面——多一个浏览器可达的入口就多一处要鉴权的东西。接口契约见 [`docs/admin-api.md`](docs/admin-api.md)。
 
 完整部署步骤、nginx 反代配置（含 SSE 必需的 `proxy_buffering off`）、证书、验收清单与踩坑记录见 [`deploy/linux/README.md`](deploy/linux/README.md)。
 

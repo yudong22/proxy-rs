@@ -2,6 +2,17 @@
 
 > 版本：**3.1.0** 起提供。仅供 **headless 服务器部署**（`proxy-rs-server`）使用；
 > 桌面版的等价能力走 Tauri IPC（`#[tauri::command]`），两者互不影响。
+>
+> **管理台就是桌面版那份 UI。** `/admin/` 提供的是 `ui/` 里的同一个前端，传输层由
+> [`ui/server/bridge.js`](../ui/server/bridge.js) 把 Tauri IPC 换成下面的 `/admin/api/rpc/*`。
+> 因此这里有两套接口：
+>
+> | 套 | 用途 | 谁在用 |
+> |---|---|---|
+> | `/admin/api/rpc/<command>` | **命令式**，命令名与参数形状**完全等于 Tauri 命令** | 桌面版控制台（经桥接） |
+> | `/admin/api/<resource>` | REST 式，脚本与外部工具 | curl / 自动化 |
+>
+> 两者共用同一份实现（`src/admin.rs`），不会出现「REST 能改、控制台不能改」这种漂移。
 
 ---
 
