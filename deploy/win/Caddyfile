@@ -1,49 +1,69 @@
 # Proxy RS 网关反向代理配置
 #
-# ACME 邮箱（全局选项，必须写在任何站点块之前）：证书到期提醒发这里。
+# 当前部署形态（已实测跑通）：
+#
+#   客户端 ──HTTPS──► Cloudflare ──隧道──► cloudflared ──HTTP──► Caddy:80 ──► 网关:3456
+#
+# ## 为什么必须走 Cloudflare Tunnel
+#
+# 域名未完成 ICP 备案。腾讯云在流量到达本机之前就把 80/443 请求劫持到备案
+# 拦截页，实测表现为：
+#   · 443 的 TLS 握手永远 `read 0 bytes`（云侧设备掐断）；
+#   · 源站 Established 计数恒为 0，包根本没到机器；
+#   · 安全组开 443 无效（与安全组无关）；
+#   · 拦截按 **Host 头** 判定，所以换端口、换子域名都躲不掉。
+#
+# Cloudflare Tunnel 绕开它的原因：**连接方向反了**。cloudflared 从源站主动
+# 外连 Cloudflare 边缘，腾讯云看不到任何入站 80/443 请求，自然无从拦截。
+# 源站不需要公网 IP、不需要开放入站端口、不需要证书。
+#
+# ## 源站为什么只监听 80
+#
+# TLS 已在 Cloudflare 边缘终结，回源这一段是 CF 骨干网内的 HTTP。源站同时
+# 监听 443 没有意义，反而会让 CF 误以为可以 HTTPS 回源而失败（实测会得到
+# 521/525 交替）。
+#
+# ## 备案通过后
+#
+# 若要改回直连（不经 CF）：删除全局 `auto_https disable_redirects`、删除下面
+# 的 `http://` 站点块、取消注释文件末尾的 `gate.wuba.site` 块。届时本机将
+# 自动监听 443 并向 Let's Encrypt 申请证书。
+
+# ── 全局选项（必须在任何站点块之前）────────────────────────────────────────
 {
 	email admin@wuba.site
+
+	# 不自动把 HTTP 308 跳到 HTTPS。CF 已在客户端侧终结 TLS，源站再跳转就是
+	# 重定向循环（客户端拿到 https → CF 经隧道回源 80 → 源站又跳 https）。
+	#
+	# 同时它也让 Caddy 不再尝试为 gate.wuba.site 申请 Let's Encrypt 证书 ——
+	# 证书由 Cloudflare 提供，源站不需要，省掉一个 90 天续期的维护点。
+	auto_https disable_redirects
 }
 
+# ── 隧道回源入口：80 提供完整服务 ──────────────────────────────────────────
+# cloudflared 把 CF 边缘的请求以 HTTP 转发到这里。这一段不出公网（隧道是
+# 加密的 QUIC/HTTP2），所以不是明文裸奔。
 #
-# 职责分工（这里只做"外壳"，不做业务）：
-#   · TLS 终止：Caddy 自动向 Let's Encrypt 申请并续期证书，HTTP 自动跳 HTTPS
-#   · SSE 不缓冲：flush_interval -1，否则流式响应会被攒成一整块才吐
-#   · 边界收窄：只反代 /v1/* 与无需前缀的别名；/api/* 和 /metrics 一律 404
-#
-# 边界为什么在反代而不是网关里：桌面 GUI 靠本机 fetch 读 /api/*，在网关层
-# 加鉴权会把它自己打断。所以网关层只管 /v1/* 的访问 key，观测接口由这里挡。
-
-gate.wuba.site {
-	# ── 对外只暴露数据面 ────────────────────────────────────────────────
-	# 观测与管理接口不对外。注意这必须在反代规则之前匹配。
+# Tunnel 的 Public Hostname 必须配成：Type=HTTP、URL=localhost:80。
+# 配成 https:// 会失败 —— 80 上跑的是明文 HTTP，没有 TLS。
+http://gate.wuba.site {
+	# 观测与管理接口不对外
 	@internal path /api/* /metrics /health
 	respond @internal 404
 
-	# ── 首页：使用说明 ──────────────────────────────────────────────────
-	# 一个静态页面，告诉拿到密钥的人怎么用。放在这里而不是反代到网关，是因为
-	# 网关没有根路径路由（`/` 会掉进它的兜底 404），而这份说明的读者恰恰是
-	# 第一次访问、还没有任何客户端配置的人。
-	#
-	# `file_server` 只服务 /landing 这一个目录，且 `hide` 掉隐藏文件；
-	# 不使用 `root` 指向整个磁盘任何位置。
+	# 首页：使用说明
 	handle / {
-		root * E:\proxy-rs\deploy\landing
+		root * E:\\proxy-rs\\deploy\\landing
 		rewrite * /index.html
-		file_server {
-			hide .git .env
-		}
+		file_server
 	}
 
-	# ── 数据面：三种客户端协议 ──────────────────────────────────────────
-	# flush_interval -1 是 SSE 的关键：等价于 nginx 的 proxy_buffering off。
-	# 不设的话，流式响应会被代理层攒起来，客户端只能等到全部生成完才收到，
-	# 表现为"卡很久然后一次性吐出来"。
+	# 数据面。flush_interval -1 是 SSE 的关键：不设的话流式响应会被代理层
+	# 攒起来，客户端要等全部生成完才收到。
 	reverse_proxy /v1/* 127.0.0.1:3456 {
 		flush_interval -1
 	}
-
-	# 无 /v1 前缀的别名（README 里列出的兼容路径）
 	reverse_proxy /responses 127.0.0.1:3456 {
 		flush_interval -1
 	}
@@ -54,31 +74,46 @@ gate.wuba.site {
 		flush_interval -1
 	}
 
-	# ── 超时 ────────────────────────────────────────────────────────────
-	# 不设站点级 `timeouts`。Caddy 2.11 的 http.handlers.timeouts 里没有
-	# `read_timeout` 一类的子指令，写错会在 `caddy validate` 阶段硬报
-	# "unrecognized timeouts subdirective"；而它默认**不设**响应写超时，
-	# 恰好是长回复/SSE 需要的行为（网关侧对上游的 read_timeout 是 300s，
-	# 见 src-tauri/src/main.rs，反代只要不比它更短即可）。
-
-	# ── 日志 ────────────────────────────────────────────────────────────
-	log {
-		output file E:\proxy-rs\logs\caddy-access.log {
-			roll_size 20MiB
-			roll_keep 5
-		}
-		format console
-	}
-
-	# 兜底：除上面明确列出的路径，其余一律 404，不暴露任何未知路由。
-	#
-	# 这里的 matcher 不能省。Caddy 按书写顺序求值，一个没有 matcher 的
-	# `respond 404` 会匹配**所有**请求并立即返回 —— 放在 reverse_proxy 之后
-	# 也不例外，因为 reverse_proxy 只对自身 matcher 命中的请求生效，其余请求
-	# 继续往下走就撞到这个兜底。症状是所有路径（含 /v1/models）都 404，
-	# 看起来像反代没配好，实际是兜底把一切吃掉了。
-	#
-	# 负向匹配：凡不是数据面路径的，才 404。
+	# 兜底。matcher 不能省：无 matcher 的 respond 会吃掉所有请求。
 	@unknown not path / /v1/* /responses /chat/completions /backend-api/*
 	respond @unknown 404
 }
+
+# ── 备案通过后启用 ────────────────────────────────────────────────────────
+# 删除上面整个 `http://gate.wuba.site` 块与全局的 `auto_https disable_redirects`，
+# 本块即自动监听 443 并向 Let's Encrypt 申请证书。
+#
+# gate.wuba.site {
+# 	@internal path /api/* /metrics /health
+# 	respond @internal 404
+#
+# 	handle / {
+# 		root * E:\\proxy-rs\\deploy\\landing
+# 		rewrite * /index.html
+# 		file_server
+# 	}
+#
+# 	reverse_proxy /v1/* 127.0.0.1:3456 {
+# 		flush_interval -1
+# 	}
+# 	reverse_proxy /responses 127.0.0.1:3456 {
+# 		flush_interval -1
+# 	}
+# 	reverse_proxy /chat/completions 127.0.0.1:3456 {
+# 		flush_interval -1
+# 	}
+# 	reverse_proxy /backend-api/* 127.0.0.1:3456 {
+# 		flush_interval -1
+# 	}
+#
+# 	log {
+# 		output file E:\\proxy-rs\\logs\\caddy-access.log {
+# 			roll_size 20MiB
+# 			roll_keep 5
+# 		}
+# 		format console
+# 	}
+#
+# 	@unknown not path / /v1/* /responses /chat/completions /backend-api/*
+# 	respond @unknown 404
+# }

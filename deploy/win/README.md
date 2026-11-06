@@ -1,35 +1,76 @@
 # Windows 服务器部署（实测记录）
 
 > 目标：把 Proxy RS 网关部署到 Windows Server，通过公网 HTTPS 对外提供 `/v1/*` 服务。
-> 本文内容全部来自 2026-11-05 在腾讯云 Windows Server 2019（`101.35.234.6`，域名 `gate.wuba.site`）上的实际部署，不是推测。
+> 本文内容全部来自 2026-11-05/06 在腾讯云 Windows Server 2019（`101.35.234.6`，域名 `gate.wuba.site`）上的实际部署与排障，不是推测。
 
 ---
 
 ## 最终形态
 
 ```
-客户端 ──HTTPS(443)──► Caddy ──HTTP──► 网关(127.0.0.1:3456) ──► 上游
-         ↑ Let's Encrypt        ↑ 只放行 /v1/* 与首页
+客户端 ──HTTPS──► Cloudflare ──隧道──► cloudflared ──HTTP──► Caddy:80 ──► 网关:3456 ──► 上游
+                   ↑ CF 证书           ↑ 源站主动外连         ↑ 路径边界 + SSE
 ```
+
+**为什么不是「客户端 → Caddy → 网关」直连**：域名未完成 ICP 备案，腾讯云在流量
+到达本机前就把 80/443 劫持到备案拦截页。Tunnel 绕开它的原因不是配置技巧，而是
+**连接方向反了**——cloudflared 从源站主动外连 CF 边缘，没有任何入站 80/443 请求。
 
 | 组件 | 进程 | 会话 | 托管方式 |
 |---|---|---|---|
 | 网关 | `proxy-rs-gui.exe` | session 2 | 计划任务 `ProxyRS-Launch`（InteractiveToken）|
 | 反代 | `caddy.exe` | session 0 | 计划任务 `ProxyRS-Caddy`（AtStartup + 失败重启）|
+| 隧道 | `cloudflared.exe` | session 0 | **Windows 服务** `Cloudflared`（Automatic）|
 
 目录约定（**不要放 C 盘**，实测仅剩 6 GB）：
 
 ```
-E:\proxy-rs\bin\         proxy-rs 安装器、caddy.exe
+E:\proxy-rs\bin\         proxy-rs 安装器、caddy.exe、cloudflared.exe
 E:\proxy-rs\data\        （预留）
 E:\proxy-rs\deploy\      Caddyfile、landing\index.html、安装日志
 E:\proxy-rs\logs\        caddy 日志
+C:\ProgramData\cloudflared\token          隧道 token（服务读取）
 %USERPROFILE%\.proxy-rs\ 网关数据（凭据、设置、stats.db、日志）
 ```
+
+> 源站**不需要**公网入站端口、**不需要**证书。80 只监听在本机，由 cloudflared
+> 回源访问；443 完全不监听（监听反而会让 CF 误以为可 HTTPS 回源，得到 521/525）。
 
 ---
 
 ## 关键实测结论
+
+### 0. ICP 备案拦截：本次部署最大的坑（已绕开）
+
+**症状**（极具迷惑性，值得完整记录）：
+
+| 观察 | 容易得出的错误结论 |
+|---|---|
+| 公网 443 的 TLS 握手永远 `read 0 bytes` | "Caddy 证书配错了" |
+| 公网 443 TCP 能连（`nc -z` 成功） | "端口是通的，问题在应用层" |
+| 源站本机访问 443 返回 200 | "服务是好的，是外部网络问题" |
+| 安全组开了 443 仍不通 | "安全组规则没生效" |
+| 远端 443 的 Established 计数恒为 0 | "抓包级别看不到，可能是云厂商 DPI" |
+
+**真相**：腾讯云对未备案域名做**按 Host 头**的劫持。判定的直接证据：
+
+```bash
+curl -H "Host: gate.wuba.site" http://101.35.234.6/   # -> 302 到备案页
+curl                        http://101.35.234.6/      # -> 200，Caddy 正常
+```
+
+同一个 IP、同一个端口，**只因为 Host 头不同**，一个被劫持、一个正常。跳转目标
+`https://dnspod.qcloud.com/static/webblock.html?d=gate.wuba.site`，页面标题「备案」。
+
+**为什么换端口/换子域名都没用**：拦截按 Host 判定，与端口无关；而 `wuba.site`
+整个 zone 都未备案，子域名一样被拦。
+
+**解决**：Cloudflare Tunnel（见 §7）。它不依赖入站端口，腾讯云看不到请求，
+自然无从拦截。**这是唯一无需备案即可上线的方式**。
+
+> 附带教训：`nc -z` 显示"端口可连"在这一场景下是**假象**——云侧设备会回
+> SYN-ACK，但后续数据被丢弃。判断连通性要看应用层是否真的应答。
+
 
 ### 1. RDP 断开**不会**杀死网关（已实测）
 
@@ -154,16 +195,92 @@ foreach ($port in @(80,443)) {
 
 ---
 
+## Cloudflare Tunnel 部署（当前方案）
+
+### 一次性配置
+
+**源站（Windows）**：
+
+```powershell
+# 1) 装 cloudflared（github release 下载后解压，或用 scp 从本机推）
+#    ⚠️ 该机直连 GitHub 会失败，必须本机下载再推
+E:\proxy-rs\bin\cloudflared.exe --version    # 应为 v2026.10.x
+
+# 2) 强制 HTTP/2 协议（QUIC 在此机实测连不上边缘，预检 PASS 但实际 dial 超时）
+[Environment]::SetEnvironmentVariable("TUNNEL_TRANSPORT_PROTOCOL", "http2", "Machine")
+
+# 3) 用 token 装成 Windows 服务（Automatic 自启）
+E:\proxy-rs\bin\cloudflared.exe service install <TOKEN>
+```
+
+**Cloudflare 后台**：
+
+1. Zero Trust → Networks → Tunnels → Create a tunnel（Cloudflared 类型）
+2. 复制 token（`eyJ...`，装服务用）
+3. **Public Hostname** 加一条：
+
+   | 字段 | 值 |
+   |---|---|
+   | Subdomain | `gate` |
+   | Domain | `wuba.site` |
+   | Type | **`HTTP`** |
+   | URL | **`localhost:80`** |
+
+4. **DNS** 里确认 `gate` 是**指向隧道的记录**（代理模式下显示为 A 记录是正常的，
+   Cloudflare 会把 CNAME 扁平化）。若之前手动建过 A 记录指向服务器 IP，
+   **必须先删除**，否则 CF 把请求发到 IP，又被备案拦截。
+
+### 验证
+
+```powershell
+# 隧道健康：应返回 readyConnections: 4
+curl.exe -sS http://127.0.0.1:20241/ready
+
+# 出站连接：应有 4 条到 198.41.x.x:7844
+Get-NetTCPConnection -OwningProcess (Get-Process cloudflared).Id -State Established
+```
+
+```bash
+# 公网
+curl -s -o /dev/null -w '%{http_code}\n' https://gate.wuba.site/            # 200
+curl -s -o /dev/null -w '%{http_code}\n' https://gate.wuba.site/v1/models   # 401（无 key）
+```
+
+### 踩过的四个坑
+
+| 坑 | 症状 | 正解 |
+|---|---|---|
+| Service Type 填 HTTPS | 521，cloudflared 日志 `dial tcp ... tls handshake failed` | 填 **HTTP**（80 上是明文） |
+| DNS 仍是旧 A 记录 | 530/521，请求根本没进隧道（debug 日志无 ingress 记录） | 删旧 A 记录，让 CF 建隧道记录 |
+| QUIC 用不了 | `failed to dial to edge with quic: timeout`，预检却显示 PASS | 设 `TUNNEL_TRANSPORT_PROTOCOL=http2` |
+| 源站同时监听 443 | CF 优先试 443 失败才回退 80，同一 URL 时而 525 时而 200 | 源站**只监听 80** |
+
+### 服务名与 token 位置
+
+```
+服务名：Cloudflared（sc.exe query Cloudflared）
+token ：C:\ProgramData\cloudflared\token
+```
+
+> 卸载服务（`cloudflared service uninstall`）**会删掉 token 文件**，重装要重新
+> 提供 token。
+
+---
+
 ## 验收清单
 
-| 项 | 期望 | 实测 |
+| 项 | 期望 | 实测（2026-11-06） |
 |---|---|---|
-| `GET /` | 200 HTML 使用说明 | ✅ |
+| `GET /` | 200 HTML 使用说明 | ✅ 含 21 个模型列表 |
 | 无 key `GET /v1/models` | 401 `missing_key` | ✅ |
 | 带 key `GET /v1/models` | 200 模型列表 | ✅ |
-| 带 key `POST /v1/messages` | 200 真实转发 | ✅ |
-| SSE 流式 | 逐条到达，不缓冲 | ✅ `message_start` +1s → `delta` 逐条 |
-| `/api/*`、`/metrics`、`/health` | 404（反代挡） | ✅ |
-| `http://` | 308 → HTTPS | ✅ |
-| TLS 证书 | Let's Encrypt 自动签发 | ✅ 有效期至 2027-02-03 |
+| 带 key `POST /v1/messages` | 200 真实转发 | ✅ `hy4`，usage 正常 |
+| `x-proxy-rs-key` / `Authorization` / `x-api-key` | 三种头均可 | ✅ 全部 200 |
+| 错误 key | 401 | ✅ |
+| SSE 流式 | 逐条到达，不缓冲 | ✅ `message_start` +3s → `delta` 逐条 |
+| `/api/*`、`/metrics`、`/health` | 404（Caddy 挡） | ✅ |
+| TLS 证书 | Cloudflare 边缘签发 | ✅ `CN=wuba.site`（源站不再需要证书）|
+| 稳定性 | 连续请求无失败 | ✅ 8/8 |
+| 隧道健康 | 4 条边缘连接 | ✅ `readyConnections: 4` |
 | RDP 断开后 | 服务仍可用 | ✅（有条件，见 §1）|
+| 机器重启后 | 三者全部自启 | 待验证（均为 Automatic/AtStartup）|
