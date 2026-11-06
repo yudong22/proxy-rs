@@ -1,6 +1,7 @@
-# proxy-rs v3.1.0 发布说明：纯服务器模式 + Web 管理台
+# proxy-rs v3.2.0 发布说明：纯服务器模式 + Web 管理台
 
-> 版本：**3.1.0**（上一版 3.0.2）
+> 版本：**3.2.0**（上一版 3.0.2；v3.1.0 是同一批功能的上一轮迭代，本次修掉了它落地后
+> 暴露的缺陷）
 > 两个新能力：**headless 服务器二进制**与**浏览器管理台**。桌面端行为不变。
 
 ---
@@ -105,7 +106,10 @@ Codex 此前**只写了模型目录、没写 provider**，所以即便有 key �
 - **未加密的导出包会剥离明文**——否则搬账号池的文件就成了一份可用 key 清单；
 - 鉴权仍然只比哈希，明文仅用于写配置。
 
-## 4. 修掉的三个 bug
+## 4. 修掉的 bug
+
+本轮共七个：三个由 v3.1.0 的 code review 发现，四个由实测暴露。**前两个是安全问题。**
+
 
 ### Bug 1：`client_account=` 从来没被记录过（3.0.0 起一直存在）
 
@@ -137,17 +141,76 @@ request.extensions_mut().insert(identity);   // identity: VerifiedAccount
 
 修复：按 `current_exe()` 文件名判定，两种形态各自说自己的话。
 
+### Bug 4（安全）：登录限速可被伪造请求头绕过
+
+限速按 `X-Forwarded-For` 首跳计数，而 nginx 用的是 `$proxy_add_x_forwarded_for` —— 它把
+客户端**自带**的值前置，于是攻击者自己挑选桶的键。生产实测：8 个伪造地址，8 次 401，
+**零锁定**，可以无限猜令牌。
+
+我原先在注释里写「伪造只会把自己的失败挪到别的桶」，那句话是错的：它让限速形同虚设。
+
+两端都修：
+
+- **nginx** 改为覆盖 `X-Forwarded-For $remote_addr`（本机是唯一入口，这就是真实客户端）；
+- **网关** 新增 `trusted_proxy`，只在绑定回环（说明前面确实有反代）时才相信转发头。
+  绑定 `0.0.0.0` 时直接忽略 —— 否则直连者同样能伪造。
+
+修后实测：8 个伪造地址，第 6 次即 `429`。
+
+### Bug 5（安全）：失败计数表无界增长
+
+键来自客户端可控的值，且从不清理。攻击者每个请求换一个伪造地址就能让 map 无限长大
+（每次约 100 字节，一百万个地址约 100 MB）。加 2 小时空闲清扫 + 4096 条上限，
+超限时丢弃最久未见的条目（只会缩短别人的锁定，是安全的方向）。
+
+### Bug 6：访问 `/admin/` 不断重启（无限刷新循环）
+
+`serve_page` 只检查 cookie **是否存在**、不校验有效性。于是过期 cookie（12 小时闲置，
+或 `systemctl restart` 后）会拿到控制台页面 → 页面上每个 RPC 都 401 → 桥接
+`location.reload()` → cookie 还在 → 又是控制台页面 → 死循环。
+
+两处都修：
+
+- 服务端**校验**会话（`touch`，同时滑动续期），无效就直给登录页；
+- 桥接遇 401 跳 `/admin/login`（`location.replace`，不进历史），并加去重标志 ——
+  启动瞬间会并发多个 RPC，否则一次过期触发多次跳转。
+
+### Bug 7：浏览器不提示保存密码
+
+两个必要条件都缺：
+
+1. **没有配对的 username 字段**。密码管理器按 `autocomplete="username"` /
+   `current-password` 配对两个字段，只有 password 一个字段时根本不记录。
+2. **用 `fetch` 提交**。浏览器只识别真实的表单导航，XHR 登录会被当成 AJAX 调用。
+
+修法：加一个可见的只读 username 字段（只有一个运维身份，不需要让用户填），并把登录改成
+**原生表单 POST**。服务端同时接受表单和 JSON；表单成功 `303` 到 `/admin/`，失败 `303`
+回登录页并用查询参数带原因（表单无法返回 JSON）。
+
+> 用户名框固定为 `admin` 且只读：这里是单运维身份，让用户填一个假用户名没有意义，
+> 但字段本身必须存在且可见，否则密码管理器不认。
+
+### Bug 8：网页端「剩余积分」永远空白
+
+服务器版 `status_json()` 漏了 `current_identity`，而桌面命令有。同一份前端、数据里的
+一个洞，于是「剩余积分」「当前账号」两张卡片在网页端永远是空的。顺带补齐
+`api_key_set` / `env_path` 等桌面端会读取的字段。
+
 ---
 
 ## 5. nginx 反代要点
 
-```caddyfile
+```nginx
 /v1/* 等数据面  → 网关:3456    # proxy_buffering off 是 SSE 的关键
-/admin/         → 网关:3456    # 两条 location，见下
-/api/* /metrics /health → 404  # 无鉴权的只读观测面
+/admin/         → 网关:3456    # 控制台（含登录页与 API）
+/api/* /metrics /health → 404  # 无鉴权的只读观测面（反代必须挡住）
 ```
 
-**`/admin/api/` 必须单独一条 `location`**，不能和 `/admin/` 合并成一条 rewrite。控制台页面里的 API 基址是绝对的 `/admin/api`，如果只写 `^/admin/(.*)$ → /admin/api/$1`，页面发出的 `/admin/api/session` 会被再前缀一次变成 `/admin/api/api/session`，登录后整个控制台 404。nginx 选最长前缀匹配，所以拆成两条即可。
+一条 `location` 就够：网关自己同时服务页面与 API 于 `/admin/` 下，映射是恒等。
+
+**`X-Forwarded-For` 必须用 `$remote_addr` 覆盖，不能用 `$proxy_add_x_forwarded_for`。**
+后者会把客户端自带的值前置，导致登录限速可被伪造地址绕过（见 Bug 4）。本机是唯一入口，
+`$remote_addr` 就是真实客户端。
 
 ---
 
@@ -155,13 +218,18 @@ request.extensions_mut().insert(identity);   // identity: VerifiedAccount
 
 | 项 | 预期 | 实测 |
 |---|---|---|
-| `cargo test` | 全绿 | ✅ 681 passed, 0 failed |
+| `cargo test` | 全绿 | ✅ 703 passed, 0 failed |
 | `cargo clippy -D warnings` | 无告警 | ✅ |
 | `cargo fmt --check` | 无差异 | ✅ |
 | `ui/tools/check-ui.mjs` | 无问题 | ✅ 30 模块 / 10 样式 |
 | 公网 `/admin` | 301 → `/admin/` | ✅ |
 | 公网 `/admin/` | 200 控制台 | ✅ |
-| 浏览器登录 → 六个标签页 | 全部渲染 | ✅ `admin-smoke` 全通过 |
+| 浏览器登录 → 三个标签页 | 全部渲染 | ✅ `admin-smoke` 全通过 |
+| 原生表单登录 | 303 → `/admin/` | ✅ |
+| 密码管理器判据 | username + password + 原生 POST | ✅ |
+| 伪造 `X-Forwarded-For` 绕过限速 | 无法绕过 | ✅ 第 6 次即 429 |
+| 剩余积分卡片 | 显示实际余额 | ✅ `libai` / 8203.42 |
+| 过期 cookie 访问 `/admin/` | 登录页，不循环 | ✅ |
 | 浏览器存储的会话 Cookie | HttpOnly + Path=/admin | ✅ |
 | 登出后 `/admin/api/session` | 401 | ✅ |
 | `PROXY_CLIENT_AUTH=true` 下控制台 | 可访问 | ✅ |
@@ -174,7 +242,7 @@ request.extensions_mut().insert(identity);   // identity: VerifiedAccount
 
 ## 7. 升级
 
-### 从 3.0.x 升到 3.1.0（服务器）
+### 从 3.0.x / 3.1.0 升到 3.2.0（服务器）
 
 ```bash
 cargo build --release --bin proxy-rs-server
@@ -184,7 +252,14 @@ systemctl start proxy-rs
 systemctl status proxy-rs --no-pager
 ```
 
-数据目录无需迁移。**若之前把 `/api/*` 或 `/admin` 写进了反代 404 规则**，按 §4 调整后 `nginx -t && systemctl reload nginx`。
+数据目录无需迁移。
+
+**反代必须一起更新**，否则 Bug 4 仍然存在：`X-Forwarded-For` 要从
+`$proxy_add_x_forwarded_for` 改成 `$remote_addr`，然后 `nginx -t && systemctl reload nginx`。
+
+**行为变更**：访问密钥的明文现在会保存进 `client-accounts.json`（`0600`），用于「一键写入
+客户端配置」。未加密的导出包会剥离明文；旧账号没有明文，需要时用列表里的「重新签发」
+拿到一把新的。详见 [`docs/admin-api.md`](admin-api.md)。
 
 ### 桌面版
 
