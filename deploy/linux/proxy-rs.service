@@ -1,0 +1,65 @@
+[Unit]
+Description=Proxy RS gateway (headless)
+Documentation=https://github.com/yudong22/anthropic-proxy-rs
+# The gateway forwards to remote HTTPS upstreams, so it must come up after the
+# network is actually usable — `network.target` alone is reached before DHCP/DNS
+# on many images, and a start that races that produces confusing upstream errors.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=proxyrs
+Group=proxyrs
+WorkingDirectory=/opt/proxy-rs
+
+# Configuration and secrets. `-` would silence a missing file, which would then
+# silently drop PROXY_CLIENT_AUTH and expose the gateway — so it is required.
+EnvironmentFile=/etc/proxy-rs.env
+
+ExecStart=/opt/proxy-rs/bin/proxy-rs-server
+
+# SIGTERM is what the binary handles: it cancels the background loops and lets
+# axum drain in-flight requests, so an SSE stream is not cut mid-response.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=3
+# A tight crash loop is a configuration error (bad bind, unwritable data dir).
+# Stopping after 5 failures in 60s keeps it from burning CPU and makes the
+# failure obvious in `systemctl status` instead of hidden in a restart counter.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Hardening. The gateway needs nothing but its own data dir and outbound TCP:
+#   · no privileges, no new privileges, private /tmp and /dev
+#   · a read-only filesystem except the data dir and its own log file
+#   · no ability to gain capabilities or be traced
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+ReadWritePaths=/opt/proxy-rs/data /opt/proxy-rs/logs
+
+# The desktop app writes stats/logs under the data dir; both must stay writable
+# for `stats.db` (WAL) and `logs/proxy.log`.
+UMask=0077
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=proxy-rs
+
+[Install]
+WantedBy=multi-user.target

@@ -611,6 +611,21 @@ fn is_due(now_ms: i64, time: &str) -> bool {
     into_day >= target_of_day
 }
 
+/// The process that currently hosts the three loops, for the snapshot payload.
+///
+/// Not a constant, because two binaries host these loops now: the desktop app
+/// and the headless server ([`src/bin/proxy-rs-server.rs`]). Reporting
+/// `proxy-rs-gui` from the server would be actively misleading — the `note`
+/// beside it tells a consumer "quitting the app stops the timers", which is
+/// true of the desktop build and false of a systemd unit. The executable's own
+/// file name is the honest answer and needs no wiring at either call site.
+fn hosting_process() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "proxy-rs".to_string())
+}
+
 /// Build the read-only snapshot `/api/scheduler` serves.
 ///
 /// Shaped here rather than in `api.rs` because the cadence constants and the
@@ -712,14 +727,23 @@ pub fn snapshot() -> serde_json::Value {
         })
         .collect();
 
+    let process = hosting_process();
+    let note = if process == "proxy-rs-server" {
+        "这三个循环跑在 Proxy RS 服务器进程里：进程退出即停止，由 systemd 托管（Restart=always 会自动拉起）；下次启动会补跑当天未完成的批次。"
+    } else {
+        "这三个循环跑在 Proxy RS 桌面进程里：退出应用即停止，窗口关闭（驻留托盘）不影响；下次启动会补跑当天未完成的批次。"
+    };
+
     json!({
         "now": render_local_minute(now_ms),
         "now_ms": now_ms,
         "utc_offset_secs": crate::util::local_utc_offset_secs(),
-        "process": "proxy-rs-gui",
+        "process": process,
         // Stated in the payload, not only in docs: a consumer that reads
         // `last_run` without this line will assume the timers survive a quit.
-        "note": "这三个循环跑在 Proxy RS 桌面进程里：退出应用即停止，窗口关闭（驻留托盘）不影响；下次启动会补跑当天未完成的批次。",
+        // The wording has to match the *hosting* process, or a server deployment
+        // tells its reader to go click a button that does not exist.
+        "note": note,
         "loops": loops,
     })
 }

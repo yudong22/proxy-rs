@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proxy RS 网关</title>
+<link rel="icon" href="data:,">
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --border:#272c36;
+    --fg:#e6e9ef; --dim:#9aa4b2; --accent:#5b9dff; --ok:#3fb950; --warn:#d29922;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:light){
+    :root{--bg:#f7f8fa;--panel:#fff;--border:#e1e4e8;--fg:#1f2328;--dim:#5b6470;--accent:#0969da;--ok:#1a7f37;--warn:#9a6700;}
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    padding:40px 20px 80px;
+  }
+  .wrap{max-width:760px;margin:0 auto}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:-.01em}
+  .sub{color:var(--dim);margin:0 0 34px;font-size:15px}
+  h2{font-size:17px;margin:38px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+  p{margin:12px 0}
+  code{font-family:var(--mono);font-size:.9em;background:var(--panel);border:1px solid var(--border);padding:1px 6px;border-radius:5px}
+  pre{
+    background:var(--panel);border:1px solid var(--border);border-radius:9px;
+    padding:15px 17px;overflow-x:auto;margin:14px 0;
+  }
+  pre code{background:none;border:none;padding:0;font-size:13px;line-height:1.6}
+  .val{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:14px 0}
+  .val code{font-size:14px;padding:7px 11px}
+  button{
+    font:inherit;font-size:13px;cursor:pointer;border-radius:6px;
+    border:1px solid var(--border);background:var(--panel);color:var(--fg);padding:5px 12px;
+  }
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14.5px}
+  th,td{text-align:left;padding:9px 11px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{color:var(--dim);font-weight:500;font-size:13px}
+  td code{font-size:.92em}
+  .note{
+    border-left:3px solid var(--accent);background:var(--panel);
+    padding:12px 16px;border-radius:0 7px 7px 0;margin:16px 0;font-size:14.5px;
+  }
+  .warn{border-left-color:var(--warn)}
+  .ok{color:var(--ok)}
+  .muted{color:var(--dim);font-size:14px}
+  ul{padding-left:22px}
+  li{margin:7px 0}
+  footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--border);color:var(--dim);font-size:13px}
+  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:9px 18px;border-radius:7px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none}
+  .toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Proxy RS 网关</h1>
+  <p class="sub">OpenAI 兼容的多协议 AI 代理 · 需访问密钥</p>
+
+  <h2>接入地址</h2>
+  <div class="val">
+    <code id="base">https://api.wuba.site</code>
+    <button data-copy="base">复制</button>
+  </div>
+
+  <h2>访问密钥</h2>
+  <p>所有请求都必须携带访问密钥。以下三种请求头任选其一，效果相同：</p>
+
+  <table>
+    <thead><tr><th>请求头</th><th>适用于</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>x-proxy-rs-key: &lt;key&gt;</code></td>
+        <td>通用，最明确</td>
+      </tr>
+      <tr>
+        <td><code>Authorization: Bearer &lt;key&gt;</code></td>
+        <td>OpenAI SDK、<code>ANTHROPIC_AUTH_TOKEN</code></td>
+      </tr>
+      <tr>
+        <td><code>x-api-key: &lt;key&gt;</code></td>
+        <td>Claude Code、多数 Anthropic 客户端</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>大多数客户端只需填两项：</strong>接口地址 <code>https://api.wuba.site</code> 和 API Key。
+    不需要额外配置自定义请求头 —— 上表后两种就是客户端本来就会发送的标准头。
+  </div>
+
+  <h2>快速验证</h2>
+  <pre><code>curl https://api.wuba.site/v1/models \
+  -H "x-api-key: &lt;你的密钥&gt;"</code></pre>
+  <p class="muted">返回模型列表即为成功。缺密钥或密钥错误返回 <code>401</code>。</p>
+
+  <h2>常见客户端配置</h2>
+
+  <p><strong>Claude Code</strong></p>
+  <pre><code>export ANTHROPIC_BASE_URL=https://api.wuba.site
+export ANTHROPIC_AUTH_TOKEN=&lt;你的密钥&gt;</code></pre>
+
+  <p><strong>OpenAI SDK（Python）</strong></p>
+  <pre><code>from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.wuba.site/v1",
+    api_key="&lt;你的密钥&gt;",
+)
+
+resp = client.chat.completions.create(
+    model="hy4std",            # ← 见上方「可用模型」
+    messages=[{"role": "user", "content": "你好"}],
+)</code></pre>
+
+  <p><strong>Codex CLI</strong>（<code>~/.codex/config.toml</code>）</p>
+  <pre><code>[model_providers.proxy_rs]
+base_url = "https://api.wuba.site/v1"
+wire_api = "responses"</code></pre>
+
+  <h2>可用模型</h2>
+  <p>以下模型均可直接使用。把 <code>model</code> 字段设成对应名称即可。</p>
+
+  <!-- 模型列表由部署脚本在推送时按 /v1/models 的真实返回生成；
+       这一版是 2026-11-05 的实测快照，共 21 个。 -->
+  <table>
+    <thead><tr><th>模型</th><th>说明</th></tr></thead>
+    <tbody id="model-rows">
+      <tr><td><code>hy4std</code></td><td>默认，通用</td></tr>
+      <tr><td><code>hy4free</code></td><td>免费额度</td></tr>
+      <tr><td><code>hy3</code></td><td>上一代通用</td></tr>
+      <tr><td><code>hy3-x</code></td><td>上一代增强</td></tr>
+      <tr><td><code>deepseek-v4.1-flash</code></td><td>DeepSeek 快速版</td></tr>
+      <tr><td><code>deepseek-v4-pro</code></td><td>DeepSeek 专业版</td></tr>
+      <tr><td><code>glm-5.3</code></td><td>智谱 GLM</td></tr>
+      <tr><td><code>glm-5.3-flash</code></td><td>GLM 快速版</td></tr>
+      <tr><td><code>glm-5.3-flashx</code></td><td>GLM 更快的快速版</td></tr>
+      <tr><td><code>glm-5.2</code></td><td>GLM 旧版</td></tr>
+      <tr><td><code>kimi-k3.1-pro</code></td><td>Kimi 专业版</td></tr>
+      <tr><td><code>kimi-k3.1-pro-highspeed</code></td><td>Kimi 专业版高速</td></tr>
+      <tr><td><code>kimi-k3-2</code></td><td>Kimi K3</td></tr>
+      <tr><td><code>kimi-k2.8-preview</code></td><td>Kimi 预览版</td></tr>
+      <tr><td><code>minimax-m3-pay</code></td><td>MiniMax M3</td></tr>
+      <tr><td><code>minimax-m3.1-flash</code></td><td>MiniMax 快速版</td></tr>
+      <tr><td><code>minimax-m2.7</code></td><td>MiniMax 旧版</td></tr>
+      <tr><td><code>step-5-preview</code></td><td>阶跃星辰预览版</td></tr>
+      <tr><td><code>mimo-v2.6-pro</code></td><td>MiMo 专业版</td></tr>
+      <tr><td><code>space-bunny</code></td><td>—</td></tr>
+      <tr><td><code>free</code></td><td>免费通道</td></tr>
+    </tbody>
+  </table>
+  <p class="muted">
+    上游可能会调整可用模型。以 <code>GET /v1/models</code> 的实时返回为准：
+    <code>curl -H "x-api-key: &lt;密钥&gt;" https://api.wuba.site/v1/models</code>
+  </p>
+
+  <h2>支持的接口</h2>
+  <table>
+    <thead><tr><th>路径</th><th>协议</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /v1/messages</code></td><td>Anthropic Messages（含流式）</td></tr>
+      <tr><td><code>POST /v1/chat/completions</code></td><td>OpenAI Chat Completions</td></tr>
+      <tr><td><code>POST /v1/responses</code></td><td>OpenAI Responses（Codex）</td></tr>
+      <tr><td><code>GET /v1/models</code></td><td>模型列表</td></tr>
+    </tbody>
+  </table>
+
+  <h2>注意事项</h2>
+  <ul>
+    <li><strong>只支持 HTTPS。</strong>用 <code>http://</code> 访问会被 308 重定向到 HTTPS。</li>
+    <li><strong>密钥请勿外传。</strong>它等同于你的账号使用权，泄露后他人可消耗你的额度。</li>
+    <li><strong>观测接口不对外。</strong><code>/api/*</code> 与 <code>/metrics</code> 在本域名下统一返回 <code>404</code>，属正常现象。</li>
+    <li>流式响应（SSE）已配置为不缓冲，首 token 会尽快到达。</li>
+  </ul>
+
+  <div class="note warn">
+    遇到 <code>401</code> 时，响应体会包含具体原因：<code>missing_key</code>（未携带密钥）、
+    <code>invalid_key</code>（密钥不存在）、<code>account_disabled</code>（密钥已被停用）。
+    可据此判断是配置问题还是密钥被吊销。
+  </div>
+
+  <footer>
+    Proxy RS · 访问密钥与账号池由管理员在桌面端「访问账户」中管理
+  </footer>
+</div>
+
+<div class="toast" id="toast">已复制</div>
+
+<script>
+  // 复制按钮：file:// 与非安全上下文下 navigator.clipboard 不可用，
+  // 回退到 execCommand 并把结果如实反馈给用户，而不是假装成功。
+  document.querySelectorAll('button[data-copy]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var el = document.getElementById(btn.dataset.copy);
+      if (!el) return;
+      var text = el.textContent.trim();
+      var done = function (ok) {
+        var t = document.getElementById('toast');
+        t.textContent = ok ? '已复制' : '复制失败，请手动选择';
+        t.classList.add('show');
+        setTimeout(function () { t.classList.remove('show'); }, 1600);
+      };
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+        return;
+      }
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        done(ok);
+      } catch (e) { done(false); }
+    });
+  });
+</script>
+</body>
+</html>

@@ -21,7 +21,9 @@ members = [
 
 [dependencies]
 # Async runtime. `time` enables the interval the daily check-in scheduler ticks on.
-tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
+# `signal` is what the headless binary uses to drain in-flight requests on
+# SIGTERM; the desktop app has no signal handling of its own.
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
 tokio-util = "0.7"
 
 # Web framework
@@ -40,6 +42,11 @@ async-stream = "0.3"
 
 # Observability
 tracing = "0.1"
+# Only the headless server binary (`src/bin/proxy-rs-server.rs`) installs a
+# subscriber: the desktop app's formatting comes from Tauri's own setup. It is
+# declared here because a direct use has to be declared to be legal, and the
+# binary links against this crate rather than `proxy-rs-gui`.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 

@@ -190,6 +190,23 @@ npm run build:dmg
 cargo test
 ```
 
+### 无桌面的服务器部署（headless）
+
+服务器（无图形界面、无 WebView2）用 `proxy-rs-server`：同一个 `build_app_router`，不含 Tauri，产物是单个可执行文件。
+
+```bash
+cargo build --release --bin proxy-rs-server
+./target/release/proxy-rs-server      # 读 ~/.proxy-rs/ 的配置与凭据
+```
+
+它与桌面版共用全部配置来源（`gui-settings.json` + `.env` + `PROXY_DATA_DIR`）、凭据池、`stats.db` 与三个后台循环，因此从桌面端迁过来的安装不丢状态。差别只有三条：
+
+- **没有热重载 / 托盘 / 启停控制** —— 配置改动靠编辑文件后重启，systemd 就是这个接口。
+- **`PROXY_CLIENT_AUTH=true` 必须显式设置**：桌面版默认关闭是为了不让升级打断存量客户端，而服务器一旦可达就必须有入站鉴权。启动日志会打印实际开关状态，关闭时另有一条 WARN。
+- **`/api/*`、`/metrics`、`/health` 应在反代层直接 404**：它们只对回环有意义，其中还含一条会改上游账号状态的 `POST`。
+
+完整部署步骤、nginx 反代配置（含 SSE 必需的 `proxy_buffering off`）、证书、验收清单与踩坑记录见 [`deploy/linux/README.md`](deploy/linux/README.md)。
+
 ### 客户端接入配置
 
 #### 1. Claude Code
