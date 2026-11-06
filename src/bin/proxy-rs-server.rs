@@ -34,7 +34,7 @@
 //! or their tokens silently age out.
 
 use proxy_rs::{
-    metrics, router, scheduler, service,
+    admin, admin_auth, admin_routes, metrics, router, scheduler, service,
     settings::{self, GuiSettings, LogBuffer, DEFAULT_PORT},
     Config, StatsDb,
 };
@@ -183,6 +183,28 @@ async fn main() -> Result<()> {
 
     let metrics_handle = metrics::install();
 
+    // The server-mode admin console. The desktop app has no equivalent — it uses
+    // Tauri IPC — and passing `None` there is what keeps its served bytes
+    // identical to before this existed.
+    //
+    // Built before the listener binds so a broken admin router is a startup
+    // failure, not a 404 that only shows up when somebody opens the console.
+    let admin_sessions = Arc::new(admin_auth::AdminSessions::new());
+    let admin_state = Arc::new(admin_routes::AdminState {
+        sessions: admin_sessions.clone(),
+        stats: stats.clone(),
+        logs: logs.clone(),
+        client_auth: client_auth.clone(),
+        pool: credential_pool.clone(),
+        process: admin::ProcessInfo {
+            version: env!("CARGO_PKG_VERSION"),
+            bound_port: port,
+            started_at: std::time::Instant::now(),
+            bind_addr: bind_addr.clone(),
+        },
+    });
+    let admin_router = admin_routes::build_admin_router(admin_state);
+
     let app_router = router::build_app_router(
         service_ctrl.clone(),
         logs.clone(),
@@ -192,6 +214,7 @@ async fn main() -> Result<()> {
         metrics_handle,
         credential_pool,
         client_auth,
+        Some(admin_router),
     );
 
     // Bind before starting the loops: a busy port is a hard failure the operator

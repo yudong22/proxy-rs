@@ -172,6 +172,13 @@ tasks:
       - task: ui-check
       - task: ui-smoke
 
+  admin-smoke:
+    desc: Boot the server-mode console in headless Chrome against a live gateway
+    cmds:
+      # Needs a running `proxy-rs-server` and its PROXY_API_TOKEN; skips cleanly
+      # when either is absent so this can sit in `task check` on any machine.
+      - node ui/tools/admin-smoke.mjs
+
   check:
     desc: Run all checks (fmt, lint, test, ui)
     cmds:

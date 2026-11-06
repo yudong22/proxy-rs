@@ -205,6 +205,16 @@ cargo build --release --bin proxy-rs-server
 - **`PROXY_CLIENT_AUTH=true` 必须显式设置**：桌面版默认关闭是为了不让升级打断存量客户端，而服务器一旦可达就必须有入站鉴权。启动日志会打印实际开关状态，关闭时另有一条 WARN。
 - **`/api/*`、`/metrics`、`/health` 应在反代层直接 404**：它们只对回环有意义，其中还含一条会改上游账号状态的 `POST`。
 
+#### Web 管理台
+
+服务器版带一个浏览器管理台，地址 **`https://<域名>/admin/`**：
+
+- **登录**：用 `PROXY_API_TOKEN` 换一个 HttpOnly + SameSite=Strict 的会话 Cookie（默认 12 小时，每次请求续期）。
+- **能做什么**：看运行状态与今日统计、管理身份池（登录态 / API Key / 默认身份 / 打卡与成长任务）、增删访问密钥、改设置、看日志、账号池导入导出。
+- **不做什么**：启停服务（归 systemd）、开机自启、打开日志目录、扫码登录（服务器没有浏览器可回跳）。少一个按钮好过一个点了没反应的按钮。
+
+桌面版仍然走 Tauri IPC，不暴露任何 HTTP 管理面——多一个浏览器可达的入口就是多一处要鉴权的东西。接口契约见 [`docs/admin-api.md`](docs/admin-api.md)。
+
 完整部署步骤、nginx 反代配置（含 SSE 必需的 `proxy_buffering off`）、证书、验收清单与踩坑记录见 [`deploy/linux/README.md`](deploy/linux/README.md)。
 
 ### 客户端接入配置

@@ -117,8 +117,13 @@ PROXY_API_TOKEN=<openssl rand -base64 32>
 | 路径 | 处理 | 理由 |
 |---|---|---|
 | `/v1/*`、`/responses`、`/chat/completions`、`/backend-api/*` | 反代到网关 | 数据面 |
+| `/admin/` | 反代到网关的 `/admin/api/` | **Web 管理台**（自带令牌登录） |
 | `/` | 静态首页 | 使用说明，不含凭据 |
-| `/api/*`、`/metrics`、`/health` | **`return 404`** | 内部观测/管理命名空间 |
+| `/api/*`、`/metrics`、`/health` | **`return 404`** | 内部只读观测命名空间 |
+
+> **`/admin/` 与 `/api/` 是两个不同的命名空间，别混。** `/api/*` 是**无鉴权**的只读观测面（本机 dashboard 用），所以必须在反代层挡掉；`/admin/api/*` 是**有鉴权**的管理面（令牌换 Cookie 会话），可以对外。
+>
+> nginx 把 `/admin/*` 重写成 `/admin/api/*`（`rewrite ^/admin/?(.*)$ /admin/api/$1 break`），这样对外是干净的 `/admin` 前缀，而网关只认一个绝对前缀，少一处必须同步的常量。
 
 `/api/*` 里有一条**会改上游账号状态**的 `POST /api/scheduler/run/:loop`。网关侧已有 `PROXY_API_TOKEN` 校验，但那是第二道锁 —— 在反代层把整个命名空间挡掉，外部根本看不到这把锁存在。同理 `/metrics` 与 `/health` 只对回环有意义，没有任何理由出现在公网。
 

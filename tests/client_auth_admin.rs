@@ -69,6 +69,7 @@ fn test_router(state: Arc<ClientAuthState>) -> axum::Router {
         metrics::install(),
         Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         state,
+        None,
     )
 }
 

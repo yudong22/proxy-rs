@@ -83,6 +83,7 @@ fn router_with(state: Arc<ClientAuthState>, config: Config) -> axum::Router {
         metrics::install(),
         Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         state,
+        None,
     )
 }
 
@@ -490,6 +491,7 @@ async fn a_gateway_key_authenticates_here_while_the_pool_authenticates_upstream(
         metrics::install(),
         Arc::new(pool),
         state.clone(),
+        None,
     );
 
     // Only the gateway key, in a standard header — the "paste key + host" setup.
@@ -697,4 +699,111 @@ async fn both_keys_travel_their_own_directions() {
             );
         }
     }
+}
+
+// ── Identity attribution ───────────────────────────────────────────────────
+
+/// The authenticated account must be visible to the handler, not just to the
+/// gate.
+///
+/// This is the regression test for a bug that shipped silently: the gate called
+/// `request.extensions_mut().insert(identity)` where `identity` was a
+/// `VerifiedAccount`. `Extensions` keys on the **concrete type of the value** and
+/// performs no `Into` conversion, so the map held `Extension<VerifiedAccount>`
+/// while every handler asks for `Extension<ClientAccountIdentity>`. Nothing
+/// failed — requests authenticated, forwarded and were served — but
+/// `client_auth::account_label` always returned `""`, so the request log could
+/// not attribute a call to the key that made it, and an operator holding two
+/// keys had no way to tell them apart.
+///
+/// Asserted through the handler's own log line rather than a unit-tested helper,
+/// because the helper was always correct — the *type that reached it* was not.
+#[tokio::test]
+async fn a_passing_request_is_attributed_to_its_account_in_the_log() {
+    let _iso = isolate("attribution").await;
+    let (account, key) = client_accounts::create_account("attribution-acct", "").expect("create");
+    let state = Arc::new(ClientAuthState::new(true));
+    state.reload_from_store().await;
+
+    // The upstream is unreachable, so this ends as a 502. Irrelevant: the gate
+    // has already run and logged by then, which is what this asserts.
+    let _ = post_messages(
+        router_with(state, unreachable_upstream_config()),
+        &[(KEY_HEADER, &key)],
+    )
+    .await;
+
+    // The handler pushes its log line asynchronously; poll briefly rather than
+    // racing it.
+    let wanted = format!("client_account={}", account.label);
+    let mut seen = String::new();
+    for _ in 0..50 {
+        seen = proxy_rs::settings::LogBuffer::new(200)
+            .snapshot()
+            .await
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if seen.contains(&wanted) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the request log must name the account that authenticated the call (wanted {wanted}), saw:\n{seen}");
+}
+
+/// The server-mode console must not require a *data-plane* access key.
+///
+/// This is the regression test for a bug that only appeared on a real
+/// deployment: `PROXY_CLIENT_AUTH=true` is exactly what a server is supposed to
+/// set, and the inbound gate then refused `/admin/api/login` with
+/// `401 missing_key`. The console was unreachable in the only configuration it
+/// ships in, while every unit test passed because they all ran with the gate off
+/// or never touched `/admin/*`.
+///
+/// The two credentials are unrelated: the access key is for clients calling
+/// `/v1/*`, and the console authenticates a human with its own token-to-cookie
+/// session. Gating the console behind the client key would also mean handing
+/// every browser user an upstream-spending credential.
+#[tokio::test]
+async fn the_admin_console_is_not_gated_by_the_access_key() {
+    let _iso = isolate("admin-open").await;
+    let state = Arc::new(ClientAuthState::new(true));
+    let app = router_with(state, unreachable_upstream_config());
+
+    for path in ["/admin/api", "/admin/api/", "/admin/api/console.js"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} must not require the data-plane access key"
+        );
+    }
+
+    // The data plane itself stays gated: the exemption must not have widened.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v1/* must still require the access key"
+    );
 }

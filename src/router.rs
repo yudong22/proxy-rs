@@ -46,6 +46,7 @@ pub fn build_app_router(
     metrics_handle: metrics::PrometheusHandle,
     pool: crate::session_pool::SharedCredentialPool,
     client_auth: Arc<crate::client_accounts::ClientAuthState>,
+    admin: Option<Router>,
 ) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -128,6 +129,18 @@ pub fn build_app_router(
         .layer(Extension(stats))
         .layer(Extension(pool))
         .layer(Extension(client_auth.clone()))
+        // The server-mode admin console, when this front-end has one. Mounted as
+        // a nested router so its own auth layer cannot be confused with the
+        // inbound access-key gate above, and so the desktop app (which passes
+        // `None`) serves exactly the bytes it did before this existed.
+        .merge(match admin {
+            // Merged, not nested: the admin router registers its own absolute
+            // `/admin/api/*` paths because `nest` reserves the prefix and answers
+            // 404 for the bare prefix before any nested route or fallback runs —
+            // and the bare prefix is the console's front door.
+            Some(router) => router,
+            None => Router::new(),
+        })
         // Inbound access-key gate. `.route_layer` keeps it off the fallback and
         // out of the way of 404s; `TraceLayer`/`cors` sit *outside* it so a 401
         // still carries CORS headers and reaches the browser as a readable

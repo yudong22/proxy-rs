@@ -45,8 +45,20 @@ const OPEN_PATHS: &[&str] = &["/health", "/metrics"];
 /// `/api/*` is open here on purpose — see the module docs. The admin routes
 /// under `/api/admin/*` carry their own `PROXY_API_TOKEN` check inside the
 /// handler, so an open middleware does not leave them unauthenticated.
+///
+/// `/admin/*` is the **server-mode console** and is open here for the same
+/// reason: it authenticates with its own token-to-cookie session
+/// ([`crate::admin_auth`]), and its login endpoint is the one that *mints* that
+/// session. Gating it behind the data-plane access key made the console
+/// unreachable with a 401 the moment `PROXY_CLIENT_AUTH=true` — which is exactly
+/// the configuration a server deployment is supposed to use. The two credentials
+/// are unrelated: the access key is for clients calling `/v1/*`, the console
+/// token is for a human opening a browser.
 fn is_open_path(path: &str) -> bool {
-    OPEN_PATHS.contains(&path) || path.starts_with("/api/")
+    OPEN_PATHS.contains(&path)
+        || path.starts_with("/api/")
+        || path == "/admin"
+        || path.starts_with("/admin/")
 }
 
 /// Build the 401 body.
@@ -189,7 +201,19 @@ pub async fn guard(
                 }
 
                 let id = identity.id.clone();
-                request.extensions_mut().insert(identity);
+                // `Extensions::insert` keys the map on the *concrete type of the
+                // value*, and does no `Into` conversion. Inserting the
+                // `VerifiedAccount` directly therefore stored
+                // `Extension<VerifiedAccount>` — a key no handler ever reads,
+                // because `proxy.rs` asks for `ClientAccountIdentity`. The
+                // request authenticated fine and `account_label` returned "",
+                // so every log line said `client_account=` was absent and the
+                // caller could not be told apart from an anonymous one. Convert
+                // explicitly; the `From` impl is what this was always meant to
+                // use.
+                request
+                    .extensions_mut()
+                    .insert(ClientAccountIdentity::from(identity));
                 // Observational only, throttled internally; cannot fail.
                 state.touch(&id).await;
                 return next.run(request).await;
