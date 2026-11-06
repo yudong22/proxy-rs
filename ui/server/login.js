@@ -10,53 +10,101 @@
 
 const form = document.getElementById('form');
 const tokenInput = document.getElementById('token');
+const rememberInput = document.getElementById('remember');
 const submit = document.getElementById('submit');
 const errorBox = document.getElementById('err');
+const warnBox = document.getElementById('warn');
 
 function showError(message) {
+  warnBox.classList.remove('show');
   errorBox.textContent = message;
   errorBox.classList.add('show');
 }
 
-form.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  submit.disabled = true;
-  errorBox.classList.remove('show');
+/**
+ * Warn that a lockout is approaching, without implying the token was wrong.
+ *
+ * Shown *before* the lockout lands because that is the only moment it can change
+ * the outcome: the operator can stop and re-read the token instead of burning
+ * the last attempt on the same typo.
+ */
+function showWarning(message) {
+  warnBox.textContent = message;
+  warnBox.classList.add('show');
+}
 
-  try {
-    const response = await fetch('api/login', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: tokenInput.value }),
-    });
-
-    if (response.ok) {
-      // Clear the field before navigating: the token must not survive in a
-      // password input that the back button could restore.
-      tokenInput.value = '';
-      window.location.replace('.');
-      return;
-    }
-
-    const body = await response.json().catch(() => null);
-    const code = body?.error?.type;
-
-    if (response.status === 503 || code === 'admin_disabled') {
-      // Not a wrong password — the console is switched off. Saying so avoids a
-      // loop of retyping a token that cannot possibly work.
-      showError(
-        '管理台未启用：服务器上没有配置 PROXY_API_TOKEN。' +
-          '请在 /etc/proxy-rs.env 中设置该项后重启服务（systemctl restart proxy-rs）。'
-      );
-    } else if (response.status === 401) {
-      showError('令牌错误，请检查 /etc/proxy-rs.env 中的 PROXY_API_TOKEN。');
-    } else {
-      showError(body?.error?.message || `登录失败（HTTP ${response.status}）`);
-    }
-  } catch (err) {
-    showError(`无法连接网关：${err.message}`);
-  } finally {
-    submit.disabled = false;
+/**
+ * Log in by submitting the form natively.
+ *
+ * Deliberately NOT `fetch()`. Browsers only offer to save a password after a real
+ * form submission that navigates; an XHR/fetch login looks like an AJAX call and
+ * the "save password?" prompt never appears. Since saving the token is exactly
+ * what the operator wants here, the page posts for real and the server answers
+ * with a redirect to the console.
+ *
+ * The one thing still done in JS is refusing to submit an empty token, so the
+ * common mistake produces the inline message instead of a round trip.
+ */
+form.addEventListener('submit', (event) => {
+  const token = tokenInput.value.trim();
+  if (!token) {
+    event.preventDefault();
+    showError('请输入管理令牌。');
+    return;
   }
+  // The button must not be re-enabled on navigation failure; the browser owns the
+  // page from here. Disabling it also prevents a double post.
+  submit.disabled = true;
+  submit.textContent = '登录中…';
+  errorBox.classList.remove('show');
+  warnBox.classList.remove('show');
 });
+
+/**
+ * The server redirects back with `?e=<code>` when a native post fails.
+ *
+ * A failed form post cannot return JSON (the browser navigates), so the reason
+ * travels in the query string and is rendered here.
+ */
+(function reportFormError() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('e');
+  if (!code) return;
+
+  submit.disabled = false;
+  submit.textContent = '登录';
+  const wait = Number(params.get('wait')) || 0;
+
+  if (code === 'rate_limited') {
+    showError(`登录尝试过于频繁。请等待 ${wait || 60} 秒后重试。`);
+    let remaining = wait || 60;
+    submit.disabled = true;
+    submit.textContent = `请等待 ${remaining} 秒`;
+    const timer = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(timer);
+        submit.disabled = false;
+        submit.textContent = '登录';
+        return;
+      }
+      submit.textContent = `请等待 ${remaining} 秒`;
+    }, 1000);
+    return;
+  }
+  if (code === 'admin_disabled') {
+    showError(
+      '管理台未启用：服务器上没有配置 PROXY_API_TOKEN。' +
+        '请在 /etc/proxy-rs.env 中设置该项后重启服务（systemctl restart proxy-rs）。'
+    );
+    return;
+  }
+  showError('令牌错误，请检查 /etc/proxy-rs.env 中的 PROXY_API_TOKEN。');
+  const left = Number(params.get('left'));
+  if (Number.isFinite(left) && left > 0) {
+    showWarning(
+      left === 1 ? '再失败 1 次将锁定登录 1 分钟。' : `再失败 ${left} 次将锁定登录 1 分钟。`
+    );
+  }
+})();
+

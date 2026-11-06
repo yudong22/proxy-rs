@@ -356,6 +356,127 @@ pub fn write_catalog(
     Ok((catalog_path, config_path.to_path_buf()))
 }
 
+/// Wire this gateway as a Codex model provider, including its access key.
+///
+/// Codex authenticates a custom provider through `env_key`: the *name* of an
+/// environment variable it reads for the bearer token. That indirection is why
+/// this writes two things — the provider block, and a line in `~/.codex/.env`
+/// (or the file `env_key` names) holding the key itself.
+///
+/// Until now the catalog was wired but the provider was not, so a user still had
+/// to hand-write this block and find a working key. On a server with
+/// `PROXY_CLIENT_AUTH=true` that meant the config could not work at all.
+///
+/// Returns the `.env` path it wrote, or `None` when no writable key exists (the
+/// provider block is still written, with `env_key` pointing at an empty
+/// variable, so the failure is a clear 401 rather than a confusing startup
+/// error).
+pub fn apply_provider(
+    config_path: &Path,
+    base_url: &str,
+    provider_id: &str,
+) -> Result<Option<PathBuf>> {
+    let existing = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+    if config_path.exists() {
+        let backup = config_path.with_extension("toml.bak");
+        let _ = std::fs::copy(config_path, backup);
+    }
+
+    // `env_key` names a variable; Codex reads it from its own `.env`.
+    let var = "PROXY_RS_API_KEY";
+    let block = format!(
+        "[model_providers.{provider_id}]\n\
+         name = \"Proxy RS\"\n\
+         base_url = {}\n\
+         wire_api = \"responses\"\n\
+         env_key = \"{var}\"\n",
+        toml_basic_string(base_url)
+    );
+
+    let rendered = upsert_toml_table(&existing, &format!("model_providers.{provider_id}"), &block);
+    if let Some(dir) = config_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(config_path, rendered)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    // The key itself, in the file Codex loads for `env_key`.
+    let Some((_, key)) = crate::client_accounts::writable_key() else {
+        return Ok(None);
+    };
+    let env_path = config_path
+        .parent()
+        .map(|d| d.join(".env"))
+        .ok_or_else(|| anyhow::anyhow!("Codex config path has no parent directory"))?;
+    let current = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let next = upsert_env_line(&current, var, &key);
+    std::fs::write(&env_path, next)
+        .with_context(|| format!("failed to write {}", env_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(Some(env_path))
+}
+
+/// Replace or append a whole `[table]` block, leaving everything else untouched.
+fn upsert_toml_table(text: &str, table: &str, block: &str) -> String {
+    let header = format!("[{table}]");
+    let lines: Vec<&str> = text.lines().collect();
+    if let Some(start) = lines.iter().position(|l| l.trim() == header) {
+        // Replace up to the next table header.
+        let end = lines
+            .iter()
+            .skip(start + 1)
+            .position(|l| l.trim_start().starts_with('['))
+            .map(|i| start + 1 + i)
+            .unwrap_or(lines.len());
+        let mut out: Vec<&str> = Vec::new();
+        out.extend(&lines[..start]);
+        out.push(block.trim_end());
+        out.extend(&lines[end..]);
+        let mut s = out.join("\n");
+        if text.ends_with('\n') || s.is_empty() {
+            s.push('\n');
+        }
+        return s;
+    }
+    let mut s = text.trim_end().to_string();
+    if !s.is_empty() {
+        s.push_str("\n\n");
+    }
+    s.push_str(block);
+    s
+}
+
+/// Replace or append `KEY=value` in a dotenv file.
+fn upsert_env_line(text: &str, key: &str, value: &str) -> String {
+    let wanted = format!("{key}={value}");
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with(&format!("{key}=")) {
+            out.push(wanted.clone());
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        out.push(wanted);
+    }
+    let mut s = out.join("\n");
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s
+}
+
 /// Point `model_catalog_json` at `catalog_path`, preserving every other key.
 ///
 /// Codex reads `model_catalog_json` only from the user-level config, so this
@@ -822,5 +943,101 @@ mod tests {
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+}
+
+#[cfg(test)]
+mod provider_key_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Serialises these tests and points the data directory at a temp root.
+    ///
+    /// Same shape as `client_accounts::tests::TempDataDir`: the override is a
+    /// process-global env var, so tests must not interleave, and the lock is the
+    /// one `settings` exposes for exactly this.
+    struct TempDataDir {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        dir: PathBuf,
+    }
+
+    impl TempDataDir {
+        fn new(name: &str) -> Self {
+            let guard = crate::settings::data_dir_test_lock();
+            let dir =
+                std::env::temp_dir().join(format!("proxy-rs-codex-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            std::env::set_var("PROXY_DATA_DIR", &dir);
+            Self { _guard: guard, dir }
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            std::env::remove_var("PROXY_DATA_DIR");
+            if !std::thread::panicking() {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+    }
+
+    /// The provider block and the key both land, and the key is the real one.
+    #[test]
+    fn apply_provider_writes_the_block_and_the_real_key() {
+        let data = TempDataDir::new("prov");
+        let (_acct, key) = crate::client_accounts::create_account("t", "").expect("create");
+
+        let config = data.dir.join("config.toml");
+        let env_path = apply_provider(&config, "http://127.0.0.1:3456/v1", "proxy_rs")
+            .expect("apply")
+            .expect("a writable key exists");
+
+        let body = std::fs::read_to_string(&config).unwrap();
+        assert!(body.contains("[model_providers.proxy_rs]"), "{body}");
+        assert!(body.contains("env_key = \"PROXY_RS_API_KEY\""), "{body}");
+        assert!(body.contains("http://127.0.0.1:3456/v1"), "{body}");
+
+        // The key itself goes to Codex's .env, named by `env_key`.
+        let env = std::fs::read_to_string(&env_path).unwrap();
+        assert_eq!(env.trim(), format!("PROXY_RS_API_KEY={key}"));
+        assert_eq!(env_path, data.dir.join(".env"));
+    }
+
+    /// Re-running must not duplicate the table or the env line.
+    #[test]
+    fn apply_provider_is_idempotent() {
+        let data = TempDataDir::new("idem");
+        crate::client_accounts::create_account("t", "").expect("create");
+
+        let config = data.dir.join("config.toml");
+        apply_provider(&config, "http://127.0.0.1:1/v1", "proxy_rs").unwrap();
+        apply_provider(&config, "http://127.0.0.1:2/v1", "proxy_rs").unwrap();
+
+        let body = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            body.matches("[model_providers.proxy_rs]").count(),
+            1,
+            "{body}"
+        );
+        assert!(
+            body.contains("http://127.0.0.1:2/v1"),
+            "last write wins: {body}"
+        );
+        let env = std::fs::read_to_string(data.dir.join(".env")).unwrap();
+        assert_eq!(env.matches("PROXY_RS_API_KEY=").count(), 1, "{env}");
+    }
+
+    /// With no stored plaintext, the block is still written but no key is.
+    #[test]
+    fn without_a_writable_key_the_provider_is_still_wired() {
+        let data = TempDataDir::new("nokey");
+        // No account at all.
+        let config = data.dir.join("config.toml");
+        let env_path = apply_provider(&config, "http://127.0.0.1:3456/v1", "proxy_rs").unwrap();
+        assert!(env_path.is_none(), "no key means no .env write");
+        let body = std::fs::read_to_string(&config).unwrap();
+        assert!(body.contains("[model_providers.proxy_rs]"), "{body}");
+        assert!(!data.dir.join(".env").exists());
     }
 }

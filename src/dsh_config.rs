@@ -921,10 +921,14 @@ pub fn ensure_credential(text: &str) -> String {
         }
     };
 
-    lines.insert(
-        insert_at,
-        format!("  {CREDENTIAL_REF}: {CREDENTIAL_PLACEHOLDER}"),
-    );
+    // A real gateway access key when one can be recovered, so the written config
+    // works as-is. The placeholder remains for the case where no stored account
+    // kept its plaintext: DSH would otherwise send no credential at all, and a
+    // wrong one at least yields a 401 from the gateway instead of a mystery.
+    let value = crate::client_accounts::writable_key()
+        .map(|(_, key)| key)
+        .unwrap_or_else(|| CREDENTIAL_PLACEHOLDER.to_string());
+    lines.insert(insert_at, format!("  {CREDENTIAL_REF}: {value}"));
 
     let mut out = lines.join("\n");
     if had_trailing_newline || out.is_empty() {
@@ -1551,5 +1555,59 @@ agent-default-model:
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+}
+
+#[cfg(test)]
+mod credential_key_tests {
+    use super::*;
+
+    /// `ensure_credential` writes a real, usable gateway key when one exists.
+    ///
+    /// Before this, it always wrote the placeholder `nouse`, which on a server
+    /// with `PROXY_CLIENT_AUTH=true` produced a DSH config that could never
+    /// authenticate — the user had no way to fix it except to re-issue a key and
+    /// edit the file by hand.
+    #[test]
+    fn ensure_credential_writes_the_real_key() {
+        let guard = crate::settings::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("dsh-cred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("PROXY_DATA_DIR", &dir);
+
+        let (_acct, key) = crate::client_accounts::create_account("t", "").expect("create");
+        let out = ensure_credential("refs:\n  OTHER: x\nrecords: {}\n");
+
+        assert!(
+            out.contains(&format!("{CREDENTIAL_REF}: {key}")),
+            "the real key must be written, got:\n{out}"
+        );
+        assert!(!out.contains(CREDENTIAL_PLACEHOLDER), "{out}");
+
+        std::env::remove_var("PROXY_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
+    }
+
+    /// With no writable key, the placeholder is still better than nothing: DSH
+    /// then sends a credential that fails with a clear 401 instead of sending none.
+    #[test]
+    fn ensure_credential_falls_back_to_the_placeholder() {
+        let guard = crate::settings::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("dsh-cred-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("PROXY_DATA_DIR", &dir);
+
+        let out = ensure_credential("refs:\n  OTHER: x\n");
+        assert!(
+            out.contains(&format!("{CREDENTIAL_REF}: {CREDENTIAL_PLACEHOLDER}")),
+            "{out}"
+        );
+
+        std::env::remove_var("PROXY_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
     }
 }

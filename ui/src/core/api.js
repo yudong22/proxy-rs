@@ -7,11 +7,21 @@
  * Views import `getStats` / `getRequestLogs` from here instead of calling
  * `invoke` directly.
  *
- * **Why HTTP is tried first.** The listener is the process that owns the data
- * and is what a headless deployment or an external tool would talk to, so the
- * window uses the same public interface rather than a privileged side channel.
- * The identical payloads remain available as Tauri commands (`get_stats`,
+ * **Why HTTP is tried first (desktop only).** The listener is the process that
+ * owns the data and is what an external tool would talk to, so the window uses
+ * the same public interface rather than a privileged side channel. The identical
+ * payloads remain available as Tauri commands (`get_stats`,
  * `get_request_logs`), which is the fallback below.
+ *
+ * **Why the server build skips HTTP entirely.** The base URL is
+ * `http://127.0.0.1:<port>`, which is correct in the desktop app — the gateway
+ * and the window are the same machine. In a browser it is a different machine
+ * by definition: `127.0.0.1` resolves to the *visitor's* computer, so every poll
+ * fired a request at their own localhost, failed, and only then fell back to the
+ * bridge. It worked, but each poll paid a round of failed requests (and a
+ * browser console full of connection errors). Under `/admin/` there is also no
+ * `/api/*` to reach — the reverse proxy 404s it by design — so the correct
+ * transport is the bridge, with no HTTP attempt at all.
  *
  * **Why the fallback is real, not decorative.** The listener only exists while
  * the service is running, and "how much did I use today" is a question asked
@@ -47,8 +57,19 @@ const HTTP_TIMEOUT_MS = 4000;
  */
 let httpDown = false;
 
-/** Loopback base URL of the observation endpoints. */
+/**
+ * Loopback base URL of the observation endpoints, or `null` when this page is
+ * not running on the gateway's own machine.
+ *
+ * `null` means "do not attempt HTTP": in the browser there is no loopback
+ * listener to reach, and the bridge is the transport. Returning `null` rather
+ * than a same-origin path is deliberate — `/api/*` is 404'd by the reverse proxy
+ * on purpose, so a same-origin fetch would fail too, just less obviously.
+ */
 function apiBase() {
+  // Server-hosted console: the page came from a different machine than the
+  // gateway it is talking to. Set by `ui/server/bridge.js`.
+  if (window.__PROXY_RS_SERVER__) return null;
   // Test hook for `ui/tools/smoke.mjs`, which serves the page and the two
   // endpoints from one harness origin so the HTTP path is exercised without
   // depending on whether a real instance happens to own the configured port.
@@ -66,10 +87,15 @@ function apiBase() {
  * moving.
  */
 async function fetchJson(path) {
+  const base = apiBase();
+  if (base === null) {
+    // Not an error and not worth a log line: this build has no HTTP transport.
+    throw new Error('no-http-transport');
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
   try {
-    const res = await fetch(`${apiBase()}${path}`, {
+    const res = await fetch(`${base}${path}`, {
       cache: 'no-store',
       signal: controller.signal,
     });
@@ -95,7 +121,9 @@ async function read(path, command, args) {
     }
     return payload;
   } catch (err) {
-    if (!httpDown) {
+    // The server build has no HTTP transport at all; that is the normal path
+    // there, so it must not set the outage flag or log on every poll.
+    if (err.message !== 'no-http-transport' && !httpDown) {
       httpDown = true;
       // Info, not error: a stopped service is an ordinary state, and logging it
       // as an error would paint a red line in the console on every cold start.

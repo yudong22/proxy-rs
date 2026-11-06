@@ -66,10 +66,20 @@ async function invoke(command, args = {}) {
   });
 
   if (response.status === 401) {
-    // The session expired (12h idle, or the gateway restarted). Reloading lands
-    // on the login form, which is the only honest recovery — every view's data
-    // is now unreachable.
-    window.location.reload();
+    // The session expired (12h idle, or the gateway restarted).
+    //
+    // Navigate to the login **page**, and guard it: a bare `location.reload()`
+    // here is what produced an infinite reload loop in production. The console
+    // issues several RPCs at boot, so one reload fires several times; and if the
+    // stale cookie is still present, re-requesting the console page simply
+    // serves the console again — reload, 401, reload, forever.
+    //
+    // `location.replace` keeps the broken page out of history, and the flag
+    // ensures concurrent 401s from the boot burst only navigate once.
+    if (!window.__PROXY_RS_REDIRECTING__) {
+      window.__PROXY_RS_REDIRECTING__ = true;
+      window.location.replace('/admin/login');
+    }
     throw '会话已过期，请重新登录';
   }
 
@@ -103,6 +113,27 @@ async function invoke(command, args = {}) {
 async function listen(_event, _handler) {
   return () => {};
 }
+
+/**
+ * Refresh the session's expiry, extending the cookie's lifetime.
+ *
+ * The console polls every two seconds and the server slides the session on every
+ * request, but the **cookie's** `Max-Age` is fixed at login. Without this, a
+ * "remember me" session would be dropped by the browser after its original
+ * `Max-Age` even though the server still holds it — and a default session used
+ * for hours would expire mid-edit for no visible reason.
+ *
+ * Runs once an hour: far more often than any TTL needs, and rare enough to be
+ * irrelevant. Failures are ignored — if the session is gone, the next RPC will
+ * answer 401 and route to the login page, which is the one path that must work.
+ */
+setInterval(async () => {
+  try {
+    await fetch('/admin/api/session', { credentials: 'same-origin', cache: 'no-store' });
+  } catch {
+    /* the next command call will surface it */
+  }
+}, 60 * 60 * 1000);
 
 // Defined synchronously, before `main.js` is evaluated: `ipc.js` reads
 // `window.__TAURI__` inside `invoke`, so a later definition would work too — but

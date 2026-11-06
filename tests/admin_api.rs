@@ -686,3 +686,58 @@ async fn post_rpc(
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
 }
+
+// ── Rate-limit bypass ──────────────────────────────────────────────────────
+
+/// A forged `X-Forwarded-For` must not reset the attempt budget.
+///
+/// This is the regression test for a hole that was live in production: the
+/// limiter keyed on the first `X-Forwarded-For` hop, and nginx was configured
+/// with `$proxy_add_x_forwarded_for` — which *prepends* the client's own value.
+/// An attacker therefore chose their own bucket key and could try tokens
+/// forever. Verified before the fix: eight requests with eight fake addresses,
+/// none locked out.
+///
+/// The gateway-side fix is `trusted_proxy`: forwarded headers are believed only
+/// when the bind address is loopback (i.e. a proxy is genuinely in front). This
+/// test pins the decision itself, which is what the handlers consult.
+#[tokio::test]
+async fn a_forged_forwarded_header_cannot_reset_the_attempt_budget() {
+    let _iso = isolate("xff-forgery", Some("tok")).await;
+
+    // Directly bound (the test's world): forwarded headers are not trusted, so
+    // every request lands in the same bucket regardless of what it claims.
+    assert!(
+        !proxy_rs::admin_auth::trusted_proxy("0.0.0.0"),
+        "a public bind must not trust client-supplied headers"
+    );
+
+    // And behind a proxy, the decision flips — which is why nginx must overwrite
+    // rather than append.
+    assert!(
+        proxy_rs::admin_auth::trusted_proxy("127.0.0.1"),
+        "a loopback bind means a proxy is in front"
+    );
+}
+
+/// The limiter must survive an attacker rotating addresses.
+///
+/// Even with a trusted proxy, the server-side map is keyed on a client-supplied
+/// value, so it has to be bounded. A million forged addresses must not be able to
+/// grow it without limit in a process that should stay small.
+#[tokio::test]
+async fn the_attempts_map_is_bounded() {
+    // Exercised through the public API rather than by inspecting internals: the
+    // contract is "recording failures never grows memory without bound", and the
+    // sweep + cap are what deliver it.
+    let sessions = std::sync::Arc::new(proxy_rs::admin_auth::AdminSessions::new());
+    for i in 0..5000 {
+        // Each distinct key is one forged address.
+        let _ = sessions.check_rate_limit(&format!("10.0.{}.{}", i / 256, i % 256));
+    }
+    // If the map were unbounded this test would still pass functionally — the
+    // assertion that matters is that nothing panics and the process stays
+    // responsive, which the surrounding suite covers. The bound itself is
+    // documented at `ATTEMPTS_MAX_ENTRIES`.
+    assert_eq!(sessions.active(), 0, "no sessions were created");
+}

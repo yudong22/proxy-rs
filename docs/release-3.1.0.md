@@ -55,7 +55,19 @@ systemd 单元、nginx 反代、证书、数据迁移、验收清单与踩坑记
 - `HttpOnly` —— XSS 偷不走会话
 - `SameSite=Strict` —— 跨站请求根本不带它，CSRF 在源头消失
 - `Path=/admin` —— 不发给 `/v1/*`
-- 12 小时滑动续期，进程内存保存，重启即失效
+- 12 小时滑动续期（可勾「记住我」延到 7 天），进程内存保存，重启即失效
+- **登录限速**：同一地址连续 5 次失败锁 1 分钟，重复犯翻倍至 1 小时封顶。按地址而非全局计数 —— 全局计数会让陌生人把运维锁在自己网关外面
+- 失败但未锁定时，页头提示「再失败 N 次将锁定」，**在锁定前**给出可行动的警告
+- 锁定期内按钮进入倒计时并保持禁用，而不是让用户对着一个点不动的按钮猜
+
+### 修复：无限重启
+
+第一版有个死循环：`serve_page` 只检查 cookie **是否存在**，不校验是否有效。于是过期 cookie 会拿到控制台页面 → 页面上每个 RPC 都 401 → 桥接 `location.reload()` → cookie 还在 → 又是控制台页面 → 无限转。
+
+两处都修了：
+
+- 服务端**校验**会话（`touch`，同时滑动续期），无效就直给登录页；
+- 桥接遇 401 跳 `/admin/login`（`location.replace`，不加历史），并加去重标志 —— 启动瞬间会并发多个 RPC，否则一次过期触发多次跳转。
 
 ### 刻意做不到的三件事
 
@@ -71,7 +83,29 @@ systemd 单元、nginx 反代、证书、数据迁移、验收清单与踩坑记
 
 桌面版仍走 Tauri IPC，`build_app_router` 收到的 admin router 是 `None`，**不暴露任何 HTTP 管理面**。
 
-## 3. 修掉的三个 bug
+## 3. 一键写入客户端配置：现在真的能用
+
+「写入 Claude Code / Codex / DSH 配置」这三个按钮此前都会写一个占位符 key（`ANTHROPIC_AUTH_TOKEN = "nouse"`、`PROXY_RS_API_KEY: nouse`）。桌面端恰好能用——网关默认不校验入站 key——但服务器上 `PROXY_CLIENT_AUTH=true`，写出来的配置**一调就 401**，用户只能重新签发一把再手工粘到三个文件里。
+
+现在：
+
+| 客户端 | 写入内容 |
+|---|---|
+| Claude Code | `ANTHROPIC_BASE_URL` + **真实可用的** `ANTHROPIC_AUTH_TOKEN` |
+| Codex | provider 块（`base_url` / `wire_api` / `env_key`）+ `~/.codex/.env` 里的真实 key |
+| DSH | patch 里的 provider + 凭据文件里的真实 key |
+
+Codex 此前**只写了模型目录、没写 provider**，所以即便有 key 也连不上；这次一并补上。
+
+### 代价：明文 key 落盘
+
+要实现「写入可用的 key」，就必须能取回明文，于是 `client-accounts.json` 现在同时保存哈希和明文（`0600`）。这推翻了最初「只存哈希」的设计，因此补了三道约束：
+
+- 字段是 `Option`，旧账号没有它仍能正常鉴权；
+- **未加密的导出包会剥离明文**——否则搬账号池的文件就成了一份可用 key 清单；
+- 鉴权仍然只比哈希，明文仅用于写配置。
+
+## 4. 修掉的三个 bug
 
 ### Bug 1：`client_account=` 从来没被记录过（3.0.0 起一直存在）
 
@@ -105,7 +139,7 @@ request.extensions_mut().insert(identity);   // identity: VerifiedAccount
 
 ---
 
-## 4. nginx 反代要点
+## 5. nginx 反代要点
 
 ```caddyfile
 /v1/* 等数据面  → 网关:3456    # proxy_buffering off 是 SSE 的关键
@@ -117,7 +151,7 @@ request.extensions_mut().insert(identity);   // identity: VerifiedAccount
 
 ---
 
-## 5. 验收（2026-11-06 实测，api.wuba.site）
+## 6. 验收（2026-11-06 实测，api.wuba.site）
 
 | 项 | 预期 | 实测 |
 |---|---|---|
@@ -138,7 +172,7 @@ request.extensions_mut().insert(identity);   // identity: VerifiedAccount
 
 ---
 
-## 6. 升级
+## 7. 升级
 
 ### 从 3.0.x 升到 3.1.0（服务器）
 

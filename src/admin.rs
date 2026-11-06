@@ -94,6 +94,22 @@ impl ProcessInfo {
             "data_dir": settings::data_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            // Whether an upstream key is configured, so the settings form can say
+            // "already set, leave blank to keep" instead of looking empty.
+            "api_key_set": !settings.api_key.trim().is_empty(),
+            "env_path": settings::dotenv_path().map(|p| p.display().to_string()),
+            // **The overview's 剩余积分 / 当前账号 cards read this.**
+            //
+            // It was missing from the server payload, so on the web console those
+            // two cards rendered empty forever while the desktop app showed them
+            // — the same front-end, a hole in the data behind it. The shape must
+            // match the desktop command exactly (`id`/`label`/`points`).
+            "current_identity": current_identity_summary(),
+            // `is_dev` gates a couple of desktop-only affordances; a server is
+            // never a dev build.
+            "is_dev": false,
+            "configured_launch_at_login": false,
+            "launch_at_login_plist_present": false,
         })
     }
 }
@@ -625,6 +641,20 @@ pub fn create_client_account(label: &str, note: &str) -> Result<Value> {
         "account": client_account_json(&account, crate::util::unix_millis()),
         // The one and only time this value exists. The store keeps a hash, so it
         // cannot be fetched again — only revoked and reissued.
+        "api_key": key,
+        "header": client_accounts::KEY_HEADER,
+    }))
+}
+
+/// Re-issue an account's key, returning the new plaintext once.
+///
+/// The only remedy for an account created before plaintext was kept: its hash
+/// cannot produce the key back, so "write this gateway into my client config"
+/// could never use it.
+pub fn reissue_client_account_key(id: &str) -> Result<Value> {
+    let (account, key) = client_accounts::reissue_key(id)?;
+    Ok(json!({
+        "account": client_account_json(&account, crate::util::unix_millis()),
         "api_key": key,
         "header": client_accounts::KEY_HEADER,
     }))

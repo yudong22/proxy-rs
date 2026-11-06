@@ -45,7 +45,7 @@
 //! papered over in the UI.
 
 use axum::{
-    extract::Path,
+    extract::{Path, State},
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::post,
@@ -298,7 +298,16 @@ pub fn build_console_router(state: Arc<crate::admin_routes::AdminState>) -> Rout
         // that UI has no notion of authentication, and adding one would mean
         // changing the file both front-ends share. A small standalone page keeps
         // `ui/` untouched and still gives the operator a way in.
-        .route("/admin/login", axum::routing::get(serve_login))
+        // GET shows the form; POST is where a *native* form submission lands.
+        //
+        // This route exists because the login page posts for real (password
+        // managers ignore `fetch` logins). Pointing the form at
+        // `/admin/api/login` would also work but puts the API path in the
+        // browser's URL bar and history, so the page-owned path is used instead.
+        .route(
+            "/admin/login",
+            axum::routing::get(serve_login).post(crate::admin_routes::login_handler),
+        )
         .route("/admin/login.js", axum::routing::get(serve_login_js))
         // One wildcard per asset root. A single `/*path` would have to guess
         // which root a name came from, and guessing wrong turns a stylesheet
@@ -333,9 +342,44 @@ pub fn build_console_router(state: Arc<crate::admin_routes::AdminState>) -> Rout
         .with_state(sessions)
 }
 
-/// Lets the page decide between the login form and the dashboard on boot.
-pub async fn session_info() -> Json<Value> {
-    Json(json!({ "authenticated": true, "ok": true }))
+/// Report the session and **re-issue the cookie** with a fresh `Max-Age`.
+///
+/// Re-issuing matters, not just reporting: the session's expiry slides on the
+/// server with every request, but the browser's cookie has a fixed `Max-Age`
+/// from the moment it was set. Without re-issuing, a console left open for a day
+/// would have its cookie dropped by the browser mid-use — the server still
+/// holding a valid session — and the operator would be logged out for no reason
+/// they could see. The bridge calls this hourly to keep the two in step.
+///
+/// Returns 401 when there is no live session, so the caller can route to the
+/// login page.
+pub async fn session_info(
+    State(sessions): State<Arc<crate::admin_auth::AdminSessions>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(id) = crate::admin_auth::session_cookie(&headers) else {
+        return crate::admin_auth::failure_response(crate::admin_auth::SessionFailure::NoSession);
+    };
+    if !sessions.touch(&id) {
+        return crate::admin_auth::failure_response(crate::admin_auth::SessionFailure::NoSession);
+    }
+    let ttl = sessions
+        .ttl_of(&id)
+        .unwrap_or(crate::admin_auth::SESSION_TTL);
+    let trust_forwarded =
+        crate::admin_auth::trusted_proxy(&crate::settings::GuiSettings::load().bind);
+    let secure = crate::admin_auth::is_secure_request(&headers, trust_forwarded);
+    let mut response = Json(json!({
+        "authenticated": true,
+        "ok": true,
+        "expires_in_secs": ttl.as_secs(),
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        crate::admin_auth::set_cookie_header(&id, secure, ttl),
+    );
+    response
 }
 
 /// Dispatch one Tauri command name to its server-side implementation.
@@ -428,21 +472,31 @@ async fn serve_login_js() -> Response {
         .into_response()
 }
 
-/// Serve the login page or the console, depending on whether a session exists.
+/// Serve the login page or the console, depending on whether the session is
+/// **valid**.
 ///
-/// Not an authorisation decision — every RPC is still checked — it just avoids
-/// showing a login form to someone already signed in, and avoids dumping a
-/// stranger straight into a console whose every panel would render empty.
-///
-/// The check is a *cookie presence* test, not a validation: validation lives in
-/// the middleware, and duplicating it here would mean two places to keep in step
-/// about expiry. A stale cookie therefore shows the console once, whose first
-/// RPC answers 401 and sends the user to the form — one extra round trip, no
-/// wrong answer.
-async fn serve_page(headers: axum::http::HeaderMap) -> Response {
+/// Validation happens here rather than only in the RPC middleware because this
+/// page is what a stale cookie would otherwise land on. That was a real bug:
+/// checking only that the cookie *existed* served the console to expired
+/// sessions, every RPC on it answered 401, the bridge navigated to the login
+/// page, and the stale cookie was still there — an infinite reload loop. See the
+/// body for the fix.
+async fn serve_page(
+    State(sessions): State<Arc<crate::admin_auth::AdminSessions>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // **Validate**, not merely detect. Checking only that a cookie *exists* was
+    // an infinite-reload bug in production: a stale cookie (expired after 12h
+    // idle, or invalidated by `systemctl restart`) got the console page, every
+    // RPC on it answered 401, the bridge reloaded, and the stale cookie was
+    // still there — so the same page came back, forever. The user sees the
+    // console "不断重启".
+    //
+    // `touch` also slides the expiry, which is right: loading the page is the
+    // user being active.
     match crate::admin_auth::session_cookie(&headers) {
-        Some(_) => console_page(),
-        None => login_page(),
+        Some(id) if sessions.touch(&id) => console_page(),
+        _ => login_page(),
     }
 }
 
@@ -484,35 +538,61 @@ fn console_page() -> Response {
 }
 
 /// Scripts: `/admin/src/<rest>` → `/src/<rest>`.
-async fn serve_src(Path(rest): Path<String>) -> Response {
-    static_asset(&format!("/src/{rest}"))
+async fn serve_src(Path(rest): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    static_asset(&format!("/src/{rest}"), &headers)
 }
 
 /// Stylesheets: `/admin/style/<rest>` → `/style/<rest>`.
-async fn serve_style(Path(rest): Path<String>) -> Response {
-    static_asset(&format!("/style/{rest}"))
+async fn serve_style(Path(rest): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    static_asset(&format!("/style/{rest}"), &headers)
 }
 
 /// Static files: `/admin/assets/<rest>` → `/assets/<rest>`.
-async fn serve_assets(Path(rest): Path<String>) -> Response {
-    static_asset(&format!("/assets/{rest}"))
+async fn serve_assets(Path(rest): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    static_asset(&format!("/assets/{rest}"), &headers)
 }
 
-fn static_asset(key: &str) -> Response {
+fn static_asset(key: &str, request_headers: &axum::http::HeaderMap) -> Response {
     match ASSETS.iter().find(|(path, _, _)| *path == key) {
-        Some((_, content_type, body)) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, *content_type),
-                // The console is versioned with the binary, so a cached module
-                // from an older build could call an endpoint that no longer
-                // exists. `no-cache` forces revalidation without the cost of a
-                // full re-download on every load.
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            *body,
-        )
-            .into_response(),
+        Some((_, content_type, body)) => {
+            // An ETag derived from the build version AND the path.
+            //
+            // This was a real upgrade bug: the response said `no-cache` but
+            // carried no validator, so the browser had nothing to revalidate
+            // against and simply reused its copy — a reload after upgrading the
+            // binary kept running the previous build's modules, which then called
+            // endpoints that no longer existed. Including the version means a new
+            // binary invalidates every asset at once, with no manual cache
+            // busting and no hashed filenames to thread through the imports.
+            let etag = format!("\"v{}-{key}\"", env!("CARGO_PKG_VERSION"));
+            // Honour a conditional request, so a normal reload costs headers and
+            // no body at all.
+            if request_headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(',').any(|c| c.trim() == etag))
+                .unwrap_or(false)
+            {
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [
+                        (header::CACHE_CONTROL, "no-cache"),
+                        (header::ETAG, etag.as_str()),
+                    ],
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, *content_type),
+                    (header::CACHE_CONTROL, "no-cache"),
+                    (header::ETAG, etag.as_str()),
+                ],
+                *body,
+            )
+                .into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],

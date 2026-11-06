@@ -1632,11 +1632,23 @@ async fn apply_codex_config(ctx: State<'_, Arc<AppContext>>) -> Result<Value, St
     let (catalog_path, config_path) = codex_config::write_catalog(&models, &config_path)
         .map_err(|e| format!("写入 Codex 配置失败: {}", e))?;
 
+    // The catalog only fixes the picker. Without a provider block and a usable
+    // key, Codex still cannot reach this gateway — see `apply_provider`.
+    let bound = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst);
+    let port = if bound != 0 {
+        bound
+    } else {
+        ctx.settings.read().await.port
+    };
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+    let env_path = codex_config::apply_provider(&config_path, &base_url, "proxy_rs")
+        .map_err(|e| format!("写入 Codex provider 失败: {}", e))?;
+
     ctx.logs
         .push(
             "INFO",
             format!(
-                "已写入 Codex 模型目录（{} 个模型）: {}",
+                "已写入 Codex 模型目录（{} 个模型）与 provider: {}",
                 models.len(),
                 catalog_path.display()
             ),
@@ -1648,6 +1660,8 @@ async fn apply_codex_config(ctx: State<'_, Arc<AppContext>>) -> Result<Value, St
         "models": models.len(),
         "catalog_path": catalog_path.display().to_string(),
         "config_path": config_path.display().to_string(),
+        "env_path": env_path.map(|p| p.display().to_string()),
+        "key_written": proxy_rs::client_accounts::has_writable_key(),
         "note": "重启 Codex 后模型选择器生效",
     }))
 }

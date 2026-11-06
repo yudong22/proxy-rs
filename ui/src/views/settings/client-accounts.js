@@ -170,7 +170,8 @@ function showRevealedKey({ label, apiKey }) {
       <div class="wb-transfer-modal">
         <p class="wb-transfer-hint">
           <b>关闭后不再显示，请立即复制保存。</b>
-          服务端只保存该 key 的哈希，无法再还原出明文；如果丢失，只能删除后重新创建。
+          服务端保留该 key 以便写入客户端配置，因此也可以再次查看；但如果这把 key 泄露，'
+          应在列表中「重新签发」一把新的，旧 key 会立即失效。
         </p>
         <div class="form-group">
           <label>账户备注</label>
@@ -323,6 +324,9 @@ export async function renderClientAccounts() {
             title="${enabled ? '禁用后该 key 立即失效（无需重启）' : '启用后该 key 立即恢复可用'}">
             ${enabled ? '禁用' : '启用'}
           </button>
+          <button type="button" class="btn btn-small"
+            data-client-account-reissue="${a.id}" data-label="${a.label || ''}"
+            title="重新签发一把新 key（旧 key 立即失效）。用于需要把 key 写进客户端配置的场合。">重新签发</button>
           <button type="button" class="btn btn-small btn-danger"
             data-client-account-delete="${a.id}" data-label="${a.label || ''}">删除</button>
         </div>
@@ -341,6 +345,34 @@ export async function renderClientAccounts() {
         toast(enabled ? '已启用该访问账户' : '已禁用该访问账户', 'ok');
       } catch (err) {
         toast('切换失败: ' + err, 'error');
+        btn.disabled = false;
+      }
+    });
+  }
+
+  for (const btn of listEl.querySelectorAll('[data-client-account-reissue]')) {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.clientAccountReissue;
+      const label = btn.dataset.label || id;
+      const ok = await confirmAction(
+        `重新签发「${label}」的 key？旧 key 会立即失效，用它的客户端需更新配置。`
+          + '\n\n用于「写入客户端配置」：只有持有明文的账户才能被一键写入。',
+        '重新签发 key',
+      );
+      if (!ok) return;
+      btn.disabled = true;
+      try {
+        const res = await invoke('client_account_reissue', { id });
+        await renderClientAccounts();
+        if (res?.api_key) {
+          showRevealedKey({
+            label: res.account?.label || label,
+            apiKey: res.api_key,
+          });
+        }
+        toast('已重新签发 key', 'ok');
+      } catch (err) {
+        toast('重新签发失败: ' + err, 'error');
         btn.disabled = false;
       }
     });

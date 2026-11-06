@@ -73,9 +73,30 @@ const KEY_BYTES: usize = 32;
 
 /// One inbound access account.
 ///
-/// There is no plaintext field here on purpose. Adding one "for convenience"
-/// would put every usable key in a world-readable-ish state file and undo the
-/// point of storing a hash.
+/// ## Why there is now a plaintext field
+///
+/// The original design stored only the hash, and the reasoning was sound: a
+/// leaked state file could not be replayed against the gateway. The cost showed
+/// up later, in a place the original scope did not cover — the "write this
+/// gateway into Claude Code / Codex / DSH" buttons could only emit a placeholder,
+/// because the key needed to *use* the gateway was unrecoverable by design. On a
+/// server with `PROXY_CLIENT_AUTH=true` that produced configs that simply did not
+/// work, and the user had no way to fix it except to re-issue a key and paste it
+/// by hand into three files.
+///
+/// So the plaintext is kept, but only as a deliberate, opt-in trade:
+///
+///   * the file is already `0600` ([`set_private_permissions`]) — the same
+///     protection the other credential stores rely on;
+///   * the field is `Option`, absent for anything created before this and for
+///     any account the operator chooses not to keep;
+///   * [`crate::pool_transfer`] **strips it from unencrypted exports**, so moving
+///     a pool between machines is still not a way to leak every key;
+///   * verification still compares hashes — the plaintext exists only to be
+///     copied into a client config.
+///
+/// An account whose plaintext is absent still authenticates normally; it just
+/// cannot be re-written into a client config automatically.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClientAccount {
     /// Stable id `ca-<6 hex>`, derived from `key_hash`.
@@ -83,8 +104,15 @@ pub struct ClientAccount {
     /// User-facing note ("家里的笔记本", "CI").
     #[serde(default)]
     pub label: String,
-    /// Hex SHA-256 of the key. The key itself is never stored.
+    /// Hex SHA-256 of the key. This is what authentication compares against.
     pub key_hash: String,
+    /// The key itself, kept so it can be written into client configs.
+    ///
+    /// `None` for accounts created before this existed, or when the operator
+    /// declined to keep it. Never used for verification — see the struct docs
+    /// for why this exists despite the original design's prohibition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_plaintext: Option<String>,
     /// First few characters of the key, for the list view only.
     ///
     /// Not a secret: it is a prefix of a 43-char random string, so it narrows a
@@ -117,6 +145,31 @@ impl ClientAccount {
             format!("{}…", self.key_prefix)
         }
     }
+}
+
+/// The key to write into a client config: the first enabled account that still
+/// has its plaintext, or `None` when nobody does.
+///
+/// Deliberately returns `None` rather than inventing one: a placeholder key is
+/// exactly the failure this whole field exists to remove, and generating a *new*
+/// account as a side effect of pressing "write config" would leave the pool with
+/// entries the operator never asked for.
+pub fn writable_key() -> Option<(String, String)> {
+    load_accounts()
+        .into_iter()
+        .find(|a| {
+            a.enabled
+                && a.key_plaintext
+                    .as_deref()
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false)
+        })
+        .and_then(|a| a.key_plaintext.map(|k| (a.id, k)))
+}
+
+/// Whether any enabled account can be written into a client config.
+pub fn has_writable_key() -> bool {
+    writable_key().is_some()
 }
 
 /// Store file: `~/.proxy-rs/client-accounts.json`.
@@ -216,6 +269,7 @@ pub fn create_account(label: &str, note: &str) -> Result<(ClientAccount, String)
         id: id_from_hash(&hash),
         label: label.trim().to_string(),
         key_hash: hash,
+        key_plaintext: Some(key.clone()),
         key_prefix: prefix,
         enabled: true,
         created_at_ms: crate::util::unix_millis(),
@@ -503,6 +557,34 @@ pub fn store_health() -> crate::workbuddy_auth::StoreState {
     crate::workbuddy_auth::inspect_store_for::<Vec<ClientAccount>>(accounts_path())
 }
 
+/// Re-issue the key for an existing account, keeping its id and settings.
+///
+/// Accounts created before plaintext was kept have no way to be written into a
+/// client config — their hash cannot produce the key back. Re-issuing is the only
+/// honest remedy: a new key, the SAME id (so the default identity, request-log
+/// attribution and the pool's sticky bindings keep resolving), and the record's
+/// other fields untouched.
+///
+/// Returns the new plaintext, which exists only in this response.
+pub fn reissue_key(id: &str) -> Result<(ClientAccount, String)> {
+    let (key, hash, prefix) = generate_key();
+    let mut items = load_accounts();
+    let Some(slot) = items.iter_mut().find(|a| a.id == id) else {
+        anyhow::bail!("访问账户不存在: {id}");
+    };
+    // The id is derived from the hash, so it MUST move with it — keeping the old
+    // id would leave `id_from_hash` disagreeing with the stored hash, and
+    // `reconcile_ids` would silently rewrite it on the next load.
+    let new_id = id_from_hash(&hash);
+    slot.id = new_id.clone();
+    slot.key_hash = hash;
+    slot.key_prefix = prefix;
+    slot.key_plaintext = Some(key.clone());
+    let updated = slot.clone();
+    save_accounts(&items)?;
+    Ok((updated, key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,18 +622,48 @@ mod tests {
     }
 
     #[test]
-    fn a_created_key_is_never_written_to_disk() {
-        let dir = TempDataDir::new("no-plaintext");
+    /// The store keeps BOTH the hash and the plaintext.
+    ///
+    /// This replaces the old assertion that the plaintext never reaches disk.
+    /// That guarantee was real, and dropping it was a deliberate trade: without
+    /// the plaintext, "write this gateway into Claude Code / Codex / DSH" could
+    /// only emit a placeholder, and a server running with `PROXY_CLIENT_AUTH=true`
+    /// then had configs that could never work. See the struct docs for the
+    /// compensating controls (0600, `Option`, stripped from plaintext exports).
+    ///
+    /// What must still hold: authentication uses the hash, and the id stays
+    /// derived from it.
+    fn the_store_keeps_the_hash_and_the_plaintext() {
+        let dir = TempDataDir::new("plaintext-kept");
         let (account, key) = create_account("笔记本", "").expect("create");
         assert!(key.starts_with(KEY_PREFIX));
 
         let text = std::fs::read_to_string(dir.dir.join("client-accounts.json")).expect("read");
-        assert!(
-            !text.contains(&key),
-            "the plaintext key must never reach the store"
-        );
         assert!(text.contains(&account.key_hash), "the hash is stored");
         assert_eq!(account.id, id_from_hash(&account.key_hash));
+        assert!(
+            text.contains(&key),
+            "the plaintext is kept so client configs can be written"
+        );
+        assert_eq!(
+            account.key_plaintext.as_deref(),
+            Some(key.as_str()),
+            "and the in-memory view agrees"
+        );
+    }
+
+    /// Verification must not depend on the plaintext being present.
+    #[test]
+    fn an_account_without_plaintext_still_authenticates() {
+        let _dir = TempDataDir::new("hash-only");
+        let (account, key) = create_account("旧账号", "").expect("create");
+        // Simulate an account created before plaintext was kept.
+        let mut stripped = account.clone();
+        stripped.key_plaintext = None;
+        assert!(
+            verify(&key, std::slice::from_ref(&stripped)).is_ok(),
+            "the hash alone must still verify"
+        );
     }
 
     #[test]

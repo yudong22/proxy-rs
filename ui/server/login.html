@@ -39,8 +39,13 @@
     background:var(--bg);color:var(--text);font:inherit;font-family:var(--mono);font-size:13px;
   }
   input:focus{outline:none;border-color:var(--accent)}
+  .remember{
+    display:flex;align-items:center;gap:8px;margin:16px 0 0;
+    font-size:13px;color:var(--muted);cursor:pointer;user-select:none;
+  }
+  .remember input{width:auto;margin:0;accent-color:var(--accent);cursor:pointer}
   button{
-    width:100%;margin-top:18px;padding:10px;border-radius:8px;border:none;
+    width:100%;margin-top:16px;padding:10px;border-radius:8px;border:none;
     background:var(--accent);color:#fff;font:inherit;font-weight:500;cursor:pointer;
   }
   button:hover:not(:disabled){background:var(--accent-hover)}
@@ -51,19 +56,46 @@
     font-size:13px;line-height:1.5;
   }
   .err.show{display:block}
+  .err code{background:rgba(0,0,0,.15);border:none}
+  .warn{
+    display:none;margin-top:12px;padding:9px 13px;border-radius:8px;
+    background:rgba(210,153,34,.12);border:1px solid #d29922;color:#9a6700;
+    font-size:12.5px;line-height:1.5;
+  }
+  .warn.show{display:block}
+  @media (prefers-color-scheme: dark){ .warn{color:#d29922} }
   .hint{margin-top:20px;font-size:12.5px;color:var(--muted);line-height:1.7}
   code{font-family:var(--mono);font-size:.92em;background:var(--bg);border:1px solid var(--border);
        padding:1px 6px;border-radius:5px}
 </style>
 </head>
 <body>
-  <form class="card" id="form">
+  <!-- `method`/`action` matter even though JavaScript intercepts the submit:
+       password managers key their heuristic on a form that *looks* like a login,
+       and a form without them is often skipped entirely. -->
+  <form class="card" id="form" method="post" action="/admin/login">
     <h1>Proxy RS 管理台</h1>
     <p class="sub">服务器模式 · 需要管理令牌</p>
+
+    <!-- A username field is what makes the browser offer to save the password.
+         There is exactly one operator identity here, so it is pre-filled and
+         read-only rather than asked for — but it must be a REAL, VISIBLE
+         `autocomplete="username"` input: password managers pair the two fields by
+         those tokens, and they ignore a `hidden`/`display:none` one. Without this
+         pair, Chrome/Safari/Firefox never show the "save password?" prompt. -->
+    <input type="text" name="username" id="username" value="admin"
+           autocomplete="username" readonly>
+
     <label for="token">管理令牌</label>
-    <input id="token" type="password" autocomplete="current-password" placeholder="PROXY_API_TOKEN" required autofocus>
-    <button type="submit" id="submit">登录</button>
+    <input id="token" name="password" type="password" autocomplete="current-password"
+           placeholder="PROXY_API_TOKEN" required autofocus>
+    <label class="remember" for="remember">
+      <input id="remember" type="checkbox">
+      <span>记住我（7 天内免登录）</span>
+    </label>
+    <button type="submit" id="submit" name="login">登录</button>
     <div class="err" id="err"></div>
+    <div class="warn" id="warn"></div>
     <div class="hint">
       令牌即服务器 <code>/etc/proxy-rs.env</code> 中的 <code>PROXY_API_TOKEN</code>。
       未配置时管理台不可用。

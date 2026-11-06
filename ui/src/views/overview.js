@@ -149,10 +149,20 @@ export async function refreshStatus() {
   // belongs to that account, so reading them together is what the number means.
   setText('metric-points-account', identity.label || '—');
 
-  // Endpoint reference
-  setText('endpoint-messages', `http://127.0.0.1:${appState.port}/v1/messages`);
-  setText('endpoint-responses', `http://127.0.0.1:${appState.port}/v1/responses`);
-  setText('endpoint-models', `http://127.0.0.1:${appState.port}/v1/models`);
+  // Endpoint reference.
+  //
+  // The base differs by deployment and the difference matters: in the desktop app
+  // the client runs on the same machine, so `127.0.0.1:port` is what to paste.
+  // In the server console the page is open in a browser somewhere else, and a
+  // client on that machine would have to reach the gateway's public address — so
+  // `127.0.0.1` there is not merely useless, it is wrong in a way that costs the
+  // user a debugging session.
+  const endpointBase = window.__PROXY_RS_SERVER__
+    ? `${window.location.protocol}//${window.location.host}`
+    : `http://127.0.0.1:${appState.port}`;
+  setText('endpoint-messages', `${endpointBase}/v1/messages`);
+  setText('endpoint-responses', `${endpointBase}/v1/responses`);
+  setText('endpoint-models', `${endpointBase}/v1/models`);
   setText('overview-upstream', status.upstream_url || '-');
   if (status.version) setText('app-version', `v${status.version}`);
   if (status.log_path) setText('overview-log-path', status.log_path);

@@ -439,6 +439,20 @@ pub fn export_text(opts: &ExportOptions) -> Result<(String, ExportOutcome)> {
         bundle.cipher = Some(cipher);
     }
 
+    // An unencrypted export is a file the user carries around and may leave in
+    // Downloads. It has always contained live upstream credentials, but the
+    // inbound *access keys* were safe to include because only their hashes were
+    // stored. Now that the plaintext is kept (so client configs can be written),
+    // including it here would turn a "move my pool to another machine" file into
+    // a list of working gateway keys.
+    //
+    // Stripped from the plaintext branch only. The encrypted branch already drops
+    // every secret, and a user who wants the keys to travel can encrypt — which
+    // is where that material belongs.
+    for account in &mut bundle.client_accounts {
+        account.key_plaintext = None;
+    }
+
     let text = serde_json::to_string_pretty(&bundle)?;
     Ok((
         text,
@@ -2208,5 +2222,44 @@ mod tests {
                     .map(|n| n.to_string_lossy().starts_with(&prefix))
                     .unwrap_or(false)
             })
+    }
+
+    /// An unencrypted export must never carry a usable inbound key.
+    ///
+    /// The pool file is something users mail to themselves and leave in
+    /// Downloads. It has always held upstream credentials, but inbound access
+    /// keys were safe to include because only their hashes existed. Now that the
+    /// plaintext is kept — so client configs can be written — an unencrypted
+    /// export would become a list of working gateway keys. It is stripped on the
+    /// way out, and this asserts it stays stripped.
+    #[test]
+    fn a_plaintext_export_does_not_leak_access_keys() {
+        let _dir = TempDataDir::new("no-key-leak");
+        let (_account, key) = crate::client_accounts::create_account("笔记本", "").expect("create");
+        assert!(!key.is_empty());
+
+        let (text, outcome) = export_text(&ExportOptions::default()).unwrap();
+        assert!(!outcome.encrypted);
+        assert!(
+            !text.contains(&key),
+            "an unencrypted export must not contain a usable access key"
+        );
+        assert!(
+            text.contains("key_hash"),
+            "the account entry is still exported, minus its plaintext"
+        );
+    }
+
+    /// The encrypted branch drops the whole account list, as before.
+    #[test]
+    fn an_encrypted_export_carries_no_accounts_at_all() {
+        let _dir = TempDataDir::new("enc-no-accounts");
+        let (_a, _key) = crate::client_accounts::create_account("x", "").expect("create");
+        let opts = ExportOptions {
+            passphrase: Some("correct horse".to_string()),
+        };
+        let (text, outcome) = export_text(&opts).unwrap();
+        assert!(outcome.encrypted);
+        assert!(!text.contains("\"key_hash\""), "{text}");
     }
 }

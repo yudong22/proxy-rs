@@ -276,6 +276,12 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             state.client_auth.reload_from_store().await;
             Ok(out)
         }
+        "client_account_reissue" => {
+            let id = req_str(&args, "id")?;
+            let out = admin::reissue_client_account_key(&id)?;
+            state.client_auth.reload_from_store().await;
+            Ok(out)
+        }
         "client_account_delete" => {
             let id = req_str(&args, "id")?;
             let out = admin::delete_client_account(&id)?;
@@ -318,7 +324,7 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             apply_claude_config(state, body)
         }
         "get_codex_config" => get_codex_config(),
-        "apply_codex_config" => apply_codex_config().await,
+        "apply_codex_config" => apply_codex_config(state.process.bound_port).await,
         // DSH writes into a profile's patch file. The implementation lives in
         // `admin` because the REST surface offers the same operation, and one
         // implementation is what keeps the two from disagreeing about which
@@ -574,7 +580,7 @@ fn get_codex_config() -> Result<Value> {
 }
 
 /// Generate `model_catalog_json` from the provider's live model list.
-async fn apply_codex_config() -> Result<Value> {
+async fn apply_codex_config(bound_port: u16) -> Result<Value> {
     let config_path = crate::codex_config::config_path()
         .ok_or_else(|| anyhow!("CODEX_HOME / HOME 未设置，无法定位 Codex 配置"))?;
     let settings = crate::settings::GuiSettings::load();
@@ -591,11 +597,19 @@ async fn apply_codex_config() -> Result<Value> {
     }
     let (catalog_path, config_path) = crate::codex_config::write_catalog(&models, &config_path)
         .map_err(|e| anyhow!("写入 Codex 配置失败: {e}"))?;
+    // Wire the provider and its key too. The catalog only fixes the *picker*;
+    // without a provider block and a usable key, Codex still cannot make a
+    // request to this gateway.
+    let base_url = format!("http://127.0.0.1:{}/v1", bound_port);
+    let env_path = crate::codex_config::apply_provider(&config_path, &base_url, "proxy_rs")
+        .map_err(|e| anyhow!("写入 Codex provider 失败: {e}"))?;
     Ok(json!({
         "ok": true,
         "models": models.len(),
         "catalog_path": catalog_path.display().to_string(),
         "config_path": config_path.display().to_string(),
+        "env_path": env_path.map(|p| p.display().to_string()),
+        "key_written": crate::client_accounts::has_writable_key(),
         "note": "重启 Codex 后模型选择器生效",
     }))
 }

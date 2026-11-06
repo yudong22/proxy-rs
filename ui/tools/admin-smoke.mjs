@@ -185,29 +185,67 @@ try {
     await evaluate('!!document.querySelector("#form") && !!document.querySelector("#token")')
   );
 
-  // ── A wrong token is refused inline ─────────────────────────────────────
+  // ── The form is shaped so a password manager offers to save the token ───
+  // This is a functional requirement, not cosmetics: it is the criterion Chrome,
+  // Safari and Firefox use, and a fetch-based login silently fails it.
+  const formShape = await evaluate(`(() => {
+    const f = document.querySelector('#form');
+    const pw = f?.querySelector('input[type=password]');
+    const un = f?.querySelector('input[autocomplete=username]');
+    return {
+      method: (f?.getAttribute('method') || '').toLowerCase(),
+      action: f?.getAttribute('action') || '',
+      pwAutocomplete: pw?.getAttribute('autocomplete') || '',
+      hasUserField: !!un,
+      // Password managers ignore a hidden username field.
+      userVisible: un ? !!(un.offsetWidth || un.offsetHeight) : false,
+    };
+  })()`);
+  check('the login form posts natively', formShape.method, 'post');
+  check('the login form targets the page route', formShape.action, '/admin/login');
+  check('the password field is marked for password managers', formShape.pwAutocomplete, 'current-password');
+  check('a username field is paired with it', formShape.hasUserField, true);
+  check('the username field is visible', formShape.userVisible, true);
+
+  // ── A wrong token is refused, via the redirect the form now uses ────────
   await evaluate('document.querySelector("#token").value = "definitely-wrong"');
-  await evaluate('document.querySelector("#form").dispatchEvent(new Event("submit"))');
+  await evaluate('document.querySelector("#form").requestSubmit()');
+  // A native post navigates, so the failure arrives as `?e=invalid_token`.
+  await waitFor('location.search.includes("e=")', 'the wrong-token redirect');
   await waitFor(
     'document.querySelector("#err")?.classList.contains("show")',
-    'the wrong-token error'
+    'the wrong-token error to render'
   );
   ok(
-    'a wrong token shows an inline error and does not navigate',
-    await evaluate('location.pathname.startsWith("/admin")')
+    'a wrong token is reported and stays on the login page',
+    await evaluate('location.pathname === "/admin/login"')
   );
 
   // ── The right token logs in and lands on the *shared* console ───────────
   await evaluate(`document.querySelector("#token").value = ${JSON.stringify(TOKEN)}`);
-  await evaluate('document.querySelector("#form").dispatchEvent(new Event("submit"))');
-  await waitFor('document.readyState === "complete"', 'post-login load');
-  await new Promise((r) => setTimeout(r, 1600));
+  await evaluate('document.querySelector("#form").requestSubmit()');
+  // Wait for a console landmark, not `readyState`: the navigation happens as a
+  // result of the submit, so polling readyState samples the *old* document and
+  // races the new one.
+  await waitFor(
+    'document.querySelector("#tabs") && document.title === "Proxy RS"',
+    'the console to load after login',
+    15000
+  );
+  await new Promise((r) => setTimeout(r, 1200));
 
   // The decisive assertion: this is the desktop front-end, not a lookalike.
   check('the console is the desktop app (title)', await evaluate('document.title'), 'Proxy RS');
   ok(
     'the server bridge replaced Tauri IPC',
     await evaluate('typeof window.__TAURI__?.core?.invoke === "function"')
+  );
+  // Wait rather than check once: over the public internet the module graph and
+  // the first RPC round trips take a beat longer than on loopback, and a bare
+  // check here produced a false failure against production.
+  await waitFor(
+    'document.querySelectorAll(".tab").length === 3',
+    'the tab bar to render'
   );
   ok(
     'the desktop tab bar rendered',
@@ -238,6 +276,16 @@ try {
     '[...document.querySelectorAll(".metric-label")].map(e=>e.textContent.trim().replace(/\\s+/g,"")).join(",")'
   );
   ok('the desktop metric cards rendered', cards.includes('请求总数') && cards.includes('Token总量'), cards);
+
+  // The 剩余积分 card must carry the live identity, not an em dash. It was empty
+  // for a while because the server's status payload omitted `current_identity`
+  // while the desktop command had it — same front-end, a hole in the data.
+  const points = await evaluate('document.querySelector("#metric-points")?.textContent.trim()');
+  ok(
+    'the 剩余积分 card shows a value, not a placeholder',
+    points && points !== '—' && points !== '-',
+    `got ${JSON.stringify(points)}`
+  );
 
   const endpoints = await evaluate(
     '[...document.querySelectorAll(".kv dt")].map(d=>d.textContent.trim()).join(",")'

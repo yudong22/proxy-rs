@@ -119,7 +119,15 @@ fn apply_env_updates(
     // only there because the CLI refuses to send a request without one (the
     // gateway resolves the real upstream credential itself).
     env.insert("ANTHROPIC_BASE_URL".into(), json!(base_url));
-    env.insert("ANTHROPIC_AUTH_TOKEN".into(), json!(PLACEHOLDER_AUTH_TOKEN));
+    // A real gateway access key when one is available, so the config works as
+    // written. The placeholder is only for the case where no stored account kept
+    // its plaintext: the CLI refuses to start without *some* token, and a wrong
+    // one at least fails at the gateway with a 401 that names the problem,
+    // rather than at the CLI with "no auth configured".
+    let token = crate::client_accounts::writable_key()
+        .map(|(_, key)| key)
+        .unwrap_or_else(|| PLACEHOLDER_AUTH_TOKEN.to_string());
+    env.insert("ANTHROPIC_AUTH_TOKEN".into(), json!(token));
 
     Ok(())
 }
