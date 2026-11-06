@@ -171,10 +171,22 @@ jobs:
           file "$STAGE/proxy-rs-server"
           ls -la dist
 
+      # Run it inside an OLD glibc container, not on the runner.
+      #
+      # The runner has glibc 2.35, so a binary demanding 2.34 starts there and the
+      # test passes — while still failing on the actual target. That is exactly how
+      # v3.2.0 shipped a broken artifact: the build was green, and "green" meant
+      # "works on the machine that built it".
+      #
+      # debian:11 has glibc 2.31, older than the Alibaba Cloud Linux 3 target
+      # (2.32), so passing here is real evidence rather than a tautology.
+      #
+      # The probe script is written to a file, not inlined as a heredoc inside
+      # `run:` — a heredoc terminator must sit at column 0, but every line in a
+      # YAML block scalar is indented, so an inline one swallows the remainder.
       - name: Smoke-test the artifact on an older glibc
         run: |
           set -eu
-          chmod +x dist/proxy-rs-server-linux-x64
           cat > smoke.sh <<'SMOKE'
           #!/bin/sh
           set -eu
@@ -190,7 +202,7 @@ jobs:
               break
             fi
             if ! kill -0 "$PID" 2>/dev/null; then
-              echo "ARTIFACT-EXITED BEFORE HEALTH"
+              echo "ARTIFACT EXITED BEFORE HEALTH"
               cat /tmp/gateway.log
               exit 1
             fi
@@ -205,6 +217,7 @@ jobs:
           echo "health=200 admin/login=$CODE"
           [ "$CODE" = "200" ] || { echo "ADMIN PAGE NOT SERVED"; exit 1; }
           SMOKE
+          chmod +x smoke.sh
           docker run --rm \
             -v "$PWD/proxy-rs-server-linux-x64:/dist:ro" \
             -v "$PWD/smoke.sh:/smoke.sh:ro" \
