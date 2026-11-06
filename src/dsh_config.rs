@@ -1395,6 +1395,7 @@ agent-default-model:
 
     #[test]
     fn credential_is_added_once_and_is_idempotent() {
+        let _dir = EmptyDataDir::new("idempotent");
         let store =
             "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-x\nrecords:\n  a:\n    kind: grant\n";
         assert!(!credential_present(store));
@@ -1425,8 +1426,44 @@ agent-default-model:
         assert_eq!(ensure_credential(store), store);
     }
 
+    /// An empty data directory: no accounts, therefore no writable key.
+    ///
+    /// These tests previously asserted the placeholder unconditionally and
+    /// relied on the process-wide `PROXY_DATA_DIR` happening to be unset. Once a
+    /// test elsewhere in the same binary created an account (the key-writing
+    /// tests), `ensure_credential` correctly started emitting that real key and
+    /// these assertions failed — a test-isolation bug, not a product bug.
+    ///
+    /// Each test now owns the data dir, so it states its own preconditions.
+    struct EmptyDataDir {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        dir: std::path::PathBuf,
+    }
+
+    impl EmptyDataDir {
+        fn new(name: &str) -> Self {
+            let guard = crate::settings::data_dir_test_lock();
+            let dir =
+                std::env::temp_dir().join(format!("proxy-rs-dsh-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            std::env::set_var("PROXY_DATA_DIR", &dir);
+            Self { _guard: guard, dir }
+        }
+    }
+
+    impl Drop for EmptyDataDir {
+        fn drop(&mut self) {
+            std::env::remove_var("PROXY_DATA_DIR");
+            if !std::thread::panicking() {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+    }
+
     #[test]
     fn credential_appends_when_there_are_no_refs_yet() {
+        let _dir = EmptyDataDir::new("no-refs");
         let out = ensure_credential("version: 1\n");
         assert!(out.contains("refs:"));
         assert!(out.contains("PROXY_RS_API_KEY: nouse"));
@@ -1556,11 +1593,6 @@ agent-default-model:
         std::fs::create_dir_all(&base).unwrap();
         base
     }
-}
-
-#[cfg(test)]
-mod credential_key_tests {
-    use super::*;
 
     /// `ensure_credential` writes a real, usable gateway key when one exists.
     ///
@@ -1570,12 +1602,7 @@ mod credential_key_tests {
     /// edit the file by hand.
     #[test]
     fn ensure_credential_writes_the_real_key() {
-        let guard = crate::settings::data_dir_test_lock();
-        let dir = std::env::temp_dir().join(format!("dsh-cred-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("PROXY_DATA_DIR", &dir);
-
+        let _dir = EmptyDataDir::new("real-key");
         let (_acct, key) = crate::client_accounts::create_account("t", "").expect("create");
         let out = ensure_credential("refs:\n  OTHER: x\nrecords: {}\n");
 
@@ -1584,30 +1611,17 @@ mod credential_key_tests {
             "the real key must be written, got:\n{out}"
         );
         assert!(!out.contains(CREDENTIAL_PLACEHOLDER), "{out}");
-
-        std::env::remove_var("PROXY_DATA_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
-        drop(guard);
     }
 
     /// With no writable key, the placeholder is still better than nothing: DSH
     /// then sends a credential that fails with a clear 401 instead of sending none.
     #[test]
     fn ensure_credential_falls_back_to_the_placeholder() {
-        let guard = crate::settings::data_dir_test_lock();
-        let dir = std::env::temp_dir().join(format!("dsh-cred-none-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("PROXY_DATA_DIR", &dir);
-
+        let _dir = EmptyDataDir::new("no-key");
         let out = ensure_credential("refs:\n  OTHER: x\n");
         assert!(
             out.contains(&format!("{CREDENTIAL_REF}: {CREDENTIAL_PLACEHOLDER}")),
             "{out}"
         );
-
-        std::env::remove_var("PROXY_DATA_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
-        drop(guard);
     }
 }
