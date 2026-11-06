@@ -99,9 +99,24 @@ jobs:
   # before this job existed the release shipped only `.dmg`/`.msi`/`.exe`, so a
   # server operator had to install a Rust toolchain just to get the binary.
   #
-  # `x86_64-unknown-linux-gnu` rather than musl: the target machines are stock
-  # Alibaba Cloud Linux / Debian / Ubuntu, all glibc, and the build runs on the
-  # oldest supported runner image to keep the required glibc floor low.
+  # **`x86_64-unknown-linux-musl`, statically linked.**
+  #
+  # The obvious choice was `-gnu` (dynamic glibc), and it shipped that way in
+  # v3.2.0 with a real defect: the runner's glibc becomes the binary's floor. The
+  # GitHub `ubuntu-22.04` image has glibc 2.35, which merged libpthread into libc
+  # and renamed those symbols at version 2.34 — verified with `objdump -T` on the
+  # published artifact, it required `GLIBC_2.34` and therefore would not start on
+  # Ubuntu 20.04 (2.31), Debian 11 (2.31) or RHEL 8 (2.28).
+  #
+  # The fix cannot be "build on an older runner": `ubuntu-20.04` was fully retired
+  # in April 2025, and pinning it would hang the release exactly the way the
+  # deprecated `macos-13` leg once did. Static musl removes the question entirely —
+  # no glibc version to satisfy, and it also works on Alpine.
+  #
+  # The cost is that musl links a different allocator (mallocng), which is slower
+  # under heavy multithreaded allocation. For a proxy whose work is dominated by
+  # network I/O that is not measurable here, and portability is worth more than a
+  # benchmark win on one distro.
   build-server:
     runs-on: ubuntu-22.04
     steps:
@@ -109,31 +124,136 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-musl
+
+      # musl needs a C toolchain that targets it: `rusqlite` (bundled SQLite) and
+      # `ring` both compile C, and the default gcc does not emit musl binaries.
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          musl-gcc --version
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: server-linux-x64
 
       - name: Build headless server
-        run: cargo build --release --bin proxy-rs-server --target x86_64-unknown-linux-gnu
+        run: |
+          # `ring` needs the C compiler pointed at musl explicitly.
+          export CC_x86_64_unknown_linux_musl=musl-gcc
+          export AR_x86_64_unknown_linux_musl=ar
+          cargo build --release --bin proxy-rs-server --target x86_64-unknown-linux-musl
 
       - name: Package
         run: |
           set -eu
-          BIN=target/x86_64-unknown-linux-gnu/release/proxy-rs-server
+          BIN=target/x86_64-unknown-linux-musl/release/proxy-rs-server
           test -x "$BIN" || { echo "::error::proxy-rs-server was not produced"; exit 1; }
-          mkdir -p dist
-          # Name carries the arch: a release page with three differently-built
-          # Linux binaries and no arch in the names is a download lottery.
-          cp "$BIN" dist/proxy-rs-server-linux-x64
-          # The unit and the vhost ship beside the binary so a deploy does not
-          # depend on reading the repo: this is the whole server deployment kit.
-          cp deploy/linux/proxy-rs.service dist/
-          cp deploy/linux/api.wuba.site.conf dist/
-          cp deploy/linux/README.md dist/
-          ( cd dist && sha256sum proxy-rs-server-linux-x64 > proxy-rs-server-linux-x64.sha256 )
+
+          STAGE=proxy-rs-server-linux-x64
+          rm -rf "$STAGE" dist
+          mkdir -p "$STAGE" dist
+          # Name carries the arch: a release page with several Linux binaries and
+          # no arch in the names is a download lottery.
+          install -m 755 "$BIN" "$STAGE/proxy-rs-server"
+          # The unit and an EXAMPLE vhost ship inside the archive so a deploy does
+          # not depend on reading the repo. They are one bundle rather than three
+          # loose files on the release page: an operator deploying a server wants
+          # the whole kit, and a bare binary next to a config they have to find in
+          # the source tree is exactly the friction this is meant to remove.
+          install -m 644 deploy/linux/proxy-rs.service "$STAGE/"
+          install -m 644 deploy/linux/api.wuba.site.conf "$STAGE/nginx-site.conf.example"
+          install -m 644 deploy/linux/README.md "$STAGE/DEPLOY.md"
+          tar -czf "dist/$STAGE.tar.gz" "$STAGE"
+
+          ( cd dist && sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256" )
+          file "$STAGE/proxy-rs-server"
           ls -la dist
+
+      - name: Smoke-test the artifact on an older glibc
+        run: |
+          set -eu
+          chmod +x dist/proxy-rs-server-linux-x64
+          cat > smoke.sh <<'SMOKE'
+          #!/bin/sh
+          set -eu
+          mkdir -p /data
+          apt-get update >/dev/null 2>&1
+          apt-get install -y --no-install-recommends curl >/dev/null 2>&1
+          /dist/proxy-rs-server > /tmp/gateway.log 2>&1 &
+          PID=$!
+          READY=0
+          for _ in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:3456/health >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "ARTIFACT-EXITED BEFORE HEALTH"
+              cat /tmp/gateway.log
+              exit 1
+            fi
+            sleep 0.5
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "NO HEALTH RESPONSE"
+            cat /tmp/gateway.log
+            exit 1
+          fi
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3456/admin/login)
+          echo "health=200 admin/login=$CODE"
+          [ "$CODE" = "200" ] || { echo "ADMIN PAGE NOT SERVED"; exit 1; }
+          SMOKE
+          docker run --rm \
+            -v "$PWD/proxy-rs-server-linux-x64:/dist:ro" \
+            -v "$PWD/smoke.sh:/smoke.sh:ro" \
+            -e PROXY_DATA_DIR=/data \
+            -e PROXY_API_TOKEN=smoke-token \
+            -e PROXY_BIND=127.0.0.1 \
+            -e PORT=3456 \
+            debian:11 sh /smoke.sh
+
+      - name: Smoke-test the artifact on the build runner
+        run: |
+          set -eu
+          chmod +x proxy-rs-server-linux-x64/proxy-rs-server
+          export PROXY_DATA_DIR="$RUNNER_TEMP/smoke-data"
+          export PROXY_API_TOKEN=smoke-token
+          export PROXY_BIND=127.0.0.1
+          export PORT=3456
+          mkdir -p "$PROXY_DATA_DIR"
+          ./proxy-rs-server-linux-x64/proxy-rs-server > "$RUNNER_TEMP/gateway.log" 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+
+          READY=0
+          for _ in $(seq 1 40); do
+            if curl -fsS "http://127.0.0.1:3456/health" >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "::error::the gateway exited before answering /health"
+              cat "$RUNNER_TEMP/gateway.log"
+              exit 1
+            fi
+            sleep 0.5
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::the gateway never answered /health"
+            cat "$RUNNER_TEMP/gateway.log"
+            exit 1
+          fi
+
+          # A 200 on /health proves the process is alive; prove the admin console
+          # was compiled in too, since that is the feature this build exists for.
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:3456/admin/login")
+          if [ "$code" != "200" ]; then
+            echo "::error::admin login page returned $code"
+            exit 1
+          fi
+          echo "artifact smoke test passed (health=200, admin/login=$code)"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -182,9 +302,7 @@ jobs:
           # none, and a missing server artifact must fail the same way a missing
           # installer does.
           find artifacts -type f \( \
-              -name 'proxy-rs-server-linux-x64*' \
-              -o -name 'proxy-rs.service' \
-              -o -name 'api.wuba.site.conf' \
+              -name 'proxy-rs-server-linux-x64.tar.gz*' \
             \) -exec cp -v {} dist/ \;
           echo "--- collected ---"
           ls -la dist

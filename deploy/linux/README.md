@@ -26,7 +26,31 @@
 
 ---
 
-## 一、构建
+## 发布物
+
+Release 页面的 Linux 产物是一个**单一归档**：
+
+```
+proxy-rs-server-linux-x64.tar.gz          # 解压即用
+proxy-rs-server-linux-x64.tar.gz.sha256   # 校验
+└── proxy-rs-server-linux-x64/
+    ├── proxy-rs-server          # 静态链接，无运行时依赖
+    ├── proxy-rs.service         # systemd 单元
+    ├── nginx-site.conf.example  # 反代示例（域名要改）
+    └── DEPLOY.md                # 本文
+```
+
+解压后拿到的是完整部署套件，不用回仓库翻配置。
+
+> **静态链接（musl）**：产物不依赖目标机的 glibc 版本，Alpine 也能跑。
+> 早期的 `-gnu` 产物要求 `GLIBC_2.34`（Ubuntu 22.04 构建的副作用），在
+> Alibaba Cloud Linux 3（glibc 2.32）上直接 `GLIBC_2.34 not found` 起不来。
+> 发布流程现在会在 `debian:11`（glibc 2.31）容器里**实际启动并探活**，
+> 不通过就不发布。
+
+---
+
+## 一、构建（从源码）
 
 服务器有 Rust 工具链时**直接在服务器上编译**最省事（本机上也一样，产物与目标机 glibc 天然对齐）：
 

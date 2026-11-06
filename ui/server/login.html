@@ -77,14 +77,23 @@
     <h1>Proxy RS 管理台</h1>
     <p class="sub">服务器模式 · 需要管理令牌</p>
 
-    <!-- A username field is what makes the browser offer to save the password.
-         There is exactly one operator identity here, so it is pre-filled and
-         read-only rather than asked for — but it must be a REAL, VISIBLE
-         `autocomplete="username"` input: password managers pair the two fields by
-         those tokens, and they ignore a `hidden`/`display:none` one. Without this
-         pair, Chrome/Safari/Firefox never show the "save password?" prompt. -->
+    <!-- A username field is what makes the browser offer to save the password,
+         and it must be a REAL, VISIBLE, EDITABLE `autocomplete="username"` input
+         paired with `autocomplete="current-password"`. Each of these has been
+         fatal to the save prompt on its own:
+
+           · no username partner at all   — no pair to record;
+           · `hidden` / `display: none`    — the field is skipped;
+           · `readonly`                    — Chrome reads it as a value the page
+                                             invented, and the form stops being
+                                             classified as a login form.
+
+         The value is only the label the password manager stores; the server
+         authenticates on the token alone and ignores this field, so editing it
+         cannot affect whether you can log in. -->
+    <label for="username">账号</label>
     <input type="text" name="username" id="username" value="admin"
-           autocomplete="username" readonly>
+           autocomplete="username" spellcheck="false">
 
     <label for="token">管理令牌</label>
     <input id="token" name="password" type="password" autocomplete="current-password"
