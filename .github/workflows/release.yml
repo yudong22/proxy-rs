@@ -91,8 +91,58 @@ jobs:
           if-no-files-found: error
           path: ${{ matrix.artifact_glob }}
 
+  # The headless Linux server binary.
+  #
+  # Separate from `build-tauri` because it needs none of the desktop toolchain:
+  # no Tauri CLI, no Node, no macOS/Windows SDK. It is a plain Rust build of the
+  # `proxy-rs-server` bin, and it is what a Linux deployment actually installs —
+  # before this job existed the release shipped only `.dmg`/`.msi`/`.exe`, so a
+  # server operator had to install a Rust toolchain just to get the binary.
+  #
+  # `x86_64-unknown-linux-gnu` rather than musl: the target machines are stock
+  # Alibaba Cloud Linux / Debian / Ubuntu, all glibc, and the build runs on the
+  # oldest supported runner image to keep the required glibc floor low.
+  build-server:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-linux-x64
+
+      - name: Build headless server
+        run: cargo build --release --bin proxy-rs-server --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          set -eu
+          BIN=target/x86_64-unknown-linux-gnu/release/proxy-rs-server
+          test -x "$BIN" || { echo "::error::proxy-rs-server was not produced"; exit 1; }
+          mkdir -p dist
+          # Name carries the arch: a release page with three differently-built
+          # Linux binaries and no arch in the names is a download lottery.
+          cp "$BIN" dist/proxy-rs-server-linux-x64
+          # The unit and the vhost ship beside the binary so a deploy does not
+          # depend on reading the repo: this is the whole server deployment kit.
+          cp deploy/linux/proxy-rs.service dist/
+          cp deploy/linux/api.wuba.site.conf dist/
+          cp deploy/linux/README.md dist/
+          ( cd dist && sha256sum proxy-rs-server-linux-x64 > proxy-rs-server-linux-x64.sha256 )
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-x64
+          if-no-files-found: error
+          path: dist/*
+
   release:
-    needs: [build-tauri]
+    needs: [build-tauri, build-server]
     runs-on: ubuntu-latest
 
     steps:
@@ -128,6 +178,14 @@ jobs:
           mkdir -p dist
           find artifacts -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) \
             -exec cp -v {} dist/ \;
+          # The Linux server kit. Caught by name, not by extension: the binary has
+          # none, and a missing server artifact must fail the same way a missing
+          # installer does.
+          find artifacts -type f \( \
+              -name 'proxy-rs-server-linux-x64*' \
+              -o -name 'proxy-rs.service' \
+              -o -name 'api.wuba.site.conf' \
+            \) -exec cp -v {} dist/ \;
           echo "--- collected ---"
           ls -la dist
           # A release with no installer is a broken release, not a warning.

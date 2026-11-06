@@ -29,3 +29,9 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      # The headless server is a separate bin from the desktop app and nothing
+      # else on Linux compiles it — a change that breaks it would otherwise only
+      # surface at release time (or, worse, on the operator's server).
+      - name: Build headless server
+        run: cargo build --release --bin proxy-rs-server
