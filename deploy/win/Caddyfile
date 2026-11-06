@@ -53,11 +53,24 @@ http://gate.wuba.site {
 	respond @internal 404
 
 	# 首页：使用说明
+	#
+	# Cache-Control 是性能关键。没有它时 Caddy 只发 Last-Modified，而
+	# Cloudflare 默认不缓存 .html（不在其默认缓存扩展名列表里），
+	# 结果是每次刷新都 `cf-cache-status: DYNAMIC`，完整穿隧道回源上海，
+	# 实测多付 0.3–1.1 s。加上之后配合 CF 的 Cache Rule 才能变成 HIT。
+	#
+	# 用 max-age=3600 而非 immutable：首页内容随部署变化，1 小时的
+	# 陈旧窗口对使用说明页可以接受，且能让 CDN 真正命中。
 	handle / {
 		root * E:\\proxy-rs\\deploy\\landing
 		rewrite * /index.html
+		header Cache-Control "public, max-age=3600"
 		file_server
 	}
+
+	# 浏览器首屏总会请求 /favicon.ico，但 landing 目录里没有这个文件，
+	# 实测要完整回源一次才拿到 404（约 1 s）。直接在本机答 204。
+	respond /favicon.ico 204
 
 	# 数据面。flush_interval -1 是 SSE 的关键：不设的话流式响应会被代理层
 	# 攒起来，客户端要等全部生成完才收到。
@@ -90,8 +103,11 @@ http://gate.wuba.site {
 # 	handle / {
 # 		root * E:\\proxy-rs\\deploy\\landing
 # 		rewrite * /index.html
+# 		header Cache-Control "public, max-age=3600"
 # 		file_server
 # 	}
+#
+# 	respond /favicon.ico 204
 #
 # 	reverse_proxy /v1/* 127.0.0.1:3456 {
 # 		flush_interval -1
