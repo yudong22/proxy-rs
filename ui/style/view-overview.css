@@ -1,0 +1,12 @@
+/* Per-view styles: the overview drill-down and the settings form. */
+
+/* Styles for the individual views. Anything genuinely shared lives in
+   cards.css / logs.css / controls.css instead; this file is the seam a new
+   view's styles go into. */
+
+/* ── Overview: cache-hit drill-down ───────────────────────────── */
+
+.stat-detail {
+  margin-top: -4px;
+}
+

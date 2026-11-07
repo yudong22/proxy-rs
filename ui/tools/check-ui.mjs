@@ -42,7 +42,14 @@ const STYLE = path.join(UI, 'style');
 const INDEX = path.join(UI, 'index.html');
 
 /** The cascade order index.html documents. Earlier files may be overridden by
- *  later ones; tokens.css must come first because every later file reads it. */
+ *  later ones; tokens.css must come first because every later file reads it.
+ *
+ *  The oversized files were split by responsibility without changing a single
+ *  selector or declaration, so this order is the concatenation order of what
+ *  they used to be: logs.css → logs-data-table → logs-console → detail-table
+ *  is the old logs.css, the four view-* files are the old views.css (in their
+ *  original order), and wb-* are the old workbuddy.css. Keeping the order
+ *  identical is what makes the split a pure move rather than a re-styling. */
 const CASCADE = [
   'tokens.css',
   'base.css',
@@ -51,9 +58,23 @@ const CASCADE = [
   'overlays.css',
   'layout.css',
   'cards.css',
+  // was logs.css (log pane chrome, then data table, then console, then the
+  // request-detail table)
   'logs.css',
-  'views.css',
-  'workbuddy.css',
+  'logs-data-table.css',
+  'logs-console.css',
+  'detail-table.css',
+  // was views.css (one file per view, in the original file's order)
+  'view-overview.css',
+  'view-settings.css',
+  'view-logs.css',
+  'view-sessions.css',
+  'view-sessions-composer.css',
+  'view-sessions-transcript.css',
+  // was workbuddy.css
+  'wb-pool.css',
+  'wb-qr.css',
+  'wb-report.css',
 ];
 
 const problems = [];

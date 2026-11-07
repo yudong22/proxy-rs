@@ -1,0 +1,217 @@
+/* A "turn" is one block of the transcript: a prompt, an assistant paragraph,
+   a tool call with its output, or a thinking block. */
+.sess-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sess-line-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.sess-time,
+.sess-model {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.sess-tokens {
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.sess-ribbon {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  background: var(--neutral-tint);
+  color: var(--muted-ink);
+}
+
+/* User prompt: the one bordered bubble, so the eye can find where a turn
+   begins while scrolling. */
+.sess-prompt {
+  align-self: flex-start;
+  max-width: 90%;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface2);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Assistant prose: inline, unwrapped, indented to align under the tool lines. */
+.sess-prose {
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+
+/* ⏺ Bash(ls -la) */
+.sess-tool-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.sess-tool-dot {
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.sess-tool-name {
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+.sess-tool-args-preview {
+  color: var(--muted-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* ⎿ output — indented under the call, full text, own scroll for huge output. */
+.sess-tool-result {
+  display: flex;
+  gap: 6px;
+  margin-left: 2px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+}
+
+.sess-tool-arrow {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+/* A failed tool is a status, so it gets the semantic colour. */
+.sess-tool-result.is-error {
+  border-left-color: var(--error-tint-border);
+}
+
+.sess-tool-result.is-error .sess-pre {
+  background: var(--error-tint);
+  border-color: var(--error-tint-border);
+}
+
+/* Folded result: the preview is the summary's own content; the full text only
+   exists in the DOM when opened, so a 1500-line result costs nothing at rest. */
+.sess-result-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.sess-result > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.sess-result > summary::-webkit-details-marker {
+  display: none;
+}
+
+.sess-result > summary .sess-pre {
+  margin-bottom: 2px;
+}
+
+.sess-result-more {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--accent);
+  padding: 0 0 2px 6px;
+}
+
+.sess-result[open] > summary {
+  margin-bottom: 2px;
+}
+
+.sess-tool-args summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 20px;
+}
+
+/* No scrollbar, ever: tool output is shown in full or folded, never in a nested
+   scrolling box (the timeline already scrolls). */
+.sess-pre {
+  margin: 2px 0 0;
+  padding: 6px 8px;
+  flex: 1;
+  min-width: 0;
+  overflow: visible;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Thinking: dim italic, visibly "not the answer". */
+.sess-thinking-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.sess-thinking-text {
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+  font-style: italic;
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+}
+
+.sess-meta-text {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.sess-cut {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.sess-model-table {
+  margin-top: 8px;
+  font-size: 11px;
+}
+
+@media (max-width: 720px) {
+  .sess-split {
+    grid-template-columns: 1fr;
+  }
+
+  .sess-sidebar {
+    border-right: none;
+  }
+}

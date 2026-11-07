@@ -1,0 +1,26 @@
+/* ── Console View ─────────────────────────────────────────────── */
+
+.logs-container {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  font: 12px/1.6 var(--mono);
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-line .ts { color: var(--muted); }
+.log-line .lvl { font-weight: 600; }
+.log-line.ERROR .lvl, .log-line.ERROR .msg { color: var(--error); }
+.log-line.WARN .lvl, .log-line.WARN .msg { color: var(--warning); }
+.log-line.INFO { opacity: .88; }
+

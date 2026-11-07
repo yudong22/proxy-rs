@@ -1,0 +1,42 @@
+/* ── Logs: console view ───────────────────────────────────────── */
+
+/* The logs tab keeps the pane's standard 16px padding: its first child is now
+   the `.logs-panel` card, so the padding is the gap between the tab bar and that
+   card — the same offset 运行概览 and 服务设置 get. It used to be zeroed when the
+   toolbar itself was the first row and the padding read as a gap inside the
+   page; with the panel in place that override pulled the card flush to the tab
+   bar instead of level with the other pages. */
+/* The console pane fills the logs tab below its own subbar. The `hidden`
+   attribute is what switches it off, and base.css's `[hidden]` rule outranks
+   the `display: flex` set here — without that, both log panes would share the
+   tab's flex height. */
+.logs-console-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Mirrors .logs-filter-row so both log views have the same two-row rhythm:
+   filters on the left, status and actions pushed to the right. */
+.console-subbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+/* Pushes 自动滚动 to the right edge of the subbar, matching .logs-actions. */
+.auto-scroll-label--end {
+  margin-left: auto;
+}
+
+/* The provider group's action buttons sit under its last field rather than
+   flush against it. */
+.form-actions {
+  margin-top: 8px;
+}
+
+

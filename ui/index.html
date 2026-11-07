@@ -8,8 +8,12 @@
 
   <!-- Stylesheets load in cascade order: tokens define the variables every
        later file reads, then reset/utilities, controls, badges, overlays, the
-       shell layout, shared cards, logs/table, view styles, and finally the
-       WorkBuddy-specific rules that are allowed to override everything above. -->
+       shell layout, shared cards, the log pane + data table, the log console
+       and request-detail table, the per-view rules (overview, settings, logs,
+       sessions), and finally the WorkBuddy-specific rules (pool, QR dialog,
+       check-in report) that are allowed to override everything above.
+       The order of these <link> tags IS the cascade — it must match the
+       CASCADE array in ui/tools/check-ui.mjs, which enforces it. -->
   <link rel="stylesheet" href="style/tokens.css">
   <link rel="stylesheet" href="style/base.css">
   <link rel="stylesheet" href="style/controls.css">
@@ -18,8 +22,18 @@
   <link rel="stylesheet" href="style/layout.css">
   <link rel="stylesheet" href="style/cards.css">
   <link rel="stylesheet" href="style/logs.css">
-  <link rel="stylesheet" href="style/views.css">
-  <link rel="stylesheet" href="style/workbuddy.css">
+  <link rel="stylesheet" href="style/logs-data-table.css">
+  <link rel="stylesheet" href="style/logs-console.css">
+  <link rel="stylesheet" href="style/detail-table.css">
+  <link rel="stylesheet" href="style/view-overview.css">
+  <link rel="stylesheet" href="style/view-settings.css">
+  <link rel="stylesheet" href="style/view-logs.css">
+  <link rel="stylesheet" href="style/view-sessions.css">
+  <link rel="stylesheet" href="style/view-sessions-composer.css">
+  <link rel="stylesheet" href="style/view-sessions-transcript.css">
+  <link rel="stylesheet" href="style/wb-pool.css">
+  <link rel="stylesheet" href="style/wb-qr.css">
+  <link rel="stylesheet" href="style/wb-report.css">
 </head>
 
 <!--

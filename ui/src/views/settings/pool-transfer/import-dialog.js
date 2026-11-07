@@ -6,7 +6,7 @@
  * and keeping both beside the preview renderer is what makes that visible.
  */
 
-import { $, html, raw } from '../../../core/dom.js';
+import { $, html } from '../../../core/dom.js';
 import { invoke } from '../../../core/ipc.js';
 import { openModal, closeModal } from '../../../components/modal.js';
 import { confirmAction } from '../../../components/confirm.js';
