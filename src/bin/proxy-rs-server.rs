@@ -203,6 +203,10 @@ async fn main() -> Result<()> {
             bind_addr: bind_addr.clone(),
         },
         client: client.clone(),
+        // The server build never exposes desktop-boot: its operator
+        // authenticates with a real token over the network.
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     // The REST surface and the console share one `AdminState` (and therefore one
     // session map): logging in at the console must authorise the REST calls its
@@ -312,8 +316,16 @@ async fn main() -> Result<()> {
         shutdown_for_signals.cancel();
     });
 
-    let server = axum::serve(listener, app_router)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await });
+    // `into_make_service_with_connect_info` gives handlers the real peer
+    // address; the desktop-boot endpoint (library) uses it to answer loopback
+    // requests only. The server build never exposes that endpoint, but the
+    // extractor costs nothing and keeps the two binaries serving the same
+    // router shape.
+    let server = axum::serve(
+        listener,
+        app_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.cancelled().await });
 
     if let Err(e) = server.await {
         logs.push("ERROR", format!("代理服务运行异常: {e}")).await;

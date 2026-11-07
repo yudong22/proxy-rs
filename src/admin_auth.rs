@@ -204,6 +204,32 @@ impl AdminSessions {
         }
     }
 
+    /// Mint a session **without** a token exchange, for the desktop app's
+    /// in-process console.
+    ///
+    /// The desktop webview loads the same `/admin/` surface the server serves,
+    /// but there is no human to type a token into: the console process *is* the
+    /// operator. It generates a random token at startup and mints the session
+    /// itself, so `require_session` keeps one code path for both transports.
+    /// The session lives in the same map with the same TTL and sliding expiry,
+    /// so nothing downstream can tell it apart from a logged-in server session.
+    ///
+    /// Deliberately not reachable over HTTP in the server build: the endpoint
+    /// that calls this exists only when `AdminState::desktop` is set, and only
+    /// answers loopback requests (see `console::desktop_boot`).
+    pub fn mint_session(&self) -> String {
+        let id = new_session_id();
+        let mut sessions = self.lock();
+        sessions.insert(
+            id.clone(),
+            Session {
+                last_seen: Instant::now(),
+                ttl: SESSION_TTL,
+            },
+        );
+        id
+    }
+
     fn lock_attempts(&self) -> std::sync::MutexGuard<'_, HashMap<String, Attempts>> {
         self.attempts.lock().unwrap_or_else(|p| p.into_inner())
     }

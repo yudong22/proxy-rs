@@ -237,7 +237,25 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
                 .into_iter()
                 .filter(|c| c.enabled)
                 .collect();
-            let report = crate::growth_runner::run_pool(&client, &credentials, None, false).await;
+            // Stream progress into the shared buffer so a *polling* console
+            // (no event channel over HTTP) can show the same per-account lines
+            // the desktop used to receive as Tauri events.
+            let buf = state.growth_progress.clone();
+            let progress = |p: crate::growth_runner::GrowthProgress| {
+                if let Ok(v) = serde_json::to_value(&p) {
+                    if let Ok(mut b) = buf.lock() {
+                        b.push(v);
+                    }
+                }
+            };
+            let report = crate::growth_runner::run_pool_with_progress(
+                &client,
+                &credentials,
+                None,
+                false,
+                Some(&progress),
+            )
+            .await;
             let summary = crate::growth_runner::summarize(&report);
             state.logs.push("INFO", summary).await;
             serde_json::to_value(&report).map_err(|e| anyhow!("{e}"))
@@ -254,16 +272,86 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             let run = crate::growth_runner::run_account(&client, cred, None, dry_run).await;
             serde_json::to_value(&run).map_err(|e| anyhow!("{e}"))
         }
+        // Drain the growth-progress buffer (take-and-clear: the next poll
+        // sees only lines emitted since). Empty when no run is streaming.
+        "get_growth_progress" => {
+            let mut buf = state
+                .growth_progress
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            Ok(json!({ "lines": std::mem::take(&mut *buf) }))
+        }
         "wb_refresh_points" => admin::refresh_all_points(state).await,
         "wb_refresh_points_single" => {
             let id = req_str(&args, "id")?;
             admin::refresh_one_points(state, &id).await
         }
-        "wb_oauth_start" => Err(anyhow!(
-            "服务器模式不支持扫码登录：浏览器回调只能指向本机 localhost，服务器上无法完成。\
-             请在本机扫码后把登录态粘贴进来（「添加登录态」）。"
-        )),
-        "wb_oauth_poll" => bail!("服务器模式不支持扫码登录"),
+        // ── QR login (OAuth) ────────────────────────────────────────────
+        //
+        // The old "server mode doesn't support QR login" refusal assumed the
+        // console had no way to *show* a QR code and the upstream callback
+        // needed a local browser. Neither holds: the flow polls a remote
+        // endpoint (no localhost callback involved — see `poll_oauth_token`),
+        // and the QR arrives as an inline SVG the web console renders exactly
+        // like the desktop window did. Same implementation, same UI, one less
+        // desktop-only command.
+        "wb_oauth_start" => {
+            let client = reqwest::Client::new();
+            let res = crate::workbuddy_auth::start_oauth_flow(&client, None)
+                .await
+                .map_err(|e| anyhow!("生成扫码授权失败: {e}"))?;
+            state
+                .logs
+                .push("INFO", format!("已生成 WorkBuddy 扫码授权: {}", res.state))
+                .await;
+            Ok(json!({
+                "state": res.state,
+                "auth_url": res.auth_url,
+                "qr_svg": res.qr_svg,
+            }))
+        }
+        "wb_oauth_poll" => {
+            let flow_state = req_str(&args, "state")?;
+            let client = reqwest::Client::new();
+            let res = crate::workbuddy_auth::poll_oauth_token(&client, None, &flow_state)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            match res {
+                crate::workbuddy_auth::OAuthPollResult::Pending => {
+                    Ok(json!({ "status": "pending" }))
+                }
+                crate::workbuddy_auth::OAuthPollResult::Failed { error } => {
+                    state
+                        .logs
+                        .push(
+                            "ERROR",
+                            format!("WorkBuddy 扫码授权失败: {error} (state={flow_state})"),
+                        )
+                        .await;
+                    Ok(json!({ "status": "failed", "error": error }))
+                }
+                crate::workbuddy_auth::OAuthPollResult::Success { credential } => {
+                    state
+                        .logs
+                        .push(
+                            "INFO",
+                            format!(
+                                "WorkBuddy 扫码授权成功并保存: {} ({})",
+                                credential.label, credential.id
+                            ),
+                        )
+                        .await;
+                    // Same payload the desktop returned: the UI reads
+                    // credential.label / credential.id and re-renders the pool.
+                    let masked = admin::credential_json(&credential, 0, false);
+                    state.pool.reload_from_store().await;
+                    Ok(json!({
+                        "status": "success",
+                        "credential": masked,
+                    }))
+                }
+            }
+        }
 
         // ── Inbound access accounts ─────────────────────────────────────
         "client_accounts_list" => Ok(admin::client_accounts_json(&state.client_auth).await),

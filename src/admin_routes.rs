@@ -54,6 +54,24 @@ pub struct AdminState {
     /// refreshes (points, model list, upstream test) reuse the same connection
     /// pool instead of opening a second one per click.
     pub client: reqwest::Client,
+    /// Whether this state belongs to the **desktop app's in-process console**.
+    ///
+    /// Only a desktop-built state exposes `GET /admin/api/desktop-boot`, the
+    /// endpoint that mints a session without a token exchange (the desktop
+    /// process *is* the operator, so there is nobody to type a token in). A
+    /// server build keeps it `false` and the endpoint answers 404 — the route
+    /// does not exist for a remote operator, and nothing about the server
+    /// deployment's trust model changes. See `console::desktop_boot`.
+    pub desktop: bool,
+    /// Growth-run progress lines, polled by the console instead of pushed as
+    /// events.
+    ///
+    /// The desktop used to deliver these over Tauri events; a shared HTTP
+    /// console has no push channel, and the payload is small and append-only,
+    /// so a buffer the UI drains on a poll is the simplest faithful
+    /// replacement. Writers append during a run; the reader takes-and-clears.
+    /// Empty in steady state.
+    pub growth_progress: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 /// Where the admin surface lives, in absolute paths.

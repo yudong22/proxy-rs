@@ -355,11 +355,95 @@ pub fn build_console_router(state: Arc<crate::admin_routes::AdminState>) -> Rout
             post(crate::admin_routes::logout_handler),
         )
         .route("/admin/api/session", axum::routing::get(session_info))
+        // Desktop-only session bootstrap. Exists as a route on both builds (so
+        // the console page can probe it without a 404-vs-timeout distinction in
+        // the JS), but the handler answers 404 unless this state is a desktop
+        // build AND the request came from loopback. See [`desktop_boot`].
+        .route("/admin/api/desktop-boot", axum::routing::get(desktop_boot))
         .merge(assets)
         .merge(gated)
         .fallback(console_fallback)
         .layer(Extension(state))
         .with_state(sessions)
+}
+
+/// Mint a session for the desktop app's own webview, without a token exchange.
+///
+/// ## Why this exists
+///
+/// The desktop webview loads the same `/admin/` console the server serves, but
+/// there is no human to type `PROXY_API_TOKEN` into: the desktop process *is*
+/// the operator. `AdminSessions::mint_session` creates the session in-process;
+/// this endpoint hands the cookie to the webview the same way
+/// `/admin/api/login` does for a server operator.
+///
+/// ## Why it is safe
+///
+/// Two independent gates, and both must pass:
+///
+/// 1. **Build gate**: `AdminState::desktop` is `true` only in the desktop
+///    binary. On a server the endpoint answers **404** — it does not exist for
+///    a remote operator, so there is nothing to probe, rate-limit or abuse.
+/// 2. **Transport gate**: only a loopback peer is answered. The desktop binds
+///    and talks to itself; a desktop listening on a LAN address still cannot
+///    have its console logged in from another machine, because the minting
+///    request must originate from the same host.
+///
+/// The session is identical in kind to a token-login session (same map, same
+/// TTL, same sliding expiry), so `require_session` cannot tell them apart —
+/// which is the point: one authorisation path, two transports.
+///
+/// Idempotent by design: the page may call this on every (re)connect, and each
+/// call simply mints a fresh session; the previous one expires on its own.
+async fn desktop_boot(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Extension(state): axum::extract::Extension<Arc<crate::admin_routes::AdminState>>,
+) -> Response {
+    use axum::http::{header, StatusCode};
+
+    // Build gate first, so a server build does not even hint that the route
+    // has special behaviour. Same JSON 404 shape the console fallback answers,
+    // so a probe cannot distinguish "absent" from "not for you".
+    if !state.desktop {
+        return not_found_response();
+    }
+    // Transport gate: the request must come from the same machine. This also
+    // covers a desktop bound to 0.0.0.0 (an odd but possible configuration):
+    // remote peers are refused even though the port is reachable.
+    if !peer.ip().is_loopback() {
+        return not_found_response();
+    }
+    let secure = false; // loopback plain HTTP; Secure would make the webview drop the cookie
+    let id = state.sessions.mint_session();
+    let ttl = admin_auth::SESSION_TTL;
+    let mut response = (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "ok": true,
+            "expires_in_secs": ttl.as_secs(),
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        admin_auth::set_cookie_header(&id, secure, ttl),
+    );
+    response
+}
+
+/// The console's JSON 404, usable from a non-async helper context.
+fn not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "type": "not_found",
+                "message": "未知的管理接口",
+                "code": "not_found",
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// Report the session and **re-issue the cookie** with a fresh `Max-Age`.

@@ -83,6 +83,8 @@ fn test_router_with_sessions() -> (axum::Router, Arc<AdminSessions>) {
             bind_addr: "127.0.0.1".to_string(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     // Both routers, merged exactly as the server binary does: login/logout live
     // on the console router (the form it serves mints the cookie), while the
@@ -110,6 +112,8 @@ fn test_router() -> axum::Router {
             bind_addr: "127.0.0.1".to_string(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     app_for(state)
 }
@@ -135,6 +139,8 @@ fn test_state_with_auth(client_auth: Arc<ClientAuthState>) -> Arc<AdminState> {
             bind_addr: "127.0.0.1".to_string(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     })
 }
 
@@ -490,6 +496,8 @@ fn console_router() -> axum::Router {
             bind_addr: "127.0.0.1".to_string(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     app_for(state)
 }
@@ -806,6 +814,8 @@ async fn the_admin_surface_does_not_advertise_cross_origin_access() {
             bind_addr: "127.0.0.1".into(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
 
     // Built the way the server binary builds it: data plane, then admin merged
@@ -877,6 +887,8 @@ fn build_console_router_for_cors_test() -> axum::Router {
             bind_addr: "127.0.0.1".into(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     build_console_router(state)
 }
@@ -1155,4 +1167,139 @@ fn the_desktop_registers_every_client_account_command_the_ui_calls() {
             "{cmd} missing from the desktop generate_handler! list"
         );
     }
+}
+
+// ── Desktop session bootstrap (desktop-boot endpoint) ─────────────────────
+
+/// `call()` rides `oneshot`, which has no transport and therefore no
+/// `ConnectInfo`; the desktop-boot handler *requires* that extractor, so tests
+/// attach a forged peer address directly.
+async fn call_with_peer(
+    app: axum::Router,
+    peer: &str,
+    uri: &str,
+) -> (StatusCode, Value, Option<String>) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            peer.parse().unwrap(),
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        set_cookie,
+    )
+}
+
+/// A desktop state with the flag on: a loopback call mints a session the
+/// regular `require_session` gate accepts — one authorisation path, two
+/// transports.
+#[tokio::test]
+async fn desktop_boot_mints_a_session_for_loopback_on_a_desktop_build() {
+    let _iso = isolate("desktop-boot-ok", Some("tok")).await;
+    let state = Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: 3456,
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let app = app_for(state);
+
+    let (status, body, set_cookie) =
+        call_with_peer(app.clone(), "127.0.0.1:50000", "/admin/api/desktop-boot").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cookie = set_cookie.expect("boot must set the session cookie");
+    let pair = cookie.split(';').next().unwrap().to_string();
+
+    // The minted session must open the gated surface — that is the whole point.
+    let (status, body, _) = call(app, "GET", "/admin/api/status", Some(&pair), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "minted session must pass require_session: {body}"
+    );
+}
+
+/// On a server build the endpoint is a plain 404: it does not exist for a
+/// remote operator, and nothing about the deployment's trust model changes.
+#[tokio::test]
+async fn desktop_boot_is_a_plain_404_on_a_server_build() {
+    let _iso = isolate("desktop-boot-server", Some("tok")).await;
+    let (status, body, set_cookie) =
+        call_with_peer(test_router(), "127.0.0.1:50000", "/admin/api/desktop-boot").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        set_cookie.is_none(),
+        "a server build must never mint a session"
+    );
+}
+
+/// Even on a desktop build, a non-loopback peer is refused — covering a desktop
+/// bound to 0.0.0.0: the port may be reachable from the LAN, the console must
+/// not be loggable from it.
+///
+/// `call()` cannot set a peer address (oneshot has no transport), so this test
+/// drives the handler directly with a forged non-loopback ConnectInfo.
+#[tokio::test]
+async fn desktop_boot_refuses_non_loopback_peers() {
+    let _iso = isolate("desktop-boot-lan", Some("tok")).await;
+    let sessions = Arc::new(AdminSessions::new());
+    let state = Arc::new(AdminState {
+        sessions: sessions.clone(),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: 3456,
+            started_at: std::time::Instant::now(),
+            bind_addr: "0.0.0.0".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/api/desktop-boot")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "192.168.1.50:55555".parse().unwrap(),
+        ))
+        .header("x-proxy-rs-test-extension", "1")
+        .body(Body::empty())
+        .unwrap();
+    // Build only the console router (it carries the Extension layer the
+    // handler needs) and extend the request with the state.
+    let router = proxy_rs::console::build_console_router(state);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "a LAN peer must never receive a session"
+    );
 }
