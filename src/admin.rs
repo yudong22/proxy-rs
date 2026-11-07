@@ -43,95 +43,10 @@ use crate::settings::{self, GuiSettings};
 use crate::stats::StatsDb;
 use crate::workbuddy_auth::{self, ApiKeyEntry, WorkBuddyCredential};
 
-/// Read-only view of the running process, for the console's status strip.
-///
-/// A struct rather than reading the environment at render time: the values must
-/// all describe *the same moment*, and a payload assembled from three separate
-/// reads can straddle a restart.
-#[derive(Debug, Clone)]
-pub struct ProcessInfo {
-    pub version: &'static str,
-    /// The port the gateway is listening on, read at call time.
-    ///
-    /// A live reference rather than a snapshot: the desktop binds its port
-    /// *after* the admin state is built (the state is built first, so the
-    /// console exists even when the bind fails), and a snapshot taken then
-    /// would report the configured port instead of the one actually in use —
-    /// which is how the console came to show "3456" while serving on 3457.
-    ///
-    /// The server build passes a fixed value (its port never changes after
-    /// start), so the shape is the same for both.
-    pub bound_port: std::sync::Arc<std::sync::atomic::AtomicU16>,
-    pub started_at: std::time::Instant,
-    pub bind_addr: String,
-}
-
-impl ProcessInfo {
-    /// The port the gateway is listening on right now.
-    pub fn port(&self) -> u16 {
-        self.bound_port.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl ProcessInfo {
-    /// The status payload the console's header renders.
-    pub fn status_json(&self) -> Value {
-        let settings = GuiSettings::load();
-        let presets = crate::providers::builtin_presets();
-        json!({
-            // A headless gateway has no start/stop control — it is always
-            // "running" if this code is answering at all. Reporting `true`
-            // rather than omitting the field keeps the console's shape aligned
-            // with the desktop payload.
-            "running": true,
-            "service_running": true,
-            // Read by the shared front-end to label the process lifecycle. The
-            // console cannot hide the start/stop button (that file is shared
-            // with the desktop app), so clicking it surfaces the bridge's
-            // explanation instead of a silent no-op.
-            "managed_by": "systemd",
-            "can_control_service": false,
-            "uptime_secs": self.started_at.elapsed().as_secs(),
-            "version": self.version,
-            "provider": settings.provider_id,
-            "upstream_url": settings.chat_url(&presets),
-            "config_path": settings::settings_path().display().to_string(),
-            "log_path": settings::log_file_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            // Desktop-only fields the shared front-end reads. They are answered
-            // honestly rather than omitted: a missing key renders as the empty
-            // string in a `<code>` element, which looks like a bug, while an
-            // explicit "由 systemd 托管" reads as the truth.
-            "launch_at_login": false,
-            "launch_at_login_stale": false,
-            "managed_by": "systemd",
-            "port": self.port(),
-            "configured_port": settings.port,
-            "bind": self.bind_addr,
-            "client_auth_enabled": client_accounts::enabled_from(settings.client_auth_enabled),
-            "data_dir": settings::data_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            // Whether an upstream key is configured, so the settings form can say
-            // "already set, leave blank to keep" instead of looking empty.
-            "api_key_set": !settings.api_key.trim().is_empty(),
-            "env_path": settings::dotenv_path().map(|p| p.display().to_string()),
-            // **The overview's 剩余积分 / 当前账号 cards read this.**
-            //
-            // It was missing from the server payload, so on the web console those
-            // two cards rendered empty forever while the desktop app showed them
-            // — the same front-end, a hole in the data behind it. The shape must
-            // match the desktop command exactly (`id`/`label`/`points`).
-            "current_identity": current_identity_summary(),
-            // `is_dev` gates a couple of desktop-only affordances; a server is
-            // never a dev build.
-            "is_dev": false,
-            "configured_launch_at_login": false,
-            "launch_at_login_plist_present": false,
-        })
-    }
-}
+// `ProcessInfo` lives with the admin state now (it describes the state's
+// process). Re-exported so every existing `admin::ProcessInfo` path keeps
+// working.
+pub use crate::admin_state::{current_identity_summary, ProcessInfo};
 
 // ── Settings ───────────────────────────────────────────────────────────────
 
@@ -161,6 +76,25 @@ pub fn settings_json() -> Value {
         obj.insert("preset_name".into(), json!(preset.name));
     }
     payload
+}
+
+/// Decide what to store when the settings form posts an `api_key`.
+///
+/// Three cases, and the rule lives here so the desktop and the server console
+/// cannot disagree about them (they used to; see the `*` case):
+///
+/// * blank / omitted → keep what is stored. The form has no key field, so an
+///   empty string is "leave it alone", never "clear it".
+/// * a masked echo (`•` or `*` runs) → keep what is stored. The form renders
+///   the key masked, and a browser replaying that value must not overwrite the
+///   real one.
+/// * anything else → the new key, trimmed.
+fn resolve_api_key(posted: &str, stored: &str) -> String {
+    let v = posted.trim();
+    if v.is_empty() || v.contains('•') || v.contains('*') {
+        return stored.to_string();
+    }
+    v.to_string()
 }
 
 /// The fields a settings save may change.
@@ -201,9 +135,9 @@ pub fn save_settings(update: SettingsUpdate) -> Result<Value> {
     // Empty means "unchanged" — the form renders the key masked, so it cannot
     // echo a real value back and an empty submit must not wipe the key.
     if let Some(v) = update.api_key {
-        let v = v.trim();
-        if !v.is_empty() && !v.contains('•') {
-            s.api_key = v.to_string();
+        let v = resolve_api_key(&v, &s.api_key);
+        if !v.is_empty() {
+            s.api_key = v;
         }
     }
     if let Some(v) = update.port {
@@ -561,29 +495,6 @@ pub fn save_schedule(enabled: bool, time: &str, growth: Option<bool>) -> Result<
 
 // ── Overview cards ─────────────────────────────────────────────────────────
 
-/// The identity currently in force, for the overview header's three cards.
-///
-/// Resolved through `effective_default_identity` rather than the stored
-/// preference: with no explicit default the first usable entry wins, and the
-/// card must describe what is *actually* serving traffic.
-pub fn current_identity_summary() -> Value {
-    let id = workbuddy_auth::effective_default_identity();
-    let (label, points) = match id.as_str() {
-        id if id.starts_with("wb-") => workbuddy_auth::load_credentials()
-            .into_iter()
-            .find(|c| c.id == id)
-            .map(|c| (c.label, c.points))
-            .unwrap_or_else(|| ("未知账号".to_string(), None)),
-        id if id.starts_with("k-") => workbuddy_auth::load_api_keys()
-            .into_iter()
-            .find(|k| k.id == id)
-            .map(|k| (k.label, k.points))
-            .unwrap_or_else(|| ("未知密钥".to_string(), None)),
-        _ => ("静态 API Key".to_string(), None),
-    };
-    json!({ "id": id, "label": label, "points": points })
-}
-
 /// Credentials list in the shape the desktop console's identity pool expects.
 pub async fn credentials_list(pool: &CredentialPool) -> Result<Value> {
     let items = workbuddy_auth::load_credentials();
@@ -830,7 +741,7 @@ pub fn read_dsh_config() -> Result<Value> {
 
 /// Write this proxy into the active DSH profile's patch file.
 pub async fn apply_dsh_config(
-    state: &std::sync::Arc<crate::admin_routes::AdminState>,
+    state: &std::sync::Arc<crate::admin_state::AdminState>,
 ) -> Result<Value> {
     let Some(patch_path) = crate::dsh_config::patch_path() else {
         bail!("DSH_HOME / HOME 未设置，无法定位 DSH 配置");
@@ -868,7 +779,7 @@ pub async fn apply_dsh_config(
 
 /// Refresh every identity's point balance.
 pub async fn refresh_all_points(
-    state: &std::sync::Arc<crate::admin_routes::AdminState>,
+    state: &std::sync::Arc<crate::admin_state::AdminState>,
 ) -> Result<Value> {
     let report = workbuddy_auth::refresh_all_points(&state.client).await;
     let known = report.results.iter().filter(|r| r.points.is_some()).count();
@@ -891,7 +802,7 @@ pub async fn refresh_all_points(
 
 /// Refresh one identity's point balance.
 pub async fn refresh_one_points(
-    state: &std::sync::Arc<crate::admin_routes::AdminState>,
+    state: &std::sync::Arc<crate::admin_state::AdminState>,
     id: &str,
 ) -> Result<Value> {
     let Some(result) = workbuddy_auth::refresh_one_points(&state.client, id).await else {
@@ -1075,6 +986,37 @@ pub fn mask_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Saving the settings form must never clear the stored key.
+    ///
+    /// Regression: the form has no `api_key` field, so it posted an empty
+    /// string on every save and the backend assigned it straight through —
+    /// silently wiping a value `migrate_legacy_api_key` reads at startup.
+    #[test]
+    fn save_settings_keeps_the_stored_key_when_the_form_omits_it() {
+        assert_eq!(resolve_api_key("", "ck-stored"), "ck-stored");
+        assert_eq!(resolve_api_key("   ", "ck-stored"), "ck-stored");
+    }
+
+    /// A masked value is not a key: it is the UI echoing back a secret it was
+    /// never given in the clear, so it must not overwrite the real one.
+    ///
+    /// Both mask characters are rejected. The desktop used to reject `•` and
+    /// `*`, the server console only `•` — a defensive divergence that would
+    /// become a bug the first time a `*` mask was produced.
+    #[test]
+    fn save_settings_does_not_store_a_masked_placeholder() {
+        assert_eq!(resolve_api_key("ck-••••wxyz", "ck-stored"), "ck-stored");
+        assert_eq!(resolve_api_key("ck-****wxyz", "ck-stored"), "ck-stored");
+    }
+
+    /// A genuine new key still replaces the old one, trimmed.
+    #[test]
+    fn save_settings_accepts_a_real_replacement_key() {
+        assert_eq!(resolve_api_key("ck-new", "ck-stored"), "ck-new");
+        assert_eq!(resolve_api_key("  ck-new  ", "ck-stored"), "ck-new");
+        assert_eq!(resolve_api_key("", ""), "");
+    }
 
     #[test]
     fn a_short_key_is_masked_entirely() {

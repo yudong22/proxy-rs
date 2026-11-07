@@ -372,7 +372,6 @@ async fn an_upstream_key_in_a_standard_header_is_left_for_passthrough() {
         upstream_urls: vec![base_url],
         passthrough_api_key: true,
         models_flavor: ModelsFlavor::WorkBuddyConfig,
-        client_auth_enabled: true,
         ..Default::default()
     };
     let app = router_with(state.clone(), config);
@@ -412,7 +411,6 @@ async fn a_gateway_key_in_a_standard_header_is_not_forwarded_upstream() {
         upstream_urls: vec![base_url],
         api_key: Some("sk-static-upstream".to_string()),
         models_flavor: ModelsFlavor::WorkBuddyConfig,
-        client_auth_enabled: true,
         ..Default::default()
     };
     let app = router_with(state, config);
@@ -470,7 +468,6 @@ async fn a_gateway_key_authenticates_here_while_the_pool_authenticates_upstream(
         upstream_urls: vec![base_url],
         models_flavor: ModelsFlavor::WorkBuddyConfig,
         credential_pool_enabled: true,
-        client_auth_enabled: true,
         // Passthrough OFF: the upstream key comes from the pool, which is the
         // normal shape for this deployment.
         passthrough_api_key: false,
@@ -629,7 +626,6 @@ async fn both_keys_travel_their_own_directions() {
         // may carry the gateway key.
         models_flavor: ModelsFlavor::WorkBuddyConfig,
         // Both features on at once. No mutual exclusion anywhere.
-        client_auth_enabled: true,
         ..Default::default()
     };
 

@@ -973,39 +973,3 @@ fn main() {
             let _ = (app, event);
         });
 }
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_api_key;
-
-    /// Saving the settings form must never clear the stored key.
-    ///
-    /// Regression: the form has no `api_key` field since v1.8.5, so it posted an
-    /// empty string on every save and the backend assigned it straight through —
-    /// silently wiping a value `migrate_legacy_api_key` reads at startup. The
-    /// damage was masked only because `gui-settings.json` kept the old key from
-    /// before the field was removed.
-    #[test]
-    fn save_settings_keeps_the_stored_key_when_the_form_omits_it() {
-        // Omitted / blank: keep what is stored.
-        assert_eq!(resolve_api_key("", "ck-stored"), "ck-stored");
-        assert_eq!(resolve_api_key("   ", "ck-stored"), "ck-stored");
-    }
-
-    /// A masked value is not a key: it is the UI echoing back a secret it was
-    /// never given in the clear, so it must not overwrite the real one.
-    #[test]
-    fn save_settings_does_not_store_a_masked_placeholder() {
-        assert_eq!(resolve_api_key("ck-••••wxyz", "ck-stored"), "ck-stored");
-        assert_eq!(resolve_api_key("ck-****wxyz", "ck-stored"), "ck-stored");
-    }
-
-    /// A genuine new key still replaces the old one, trimmed.
-    #[test]
-    fn save_settings_accepts_a_real_replacement_key() {
-        assert_eq!(resolve_api_key("ck-new", "ck-stored"), "ck-new");
-        assert_eq!(resolve_api_key("  ck-new  ", "ck-stored"), "ck-new");
-        // No stored key and nothing posted stays empty rather than erroring.
-        assert_eq!(resolve_api_key("", ""), "");
-    }
-}

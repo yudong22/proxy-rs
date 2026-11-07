@@ -1728,3 +1728,183 @@ async fn the_reported_port_follows_the_live_listener() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["port"], 3500);
 }
+
+// ── Structure guard (3.4.0 A5/A6): module dependency cycles ──────────────
+
+/// The module graph must not grow new cycles.
+///
+/// 3.4.0 took the graph from seven cycles to one. The remaining one
+/// (`config → workbuddy_auth → credits → config`, with `session_pool` inside it)
+/// is a real dependency knot: the credits handler needs the proxy config, and
+/// the credential layer reads balances. Splitting it further would duplicate the
+/// response parser, which is the opposite of what 3.4.0 is for — so it is
+/// recorded here as a known exception rather than papered over.
+///
+/// This test is the guard: a *new* cycle, or a change to the known one, fails.
+/// The parser mirrors the audit script (`docs/audit-3.3.0/module-graph.md`).
+#[test]
+fn the_module_graph_has_no_new_cycles() {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut modules: BTreeSet<String> = BTreeSet::new();
+    for entry in std::fs::read_dir(&src).expect("src dir") {
+        let p = entry.unwrap().path();
+        if p.is_dir() {
+            if p.join("mod.rs").exists() {
+                modules.insert(p.file_name().unwrap().to_string_lossy().to_string());
+            }
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            modules.insert(p.file_stem().unwrap().to_string_lossy().to_string());
+        }
+    }
+
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).expect("dir") {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+
+    let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in &files {
+        let rel = f.strip_prefix(&src).unwrap();
+        let from = rel
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_string_lossy()
+            .trim_end_matches(".rs")
+            .to_string();
+        if !modules.contains(&from) {
+            continue;
+        }
+        let text = std::fs::read_to_string(f).unwrap_or_default();
+        // Drop test modules: they are not part of the shipped graph.
+        let text = text.split("\n#[cfg(test)]").next().unwrap_or("");
+        for line in text.lines() {
+            // Doc comments mention `crate::x` without calling it.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(i) = rest.find("crate::") {
+                rest = &rest[i + 7..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if modules.contains(&name) && name != from {
+                    edges.entry(from.clone()).or_default().insert(name);
+                }
+            }
+        }
+    }
+
+    // Tarjan SCC, iterative enough for a small graph.
+    let names: Vec<String> = modules.iter().cloned().collect();
+    let idx: HashMap<&str, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); names.len()];
+    for (from, tos) in &edges {
+        for to in tos {
+            adj[idx[from.as_str()]].push(idx[to.as_str()]);
+        }
+    }
+
+    let mut counter = 0usize;
+    let mut index = vec![usize::MAX; names.len()];
+    let mut low = vec![0usize; names.len()];
+    let mut on_stack = vec![false; names.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+    // Tarjan over shared state, so the recursive helper keeps a small
+    // signature (clippy rejects eight positional arguments, and the mutable
+    // slices are all the same "graph walk state").
+    struct Walkers<'a> {
+        adj: &'a [Vec<usize>],
+        index: &'a mut [usize],
+        low: &'a mut [usize],
+        on_stack: &'a mut [bool],
+        stack: &'a mut Vec<usize>,
+        counter: &'a mut usize,
+        sccs: &'a mut Vec<Vec<usize>>,
+    }
+
+    fn strongconnect(v: usize, w: &mut Walkers<'_>) {
+        w.index[v] = *w.counter;
+        w.low[v] = *w.counter;
+        *w.counter += 1;
+        w.stack.push(v);
+        w.on_stack[v] = true;
+        for i in 0..w.adj[v].len() {
+            let to = w.adj[v][i];
+            if w.index[to] == usize::MAX {
+                strongconnect(to, w);
+                w.low[v] = w.low[v].min(w.low[to]);
+            } else if w.on_stack[to] {
+                w.low[v] = w.low[v].min(w.index[to]);
+            }
+        }
+        if w.low[v] == w.index[v] {
+            let mut comp = Vec::new();
+            while let Some(x) = w.stack.pop() {
+                w.on_stack[x] = false;
+                comp.push(x);
+                if x == v {
+                    break;
+                }
+            }
+            if comp.len() > 1 {
+                w.sccs.push(comp);
+            }
+        }
+    }
+
+    for v in 0..names.len() {
+        if index[v] == usize::MAX {
+            let mut walkers = Walkers {
+                adj: &adj,
+                index: &mut index,
+                low: &mut low,
+                on_stack: &mut on_stack,
+                stack: &mut stack,
+                counter: &mut counter,
+                sccs: &mut sccs,
+            };
+            strongconnect(v, &mut walkers);
+        }
+    }
+
+    let mut found: Vec<Vec<String>> = sccs
+        .into_iter()
+        .map(|c| {
+            let mut v: Vec<String> = c.into_iter().map(|i| names[i].clone()).collect();
+            v.sort();
+            v
+        })
+        .collect();
+    found.sort();
+
+    let known: Vec<String> = ["config", "credits", "session_pool", "workbuddy_auth"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        found,
+        vec![known],
+        "the module graph must have exactly one known cycle (config/credits/session_pool/\
+         workbuddy_auth); a new or changed cycle means a dependency was reintroduced"
+    );
+}

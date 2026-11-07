@@ -536,7 +536,7 @@ impl ClientAuthState {
 /// `=false` turns it off) so a deployment can pin the answer without trusting a
 /// settings file that a GUI user could toggle.
 pub fn enabled_from(settings_flag: bool) -> bool {
-    match crate::config::env_value(ENABLED_ENV) {
+    match crate::env::value(ENABLED_ENV) {
         Some(raw) => {
             let v = raw.trim();
             !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))

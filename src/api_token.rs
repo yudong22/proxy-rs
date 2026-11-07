@@ -39,7 +39,7 @@ pub const TOKEN_ENV: &str = "PROXY_API_TOKEN";
 /// authenticate anything, and treating `PROXY_API_TOKEN=` as "enabled" would
 /// silently open the route with a guessable credential.
 pub fn configured_token() -> Option<String> {
-    crate::config::env_value(TOKEN_ENV)
+    crate::env::value(TOKEN_ENV)
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }

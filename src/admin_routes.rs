@@ -34,45 +34,12 @@ use std::sync::Arc;
 
 use crate::admin;
 use crate::admin_auth::{self, AdminSessions, SessionFailure};
-use crate::client_accounts::ClientAuthState;
-use crate::settings::LogBuffer;
-use crate::stats::{RequestLogFilter, StatsDb};
+use crate::stats::RequestLogFilter;
 
-/// State the admin handlers need.
-///
-/// A distinct type from the data plane's extensions on purpose: the admin surface
-/// has no `Config` (it does not forward anything) and no credential pool *for
-/// forwarding* — it reads the pool only to report sticky-session counts.
-pub struct AdminState {
-    pub sessions: Arc<AdminSessions>,
-    pub stats: Arc<StatsDb>,
-    pub logs: Arc<LogBuffer>,
-    pub client_auth: Arc<ClientAuthState>,
-    pub pool: crate::session_pool::SharedCredentialPool,
-    pub process: admin::ProcessInfo,
-    /// Outbound HTTP client, shared with the proxy so the console's occasional
-    /// refreshes (points, model list, upstream test) reuse the same connection
-    /// pool instead of opening a second one per click.
-    pub client: reqwest::Client,
-    /// Whether this state belongs to the **desktop app's in-process console**.
-    ///
-    /// Only a desktop-built state exposes `GET /admin/api/desktop-boot`, the
-    /// endpoint that mints a session without a token exchange (the desktop
-    /// process *is* the operator, so there is nobody to type a token in). A
-    /// server build keeps it `false` and the endpoint answers 404 — the route
-    /// does not exist for a remote operator, and nothing about the server
-    /// deployment's trust model changes. See `console::desktop_boot`.
-    pub desktop: bool,
-    /// Growth-run progress lines, polled by the console instead of pushed as
-    /// events.
-    ///
-    /// The desktop used to deliver these over Tauri events; a shared HTTP
-    /// console has no push channel, and the payload is small and append-only,
-    /// so a buffer the UI drains on a poll is the simplest faithful
-    /// replacement. Writers append during a run; the reader takes-and-clears.
-    /// Empty in steady state.
-    pub growth_progress: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-}
+// The state moved to its own module so this file and `admin` do not import
+// each other. Re-exported here because every existing `AdminState` reference
+// names this path.
+pub use crate::admin_state::AdminState;
 
 /// Where the admin surface lives, in absolute paths.
 pub const ADMIN_PREFIX: &str = "/admin/api";
