@@ -9,14 +9,18 @@ use crate::translate::core;
 enum BlockState {
     Idle,
     Text { index: usize },
-    ToolUse { index: usize },
+    ToolUse {
+        index: usize,
+        id: String,
+        call_index: usize,
+    },
 }
 
 impl BlockState {
     fn current_index(&self) -> Option<usize> {
         match self {
             Self::Idle => None,
-            Self::Text { index } | Self::ToolUse { index } => Some(*index),
+            Self::Text { index } | Self::ToolUse { index, .. } => Some(*index),
         }
     }
 }
@@ -165,6 +169,7 @@ fn close_current_block(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
     if let Some(index) = state.block.current_index() {
         events.push(StreamEvent::ContentBlockStop { index });
         state.next_index = index + 1;
+        state.block = BlockState::Idle;
     }
 }
 
@@ -197,33 +202,64 @@ fn emit_tool_calls(
     tool_calls: &[openai::DeltaToolCall],
 ) {
     for tool_call in tool_calls {
-        if let Some(id) = &tool_call.id {
-            close_current_block(events, state);
-            let index = state.next_index;
+        let incoming_name = tool_call
+            .function
+            .as_ref()
+            .and_then(|f| f.name.as_deref())
+            .filter(|n| !n.trim().is_empty());
 
-            if let Some(function) = &tool_call.function {
-                if let Some(name) = &function.name {
-                    events.push(StreamEvent::ContentBlockStart {
-                        index,
-                        content_block: ContentBlockStart::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                        },
-                    });
-                    state.block = BlockState::ToolUse { index };
+        let is_new_tool = match &state.block {
+            BlockState::ToolUse {
+                call_index,
+                id: current_id,
+                ..
+            } => {
+                // Same call_index: only consider new tool if a different non-empty id and non-empty name arrive.
+                // Upstreams like MiniMax echo the id and empty name in every chunk; those must NOT start a new block.
+                if *call_index == tool_call.index {
+                    if let Some(new_id) = &tool_call.id {
+                        !new_id.is_empty() && new_id != current_id && incoming_name.is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    true
                 }
             }
+            _ => incoming_name.is_some() || tool_call.id.is_some(),
+        };
+
+        if is_new_tool {
+            close_current_block(events, state);
+            let index = state.next_index;
+            let id = tool_call.id.clone().unwrap_or_default();
+            let name = incoming_name.unwrap_or_default().to_string();
+
+            events.push(StreamEvent::ContentBlockStart {
+                index,
+                content_block: ContentBlockStart::ToolUse {
+                    id: id.clone(),
+                    name,
+                },
+            });
+            state.block = BlockState::ToolUse {
+                index,
+                id,
+                call_index: tool_call.index,
+            };
         }
 
         if let Some(function) = &tool_call.function {
             if let Some(args) = &function.arguments {
-                if let BlockState::ToolUse { index } = state.block {
-                    events.push(StreamEvent::ContentBlockDelta {
-                        index,
-                        delta: Delta::InputJsonDelta {
-                            partial_json: args.clone(),
-                        },
-                    });
+                if !args.is_empty() {
+                    if let BlockState::ToolUse { index, .. } = state.block {
+                        events.push(StreamEvent::ContentBlockDelta {
+                            index,
+                            delta: Delta::InputJsonDelta {
+                                partial_json: args.clone(),
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -536,5 +572,48 @@ mod tests {
             .filter(|e| matches!(e, StreamEvent::ContentBlockDelta { .. }))
             .collect();
         assert!(deltas.is_empty());
+    }
+
+    #[test]
+    fn tool_call_stream_with_repeated_id_and_empty_name_does_not_split_block() {
+        // MiniMax emits tool_calls chunks where subsequent chunks echo the id and send name: "".
+        // They must NOT close the current tool block or open dummy blocks.
+        let mut state = initial_state("fallback".into());
+
+        // Chunk 1: tool call start
+        let c1: openai::StreamChunk = serde_json::from_value(json!({
+            "id": "1", "model": "minimax-m3.1-flash",
+            "choices": [{ "index": 0, "delta": {
+                "tool_calls": [{ "index": 0, "id": "call_123", "type": "function", "function": { "name": "Bash", "arguments": "" } }]
+            }}]
+        })).unwrap();
+        let e1 = translate_chunk(&mut state, &c1);
+        assert!(event_types(&e1).contains(&"content_block_start"));
+
+        // Chunk 2: same id, empty name, first chunk of arguments
+        let c2: openai::StreamChunk = serde_json::from_value(json!({
+            "id": "1", "model": "minimax-m3.1-flash",
+            "choices": [{ "index": 0, "delta": {
+                "tool_calls": [{ "index": 0, "id": "call_123", "function": { "name": "", "arguments": "{\"command\":\"echo 1" } }]
+            }}]
+        })).unwrap();
+        let e2 = translate_chunk(&mut state, &c2);
+        // Must NOT close block or open a new block! Only content_block_delta!
+        assert_eq!(event_types(&e2), ["content_block_delta"]);
+
+        // Chunk 3: same id, empty name, second chunk of arguments
+        let c3: openai::StreamChunk = serde_json::from_value(json!({
+            "id": "1", "model": "minimax-m3.1-flash",
+            "choices": [{ "index": 0, "delta": {
+                "tool_calls": [{ "index": 0, "id": "call_123", "function": { "name": "", "arguments": "\"}" } }]
+            }}]
+        })).unwrap();
+        let e3 = translate_chunk(&mut state, &c3);
+        assert_eq!(event_types(&e3), ["content_block_delta"]);
+
+        // Finish chunk
+        let c4 = finish_chunk("1", "minimax-m3.1-flash", "tool_calls");
+        let e4 = translate_chunk(&mut state, &c4);
+        assert_eq!(event_types(&e4), ["content_block_stop", "message_delta"]);
     }
 }
