@@ -11,6 +11,7 @@
 import { setOAuthPoolRefresh } from '../oauth-qr.js';
 import { initRelogin, setReloginPoolRefresh } from '../relogin.js';
 import { renderIdentityPool } from './pool-table.js';
+import { setPoolRepaint } from './drag.js';
 import {
   loadSchedule,
   initAutomationDialog,
@@ -27,6 +28,7 @@ export function initCredentialPool() {
   // one — importing this file from them would close a cycle.
   setOAuthPoolRefresh(renderIdentityPool);
   setReloginPoolRefresh(renderIdentityPool);
+  setPoolRepaint(renderIdentityPool);
   initRelogin();
   initAutomationDialog();
   // Paint the summary immediately: the page must state whether anything runs

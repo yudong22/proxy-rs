@@ -5,16 +5,23 @@
  * on creation and never again, so this dialog is the only place a user can ever
  * obtain it — which is why it states that in the body rather than in a tooltip.
  *
- * Importing `renderClientAccounts` back from `list.js` forms a cycle, which is
- * deliberate and safe: the call happens inside the dialog's close handler, long
- * after both modules are evaluated, and function declarations are hoisted.
+ * The repaint is injected rather than imported back from `list.js`: the list
+ * calls `showRevealedKey`, so importing the list from here would close a cycle.
+ * Same idiom as `setOAuthPoolRefresh` / `setReloginPoolRefresh`.
  */
 
 import { $, html } from '../../../core/dom.js';
 import { overlay, modalShell } from '../../../components/overlay.js';
 import { toast } from '../../../components/toast.js';
 import { KEY_HEADER, copyText } from './shared.js';
-import { renderClientAccounts } from './list.js';
+
+/** Repaints the access-account list; injected by `index.js` at init. */
+let repaintList = () => {};
+
+/** @param {() => void} fn */
+export function setAccountsRepaint(fn) {
+  repaintList = fn;
+}
 
 /** One-time plaintext reveal. */
 const REVEAL_ID = 'client-account-reveal-overlay';
@@ -59,7 +66,7 @@ function ensureRevealDialog() {
     revealedLabel = '';
     // Repaint so the new row appears without the user wondering whether the
     // creation actually happened.
-    void renderClientAccounts();
+    void repaintList();
   };
 
   el.addEventListener('click', (e) => {

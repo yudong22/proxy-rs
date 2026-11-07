@@ -5,15 +5,21 @@
  * has its own history (see the doc comment), and is easier to follow with the
  * list rendering out of the way.
  *
- * Importing `renderIdentityPool` back from `pool-table.js` forms a cycle, which
- * is deliberate and safe here: both sides only call each other from inside
- * handlers that run long after every module has been evaluated, and function
- * declarations are hoisted, so neither binding is read during instantiation.
+ * The repaint is injected rather than imported back from `pool-table.js`: the
+ * list calls `wireCredentialDrag`, so importing the list from here would close
+ * a cycle. Same idiom as `setOAuthPoolRefresh` / `setReloginPoolRefresh`.
  */
 
 import { invoke } from '../../../core/ipc.js';
 import { showWbStatus } from './status.js';
-import { renderIdentityPool } from './pool-table.js';
+
+/** Repaints the identity list; injected by `index.js` at init. */
+let repaintPool = async () => {};
+
+/** @param {() => Promise<void>} fn */
+export function setPoolRepaint(fn) {
+  repaintPool = fn;
+}
 
 /**
  * Make the identity rows reorderable by dragging, and persist the result.
@@ -108,12 +114,12 @@ export function wireCredentialDrag(listEl) {
         // stored order is the source of truth, and a repaint also refreshes the
         // 默认 badge, which follows "first usable" when no explicit default is
         // set — reordering can therefore change which identity shows as 默认.
-        await renderIdentityPool();
+        await repaintPool();
       } catch (err) {
         showWbStatus('调整顺序失败: ' + err, true);
         // Put the DOM back where the backend says it is; leaving the visual
         // order ahead of the stored one is the exact drift this guards against.
-        await renderIdentityPool();
+        await repaintPool();
       }
     };
 
