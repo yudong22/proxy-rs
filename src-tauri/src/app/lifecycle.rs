@@ -1,6 +1,5 @@
 //! App lifecycle helpers: legacy migration, window focus, quit.
 
-use crate::app::context::*;
 use crate::*;
 
 // ── WorkBuddy credential pool management ───────────────────────────────────
