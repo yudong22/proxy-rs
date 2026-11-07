@@ -70,11 +70,23 @@ function apiBase() {
   // Server-hosted console: the page came from a different machine than the
   // gateway it is talking to. Set by `ui/server/bridge.js`.
   if (window.__PROXY_RS_SERVER__) return null;
-  // Same-origin console (desktop webview after bootstrap, or a browser on
-  // /admin/): the endpoints are right here, relative wins — it follows the
-  // port the page was actually served from, even across listener restarts
-  // that changed it.
-  if (window.location.pathname.startsWith('/admin')) return '';
+  // The console is served from the **console** listener, which does not carry
+  // the observation API. `/api/*` is registered on the data plane
+  // (`crate::router`), a *different* port (proxy port + 1 … +9), so a relative
+  // fetch here can only ever 404 — not on a bad day, but structurally.
+  //
+  // 3.4.0 split the two listeners and this branch kept returning `''` ("the
+  // endpoints are right here"), which was true before the split and is not
+  // true after it. The result was one 404 per poll in the console (the log
+  // table polls at 2 Hz), each followed by an IPC fallback — visible noise in
+  // devtools and a wasted round trip, never a wrong number.
+  //
+  // `null` is the honest answer: this page has no HTTP transport for the
+  // observation reads, so `read()` goes straight to IPC/RPC. That is the same
+  // path the server console already takes through `__PROXY_RS_SERVER__`, and it
+  // is stateless, so it also survives the listener restarts that saving
+  // settings triggers.
+  if (window.location.pathname.startsWith('/admin')) return null;
   // Test hook for `ui/tools/smoke.mjs`, which serves the page and the two
   // endpoints from one harness origin so the HTTP path is exercised without
   // depending on whether a real instance happens to own the configured port.
