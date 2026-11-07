@@ -19,7 +19,15 @@ import { overlay, modalShell } from '../../components/overlay.js';
 /** Whether a growth run is in flight (drives the progress line). */
 let growthRunActive = false;
 /** Set once the run's summary is written, so late events cannot overwrite it. */
-let growthRunFinished = false;
+let growthRunFinished = true;
+/**
+ * Timestamp until which the poller keeps talking to the backend even though the
+ * run is over. A run resolves before its last progress lines are necessarily
+ * flushed, so the drain continues for a short grace window to catch the tail.
+ * Without it the final lines are dropped; without the window the poller would
+ * keep asking forever (see `drainProgress`).
+ */
+let growthPollGraceUntil = 0;
 /** Recent progress lines, newest last. */
 let growthProgressLines = [];
 /** Poll draining the backend's progress buffer while a run is in flight. */
@@ -621,8 +629,15 @@ export function initCredentialPool() {
   // produced since the last one. A failure is ignored: the next tick retries
   // (a listener restart mid-run is transient, and the run itself will fail
   // loudly if it was real).
-  async function drainProgress() {
-    if (growthRunFinished) return;
+  //
+  // The network call happens **only** while a run is in flight or inside the
+  // short grace window that follows it. The timer itself ticks forever, but an
+  // idle settings page must not ask the backend four times a second — that
+  // was the actual bug: the poller used to be gated on `growthRunFinished`,
+  // which starts out "not finished", so every idle page hammered
+  // `get_growth_progress` at 4 Hz forever.
+  async function drainProgress(force = false) {
+    if (!force && !growthRunActive && Date.now() > growthPollGraceUntil) return;
     let res;
     try {
       res = await invoke('get_growth_progress');
@@ -647,6 +662,7 @@ export function initCredentialPool() {
     // Progress state: the poller appends lines while `growthRunActive`.
     growthRunActive = true;
     growthRunFinished = false;
+    growthPollGraceUntil = 0;
     growthProgressLines = ['开始运行成长任务…'];
     paintGrowthProgress(true);
 
@@ -722,7 +738,11 @@ export function initCredentialPool() {
       // are written just before the command resolves, and the poller may not
       // have ticked since. The freeze flag is set *after* this drain, so those
       // lines are not discarded.
-      await drainProgress();
+      await drainProgress(true);
+      // Keep polling for a short grace window so a line flushed just after the
+      // command resolved still shows up — but stop after it, instead of asking
+      // the backend forever.
+      growthPollGraceUntil = Date.now() + 2000;
       growthRunFinished = true;
       paintGrowthProgress(false);
       if (btn) {
