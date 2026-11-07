@@ -1,5 +1,5 @@
 /**
- * 会话 detail pane: header, usage, gateway join, and the timeline.
+ * 会话 detail pane: compact topbar, timeline, modern input-box footer, and modal metrics.
  *
  * Pure rendering over a `SessionDetail` payload; the fetching and the
  * "load older" bookkeeping live in `sessions/index.js`. Every string that comes
@@ -13,6 +13,7 @@ import {
   formatLocalDateTime,
   formatLongDuration,
   formatNumber,
+  formatTokens,
 } from '../../lib/format.js';
 import { pairResults, renderTimeline } from './entry.js';
 
@@ -39,10 +40,13 @@ function modelsTable(models) {
     )
     .join('');
   return html`
-    <table class="data-table sess-model-table">
-      <thead><tr><th>模型</th><th>回合</th><th>输入</th><th>输出</th><th>缓存读</th></tr></thead>
-      <tbody>${raw(rows)}</tbody>
-    </table>`;
+    <div class="sess-pop-section">
+      <div class="sess-pop-section-title">模型使用分布</div>
+      <table class="data-table sess-model-table">
+        <thead><tr><th>模型</th><th>回合</th><th>输入</th><th>输出</th><th>缓存读</th></tr></thead>
+        <tbody>${raw(rows)}</tbody>
+      </table>
+    </div>`;
 }
 
 /**
@@ -73,10 +77,100 @@ function gatewayBox(detail) {
   return html`<div class="sess-gateway sess-gateway--muted">网关未记录此会话（请求未经过本代理，或未携带会话头）</div>`;
 }
 
-/** The header + usage block, repainted whenever a session is opened. */
-export function renderDetailHeader(detail) {
+/** Pick the most prominent model name for the pill display. */
+function pickPrimaryModel(detail) {
+  if (detail.models && detail.models.length > 0) {
+    // Sort by turns descending to find the main model
+    const sorted = [...detail.models].sort((a, b) => (b.turns || 0) - (a.turns || 0));
+    if (sorted[0]?.model) return sorted[0].model;
+  }
+  return 'Claude 3.5';
+}
+
+/** Calculate overall cache hit percentage if available. */
+function calculateCacheHitPct(tokens) {
+  if (!tokens) return null;
+  const read = Number(tokens.cache_read) || 0;
+  const input = Number(tokens.input) || 0;
+  const total = read + input;
+  if (total <= 0) return null;
+  return Math.round((read / total) * 100);
+}
+
+/** Compact topbar: brief title, path, quick branch/size tags and an info trigger. */
+export function renderCompactHeader(detail) {
   const host = $('#session-detail-head');
   if (!host) return;
+  const s = detail.summary;
+  const path = s.cwd || s.encoded_project || '';
+
+  host.innerHTML = html`
+    <div class="sess-topbar-content">
+      <div class="sess-topbar-info">
+        <span class="sess-topbar-title" title="${s.title}">${s.title}</span>
+        <span class="sess-topbar-sep">·</span>
+        <span class="sess-topbar-path" title="${path}">${path}</span>
+      </div>
+      <div class="sess-topbar-meta">
+        ${raw(s.git_branch ? html`<span class="badge-pill sess-badge-git">${s.git_branch}</span>` : '')}
+        <span class="badge-pill">${formatBytes(s.size_bytes)}</span>
+        <button type="button" class="sess-topbar-btn" id="btn-sess-topbar-stats" title="展开完整指标与详情">
+          <span class="sess-icon">📊</span> 详情
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+/** Render bottom input toolbar model name and bottom status line. */
+export function renderFooterStats(detail) {
+  const s = detail.summary;
+  const primaryModel = pickPrimaryModel(detail);
+
+  // Update model label in the input box
+  const modelLabel = $('#sess-active-model-name');
+  if (modelLabel) {
+    modelLabel.textContent = primaryModel;
+    modelLabel.title = `会话主要模型：${primaryModel}`;
+  }
+
+  // Update bottom status line (referencing the prompt screenshot):
+  // ⏱️ 12 轮 1236 步 · 202 tok/s   🗄️ 425M tok · 缓存命中 99.7%   🕒 16%
+  const turnsCount = s.turns || 0;
+  const stepsCount = s.assistant_turns || 0;
+  const toolCallsCount = s.tool_calls || 0;
+
+  const totalTokens = (detail.tokens?.input || 0) + (detail.tokens?.output || 0) + (detail.tokens?.cache_read || 0);
+  const cacheHit = calculateCacheHitPct(detail.tokens);
+
+  const turnsText = `⏱️ ${turnsCount} 轮 ${stepsCount} 步${toolCallsCount ? ` · ${toolCallsCount} 工具` : ''}`;
+  const tokensText = `🗄️ ${formatTokens(totalTokens)} tok${cacheHit !== null ? ` · 缓存命中 ${cacheHit}%` : ''}`;
+
+  let extraText = '';
+  if (detail.cost_state && detail.cost_state.total_cost_usd > 0) {
+    extraText = `💰 $${detail.cost_state.total_cost_usd.toFixed(4)}`;
+  } else if (detail.gateway?.requests) {
+    extraText = `🌐 网关 ${detail.gateway.requests} 请求`;
+  } else if (s.subagents > 0) {
+    extraText = `🤖 ${s.subagents} 子代理`;
+  } else {
+    extraText = `📦 ${formatBytes(s.size_bytes)}`;
+  }
+
+  const statusBar = $('#sess-status-bar');
+  if (statusBar) {
+    statusBar.innerHTML = html`
+      <span class="sess-status-col">${turnsText}</span>
+      <span class="sess-status-col">${tokensText}</span>
+      <span class="sess-status-col">${extraText}</span>
+    `;
+  }
+}
+
+/** Render the complete detail popup/modal content. */
+export function renderDetailModal(detail) {
+  const body = $('#sess-pop-body');
+  if (!body) return;
   const s = detail.summary;
   const span =
     s.first_seen_ms && s.last_seen_ms
@@ -86,34 +180,50 @@ export function renderDetailHeader(detail) {
     ? html`<div class="sess-gateway-note">Claude Code 自报成本 $${detail.cost_state.total_cost_usd.toFixed(4)} · 用时 ${formatLongDuration(detail.cost_state.total_duration_ms)}</div>`
     : '';
 
-  host.innerHTML = html`
-    <div class="sess-detail-title">${s.title}</div>
-    <div class="sess-detail-path" title="${s.cwd || s.encoded_project}">${s.cwd || s.encoded_project}</div>
-    <div class="sess-detail-tags">
-      ${raw(s.git_branch ? html`<span class="badge-pill">${s.git_branch}</span>` : '')}
-      ${raw(s.version ? html`<span class="badge-pill">v${s.version}</span>` : '')}
-      <span class="badge-pill" title="${s.id}">${s.id.slice(0, 8)}</span>
-      <span class="badge-pill">${formatBytes(s.size_bytes)}</span>
-      ${raw(span ? html`<span class="sess-muted">${span}</span>` : '')}
+  body.innerHTML = html`
+    <!-- 会话基础信息 -->
+    <div class="sess-pop-section">
+      <div class="sess-detail-title">${s.title}</div>
+      <div class="sess-detail-path" title="${s.cwd || s.encoded_project}">${s.cwd || s.encoded_project}</div>
+      <div class="sess-detail-tags">
+        ${raw(s.git_branch ? html`<span class="badge-pill">${s.git_branch}</span>` : '')}
+        ${raw(s.version ? html`<span class="badge-pill">v${s.version}</span>` : '')}
+        <span class="badge-pill" title="${s.id}">ID: ${s.id.slice(0, 8)}</span>
+        <span class="badge-pill">${formatBytes(s.size_bytes)}</span>
+        ${raw(span ? html`<span class="sess-muted">${span}</span>` : '')}
+      </div>
     </div>
 
-    <div class="sess-stats">
-      <div class="sess-kv"><span>人工轮次</span><strong>${s.turns}</strong></div>
-      <div class="sess-kv"><span>助手回合</span><strong>${s.assistant_turns}</strong></div>
-      <div class="sess-kv"><span>工具调用</span><strong>${s.tool_calls}</strong></div>
-      <div class="sess-kv"><span>子代理</span><strong>${s.subagents}</strong></div>
+    <!-- 交互轮次网格 -->
+    <div class="sess-pop-section">
+      <div class="sess-pop-section-title">交互概览</div>
+      <div class="sess-stats">
+        <div class="sess-kv"><span>人工轮次</span><strong>${s.turns}</strong></div>
+        <div class="sess-kv"><span>助手回合</span><strong>${s.assistant_turns}</strong></div>
+        <div class="sess-kv"><span>工具调用</span><strong>${s.tool_calls}</strong></div>
+        <div class="sess-kv"><span>子代理</span><strong>${s.subagents}</strong></div>
+      </div>
     </div>
 
-    <div class="sess-stats">
-      <div class="sess-stats-label">本地记录（来自会话文件）</div>
-      ${raw(tokensRow(detail.tokens))}
-      ${raw(detail.tokens_incl_subagents.output !== detail.tokens.output
-        ? html`<div class="sess-gateway-note">含子代理：输出 ${formatNumber(detail.tokens_incl_subagents.output)}</div>`
-        : '')}
-      ${raw(cost)}
+    <!-- 本地 Token 与成本 -->
+    <div class="sess-pop-section">
+      <div class="sess-pop-section-title">本地记录（来自会话文件）</div>
+      <div class="sess-stats">
+        ${raw(tokensRow(detail.tokens))}
+        ${raw(detail.tokens_incl_subagents.output !== detail.tokens.output
+          ? html`<div class="sess-gateway-note">含子代理：输出 ${formatNumber(detail.tokens_incl_subagents.output)}</div>`
+          : '')}
+        ${raw(cost)}
+      </div>
     </div>
 
-    ${raw(gatewayBox(detail))}
+    <!-- 网关记录 -->
+    <div class="sess-pop-section">
+      <div class="sess-pop-section-title">代理网关记录</div>
+      ${raw(gatewayBox(detail))}
+    </div>
+
+    <!-- 模型分布明细 -->
     ${raw(modelsTable(detail.models))}
   `;
 }
@@ -126,24 +236,49 @@ export function renderTimelineBody(detail, { replace } = {}) {
   if (replace) {
     host.innerHTML = snippet.value;
   } else {
-    // Prepend without moving the viewport: the reader keeps the entry they
-    // were looking at instead of being scrolled to the top of the page.
+    // Prepend without moving the viewport
     host.insertAdjacentHTML('afterbegin', snippet.value);
   }
-  const more = $('#btn-sessions-older');
-  if (more) more.hidden = !detail.has_more;
+
+  // Update top load-more bar
+  const moreBar = $('#session-load-more-bar');
+  const topHint = $('#session-top-hint');
   const count = $('#session-timeline-count');
-  if (count) {
-    count.textContent = `已显示 ${detail.timeline_offset + detail.timeline.length} / ${detail.timeline_total} 条`;
+
+  const loadedCount = detail.timeline_offset + detail.timeline.length;
+  const totalCount = detail.timeline_total;
+
+  if (detail.has_more) {
+    if (moreBar) moreBar.removeAttribute('hidden');
+    if (topHint) topHint.setAttribute('hidden', '');
+    if (count) {
+      count.textContent = `已显示 ${loadedCount} / ${totalCount} 条`;
+    }
+  } else {
+    if (moreBar) moreBar.setAttribute('hidden', '');
+    if (topHint) {
+      topHint.removeAttribute('hidden');
+      const hintText = topHint.querySelector('span');
+      if (hintText) hintText.textContent = `已到达会话开头（共 ${totalCount} 条记录）`;
+    }
   }
 }
 
-/** First paint of a session: header, then the newest page, scrolled to its end. */
+/** First paint of a session: compact header, footer stats, modal data, timeline, scrolled to bottom. */
 export function renderDetail(detail) {
-  renderDetailHeader(detail);
+  renderCompactHeader(detail);
+  renderFooterStats(detail);
+  renderDetailModal(detail);
   renderTimelineBody(detail, { replace: true });
-  const host = $('#session-timeline');
-  if (host) host.scrollTop = host.scrollHeight;
+
+  const scrollHost = $('#session-timeline-scroll');
+  if (scrollHost) {
+    // Ensure scroll jumps to bottom so newest conversation is visible
+    requestAnimationFrame(() => {
+      scrollHost.scrollTop = scrollHost.scrollHeight;
+    });
+  }
+
   $('#session-pane-empty')?.setAttribute('hidden', '');
   $('#session-pane')?.removeAttribute('hidden');
 }
