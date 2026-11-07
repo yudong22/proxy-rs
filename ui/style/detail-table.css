@@ -1,0 +1,52 @@
+/* ── Detail Table (request modal) ─────────────────────────────── */
+
+.detail-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.detail-table td {
+  padding: 6px 4px;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-table tr:last-child td {
+  border-bottom: none;
+}
+
+.detail-key {
+  width: 120px;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.detail-val {
+  color: var(--text);
+  font-family: var(--mono);
+  word-break: break-all;
+}
+
+/* Marks the input-token figure on a failed request as an estimate rather than a
+   counted value. Sits inside `.detail-val`, so it resets that cell's mono/weight
+   and reads as an aside. */
+.detail-estimated {
+  font-size: 10px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.error-block {
+  margin-top: 8px;
+  padding: 10px;
+  background: var(--error-block-bg);
+  border: 1px solid var(--error-block-border);
+  border-radius: var(--radius-sm);
+  color: var(--error);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+}

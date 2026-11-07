@@ -62,243 +62,17 @@ use crate::admin_auth;
 /// deployment is one executable plus a data directory, and a console that 404s
 /// because nobody copied `ui/` next to the binary is a footgun with no upside.
 /// ~360 KB of text, compressed to a few tens of KB by the reverse proxy.
-const ASSETS: &[(&str, &str, &str)] = &[
-    (
-        "/index.html",
-        "text/html; charset=utf-8",
-        include_str!("../ui/index.html"),
-    ),
-    (
-        "/src/main.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/main.js"),
-    ),
-    (
-        "/src/core/api.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/core/api.js"),
-    ),
-    (
-        "/src/core/dom.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/core/dom.js"),
-    ),
-    (
-        "/src/core/ipc.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/core/ipc.js"),
-    ),
-    (
-        "/src/core/state.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/core/state.js"),
-    ),
-    (
-        "/src/lib/format.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/lib/format.js"),
-    ),
-    (
-        "/src/components/confirm.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/components/confirm.js"),
-    ),
-    (
-        "/src/components/modal.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/components/modal.js"),
-    ),
-    (
-        "/src/components/overlay.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/components/overlay.js"),
-    ),
-    (
-        "/src/components/pills.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/components/pills.js"),
-    ),
-    (
-        "/src/components/request-modal.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/components/request-modal.js"),
-    ),
-    (
-        "/src/components/table.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/components/table.js"),
-    ),
-    (
-        "/src/components/toast.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/components/toast.js"),
-    ),
-    (
-        "/src/views/tabs.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/tabs.js"),
-    ),
-    (
-        "/src/views/overview.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/overview.js"),
-    ),
-    (
-        "/src/views/logs.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/logs.js"),
-    ),
-    (
-        "/src/views/sessions/index.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/sessions/index.js"),
-    ),
-    (
-        "/src/views/sessions/list.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/sessions/list.js"),
-    ),
-    (
-        "/src/views/sessions/timeline.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/sessions/timeline.js"),
-    ),
-    (
-        "/src/views/sessions/entry.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/sessions/entry.js"),
-    ),
-    (
-        "/src/views/palette.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/palette.js"),
-    ),
-    (
-        "/src/views/settings/index.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/index.js"),
-    ),
-    (
-        "/src/views/settings/form.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/form.js"),
-    ),
-    (
-        "/src/views/settings/fields.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/fields.js"),
-    ),
-    (
-        "/src/views/settings/load.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/load.js"),
-    ),
-    (
-        "/src/views/settings/save.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/save.js"),
-    ),
-    (
-        "/src/views/settings/badges.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/badges.js"),
-    ),
-    (
-        "/src/views/settings/checkin.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/checkin.js"),
-    ),
-    (
-        "/src/views/settings/client-accounts.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/client-accounts.js"),
-    ),
-    (
-        "/src/views/settings/credential-pool.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/credential-pool.js"),
-    ),
-    (
-        "/src/views/settings/dsh.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/dsh.js"),
-    ),
-    (
-        "/src/views/settings/oauth-qr.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/oauth-qr.js"),
-    ),
-    (
-        "/src/views/settings/pool-transfer.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/pool-transfer.js"),
-    ),
-    (
-        "/src/views/settings/relogin.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/src/views/settings/relogin.js"),
-    ),
-    (
-        "/style/tokens.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/tokens.css"),
-    ),
-    (
-        "/style/base.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/base.css"),
-    ),
-    (
-        "/style/controls.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/controls.css"),
-    ),
-    (
-        "/style/badges.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/badges.css"),
-    ),
-    (
-        "/style/overlays.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/overlays.css"),
-    ),
-    (
-        "/style/layout.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/layout.css"),
-    ),
-    (
-        "/style/cards.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/cards.css"),
-    ),
-    (
-        "/style/logs.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/logs.css"),
-    ),
-    (
-        "/style/views.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/views.css"),
-    ),
-    (
-        "/style/workbuddy.css",
-        "text/css; charset=utf-8",
-        include_str!("../ui/style/workbuddy.css"),
-    ),
-    (
-        "/assets/logo.svg",
-        "image/svg+xml",
-        include_str!("../ui/assets/logo.svg"),
-    ),
-    (
-        "/src/bridge.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../ui/server/bridge.js"),
-    ),
-];
+///
+/// The list itself is **generated by `build.rs`** from `ui/`, not maintained
+/// here. It used to be 47 hand-written triples, which meant every new UI module
+/// needed a matching edit in this file — and forgetting one produced a 404 at
+/// runtime rather than a compile error. Splitting a front-end module is now a
+/// pure `ui/` change. `build.rs` documents the served roots;
+/// `the_asset_manifest_covers_the_ui_tree` below is the guard.
+mod assets {
+    include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
+}
+use assets::ASSETS;
 
 /// Where the console lives in the URL space.
 pub const CONSOLE_PREFIX: &str = "/admin";
@@ -849,3 +623,127 @@ async fn console_fallback(uri: Uri) -> Response {
 /// read without scrolling through Rust.
 const LOGIN_HTML: &str = include_str!("../ui/server/login.html");
 const LOGIN_JS: &str = include_str!("../ui/server/login.js");
+
+#[cfg(test)]
+mod tests {
+    use super::ASSETS;
+
+    /// The generated manifest must cover **every** file a browser could request
+    /// from `ui/`.
+    ///
+    /// `build.rs` compiles the list in, which already means a present file is
+    /// served. This test covers the other direction: a file of a served kind
+    /// that the script skipped — a new extension it does not know, or a root it
+    /// does not walk. Without it, adding `ui/src/views/foo.ts` or a new
+    /// `ui/fonts/` root would ship a console whose asset 404s, and the failure
+    /// would appear in a browser, not in CI.
+    ///
+    /// It walks the same roots `build.rs` documents, so the two must agree.
+    #[test]
+    fn the_asset_manifest_covers_the_ui_tree() {
+        use std::collections::BTreeSet;
+        use std::path::{Path, PathBuf};
+
+        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    walk(&path, out);
+                } else if meta.is_file() && !path.file_name().is_some_and(|n| n == ".DS_Store") {
+                    out.push(path);
+                }
+            }
+        }
+
+        // The served roots, matching `roots` in build.rs.
+        let roots = [
+            ("src", "/src/"),
+            ("style", "/style/"),
+            ("assets", "/assets/"),
+        ];
+        let mut expected: BTreeSet<String> = BTreeSet::new();
+        for (dir, prefix) in roots {
+            let base = ui.join(dir);
+            let mut files = Vec::new();
+            walk(&base, &mut files);
+            for f in files {
+                let rel = f.strip_prefix(&base).expect("under root");
+                let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
+                // Only the kinds the console knows how to label.
+                if !matches!(ext, "js" | "mjs" | "css" | "svg" | "html") {
+                    continue;
+                }
+                expected.insert(format!(
+                    "{prefix}{}",
+                    rel.to_string_lossy().replace('\\', "/")
+                ));
+            }
+        }
+        // The two entries served from routes rather than a same-named directory.
+        expected.insert("/index.html".to_string());
+        expected.insert("/src/bridge.js".to_string());
+
+        let served: BTreeSet<String> = ASSETS
+            .iter()
+            .map(|(url, _, _)| (*url).to_string())
+            .collect();
+
+        let missing: Vec<&String> = expected.difference(&served).collect();
+        assert!(
+            missing.is_empty(),
+            "these ui/ files are not in the compiled-in asset manifest ({missing:?}). \
+             Add their extension/root to `content_type`/`roots` in build.rs."
+        );
+
+        // And nothing is served that does not exist (a stale generated file).
+        let extra: Vec<&String> = served.difference(&expected).collect();
+        assert!(
+            extra.is_empty(),
+            "the manifest serves paths with no file behind them: {extra:?}"
+        );
+    }
+
+    /// Every served asset must be reachable through the console's URL space.
+    ///
+    /// The manifest keys are `/src/...`, but the browser asks for
+    /// `/admin/src/...`. The three wildcard routes strip `/admin` before the
+    /// lookup, so an entry under a *fourth* prefix would compile, be in the
+    /// manifest, and never resolve. This pins the prefixes the router knows.
+    #[test]
+    fn every_asset_lives_under_a_routed_prefix() {
+        for (url, _, _) in ASSETS {
+            assert!(
+                url.starts_with("/src/")
+                    || url.starts_with("/style/")
+                    || url.starts_with("/assets/")
+                    || *url == "/index.html",
+                "{url} is served by no console route"
+            );
+        }
+    }
+
+    /// The shell document must be present and mention the module entry point:
+    /// `console_page` rewrites exactly that `<script>` tag to inject the bridge,
+    /// and a silent miss there would ship a console that loads no JavaScript.
+    #[test]
+    fn the_index_html_carries_the_rewrite_target() {
+        let index = ASSETS
+            .iter()
+            .find(|(url, _, _)| *url == "/index.html")
+            .map(|(_, _, body)| *body)
+            .expect("/index.html must be in the manifest");
+        let needle = "<script type=\"module\" src=\"src/main.js\"></script>";
+        assert!(
+            index.contains(needle),
+            "console_page rewrites {needle:?}; changing index.html must change that too"
+        );
+    }
+}

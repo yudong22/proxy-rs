@@ -1,0 +1,309 @@
+/* ── 会话 view ───────────────────────────────────────────────────────────── */
+/* A two-pane reader inside the standard `.logs-panel` card: the session list
+   on the left, the transcript on the right. Both panes scroll on their own,
+   which is why the pane is `.tab-content--fill`. */
+
+.sess-panel {
+  gap: 0;
+}
+
+.sess-split {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  flex: 1;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+  margin: 0 -16px;
+}
+
+.sess-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+
+.sess-rows {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* A fixed-height row: two lines, titles and paths clipped with an ellipsis.
+   Left to itself a long session title or cwd wraps onto a third line and the
+   list becomes a ragged column; a constant height keeps it scannable. */
+.sess-row {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  width: 100%;
+  /* border-box keeps the declared height the *rendered* height; content-box
+     would add the padding on top of it. */
+  box-sizing: border-box;
+  height: 60px;
+  padding: 0 12px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
+  color: var(--text);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.sess-row:hover {
+  background: var(--surface2);
+}
+
+/* Selection is a background, not a coloured border — the same convention as
+   `.metric-card.active` and the identity pool's default row. */
+.sess-row.active {
+  background: var(--surface2);
+}
+
+.sess-row-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.sess-row-path {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  max-width: 100%;
+}
+
+/* One line of counters; anything that does not fit is clipped, never wrapped. */
+.sess-row-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.sess-row-foot > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.sess-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-tint);
+  color: var(--accent);
+}
+
+.sess-approx {
+  color: var(--muted);
+}
+
+.sess-pager {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.sess-detail {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+}
+
+.sess-detail-container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+}
+
+.sess-detail-container[hidden],
+.sess-pane-empty[hidden] {
+  display: none;
+}
+
+.sess-pane-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sess-empty {
+  padding: 24px 14px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* ── Topbar: compact session info ─────────────────────────────── */
+
+.sess-detail-topbar {
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.sess-topbar-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.sess-topbar-info {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.sess-topbar-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+  max-width: 320px;
+}
+
+.sess-topbar-sep {
+  color: var(--border);
+  font-size: 12px;
+}
+
+.sess-topbar-path {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+
+.sess-topbar-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.sess-topbar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.sess-topbar-btn:hover {
+  background: var(--bg);
+  border-color: var(--accent);
+}
+
+/* ── Timeline scrolling container ─────────────────────────────── */
+
+.sess-timeline-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.sess-load-more-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 16px 4px;
+  flex-shrink: 0;
+}
+
+.sess-btn-load-more {
+  border-radius: 16px;
+  padding: 4px 14px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--accent);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sess-btn-load-more:hover:not(:disabled) {
+  background: var(--accent-tint);
+  border-color: var(--accent);
+}
+
+.sess-btn-load-more:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.sess-load-more-count {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.sess-top-hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px 16px 4px;
+  font-size: 11px;
+  color: var(--muted);
+  user-select: none;
+}
+
+.sess-top-hint span {
+  position: relative;
+  padding: 0 10px;
+  background: var(--bg);
+}
+
+.sess-timeline {
+  flex: 1 0 auto;
+  padding: 12px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+

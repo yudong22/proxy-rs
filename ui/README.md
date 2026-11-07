@@ -38,9 +38,24 @@ ui/
 | 5 | `overlays.css` | 模态、确认框、Toast、命令面板，以及通用工具类 | `base` |
 | 6 | `layout.css` | 应用外壳：`.app` / `.header` / `.tabs` / `.tab-content` | `base` |
 | 7 | `cards.css` | `.metric-card`、`.section`、`.kv`、`.speed-sessions` | `controls`、`badges` |
-| 8 | `logs.css` | 日志面板 chrome、`.data-table`、控制台、详情表 | `cards` |
-| 9 | `views.css` | 视图级规则：设置表单、日志视图等 | 以上全部 |
-| 10 | `workbuddy.css` | WorkBuddy 账号池 / 扫码 / 打卡报告 | 以上全部 |
+| 8 | `logs.css` | 日志面板 chrome、工具条、视图切换 | `cards` |
+| 9 | `logs-data-table.css` | 日志列表表格（`.data-table`）与外层滚动 | `logs` |
+| 10 | `logs-console.css` | 控制台日志视图 | `logs` |
+| 11 | `detail-table.css` | 请求详情弹窗内的键值表 | `logs` |
+| 12 | `view-overview.css` | 概览页下钻 | 以上全部 |
+| 13 | `view-settings.css` | 设置表单（分组、字段、chips、保存条） | 以上全部 |
+| 14 | `view-logs.css` | 日志视图层 | 以上全部 |
+| 15 | `view-sessions.css` | 会话双栏、列表行、徽标、分页、顶栏 | 以上全部 |
+| 16 | `view-sessions-composer.css` | 会话详情：输入框与指标浮层 | `view-sessions` |
+| 17 | `view-sessions-transcript.css` | 会话详情：时间线正文 | `view-sessions` |
+| 18 | `wb-pool.css` | 身份池表格、拖拽排序、自动化对话框 | 以上全部 |
+| 19 | `wb-qr.css` | 扫码登录二维码 | `wb-pool` |
+| 20 | `wb-report.css` | 打卡 / 成长报告 | `wb-pool` |
+
+> 层叠顺序是语义的一部分：`logs.css` 原来的位置展开成 8–11，`views.css`
+> 展开成 12–17，`workbuddy.css` 展开成 18–20。**拆文件时新文件名必须同时进
+> `ui/index.html` 与 `ui/tools/check-ui.mjs` 的 `CASCADE` 数组**，否则
+> `task ui-check` 会失败。
 
 ### 硬性规则
 

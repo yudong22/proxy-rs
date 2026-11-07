@@ -1,0 +1,247 @@
+/* ── Settings: form ───────────────────────────────────────────── */
+
+/* A plain block, not a card. Every group inside is already its own framed card
+   (`details.form-section` / `.form-section--fixed`), so a frame here would draw
+   a box around boxes. The page's 16px padding (from `.tab-content`) is the only
+   outer spacing it needs.
+   Deliberately NOT `display: flex`: these groups rely on adjacent vertical
+   margins collapsing (each carries `margin-bottom`, the save bar carries
+   `margin-top`), which a flex column would stop doing and so double every gap. */
+.settings-form {
+  display: block;
+}
+
+/* Each settings group is a <details>, so it collapses without any JS. The
+   native disclosure triangle is replaced by a rotating "▾" in the summary.
+   Written as `details.form-section` rather than `fieldset.form-section` so the
+   markup that `views/settings.js` builds matches the rules here. */
+details.form-section {
+  border: 1px solid var(--border);
+  /* Same radius as the page cards elsewhere (`.section` / `.logs-panel`): these
+     groups *are* this page's cards, so a different corner radius reads as a
+     different kind of object. */
+  border-radius: var(--radius);
+  padding: 0;
+  margin-bottom: 14px;
+  overflow: hidden;
+  /* White like every other card. `transparent` let the grey page background
+     through, so the body of each group looked recessed next to the overview's
+     cards instead of matching them. */
+  background: var(--surface);
+  /* `.section` and `.logs-panel` both carry this; the settings page used to get
+     its elevation from the outer `.settings-form` frame, which is now gone. */
+  box-shadow: var(--shadow-sm);
+}
+
+details.form-section > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface2);
+  list-style: none;
+  user-select: none;
+}
+
+/* WebKit renders its own marker; remove it in favour of .form-section-caret. */
+details.form-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.form-section > summary:hover {
+  color: var(--text);
+}
+
+/* A CSS triangle rather than a glyph: "▾" renders at inconsistent sizes and
+   baselines across the fonts this app can land on (and in the webview's
+   fallback), so the marker is drawn instead of typed. Points right while
+   collapsed, down while open — the state reads without colour or weight. */
+.form-section-caret {
+  width: 0;
+  height: 0;
+  flex: 0 0 auto;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  transition: transform .15s;
+}
+
+.form-section[open] > summary .form-section-caret {
+  transform: rotate(90deg);
+}
+
+details.form-section[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+
+/* Appended to a collapsed group's title when it holds a non-default value, so
+   a changed setting is visible without expanding the group. */
+.form-section-badge {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--accent);
+  background: var(--accent-tint);
+  border: 1px solid var(--accent-tint-border);
+  border-radius: 10px;
+  padding: 1px 7px;
+}
+
+.form-section-body {
+  padding: 12px 14px;
+}
+
+/* A non-collapsible group (身份池): the same card frame and the same heading row
+   as a `<summary>`, but static — no `<details>`, no caret, nothing to fold away.
+   Sharing the border/radius/background/margins keeps it visually one of the set
+   (and matching the `.section` cards on the other pages). */
+.form-section--fixed {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0;
+  margin-bottom: 14px;
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.form-section--fixed > .form-section-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.form-group {
+  margin-bottom: 10px;
+}
+
+.form-group:last-child {
+  margin-bottom: 0;
+}
+
+.form-group label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.form-group input, .form-group select {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  font-family: inherit;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.form-group input:focus, .form-group select:focus {
+  border-color: var(--accent);
+}
+
+.form-row {
+  display: flex;
+  gap: 12px;
+}
+
+.form-row .half {
+  flex: 1;
+}
+
+.input-with-btn {
+  display: flex;
+  gap: 4px;
+  width: 100%;
+}
+
+.input-with-btn input {
+  flex: 1;
+}
+
+.setting-item-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.setting-item-inline:last-child {
+  padding-bottom: 0;
+}
+
+.setting-label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.setting-desc {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.models-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.model-chip {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+  font-size: 11px;
+  font-family: var(--mono);
+  cursor: pointer;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.model-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Per-model 积分 ratio and free badge rendered next to the model id in the
+   picker. The ratio is dimmed so the id stays the focal point; the badge is
+   tinted to read as "free". */
+.model-chip small {
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.model-chip small.ratio {
+  color: var(--accent);
+}
+
+.model-chip small.badge {
+  color: var(--ok, #2fae66);
+  font-weight: 600;
+}
+
+.settings-save-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+

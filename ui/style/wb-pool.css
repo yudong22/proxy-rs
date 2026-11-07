@@ -1,0 +1,316 @@
+/* WorkBuddy pools, QR modal and check-in report. */
+
+/* ── WorkBuddy credential pool (settings) ───────────────────────── */
+
+.wb-credential-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wb-credential-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.wb-credential-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+  /* The row is `space-between` with three children once the drag handle exists
+   * (handle, main, actions). Without this the main block floats to the centre
+   * instead of hugging the handle, which reads as the account list being
+   * centre-aligned while API-key rows (two children, no handle) stay left. */
+  flex: 1 1 auto;
+  justify-content: flex-start;
+}
+
+.wb-credential-label {
+  font-weight: 600;
+}
+
+.wb-credential-id {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.wb-credential-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.wb-state-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+}
+
+/* State pills reuse the semantic tints rather than repeating the palette.
+ *
+ * These were hardcoded `rgba()`/hex, which meant they kept their light-mode
+ * colours under `prefers-color-scheme: dark` — on a dark surface the ok/cooldown
+ * pills washed out and the expired pill lost its red. The tokens carry a value
+ * per theme, so the pill follows the theme for free. */
+.wb-state-pill.wb-state-ok {
+  background: var(--success-tint);
+  color: var(--success-ink);
+  border: 1px solid var(--success-tint-border);
+}
+
+.wb-state-pill.wb-state-cooldown {
+  background: var(--warning-tint);
+  color: var(--warning-ink);
+  border: 1px solid var(--warning-tint-border);
+}
+
+.wb-state-pill.wb-state-expired {
+  background: var(--error-tint);
+  color: var(--error-ink);
+  border: 1px solid var(--error-tint-border);
+}
+
+.wb-state-pill.wb-state-disabled {
+  background: var(--neutral-tint);
+  color: var(--muted);
+  border: 1px solid var(--neutral-tint-border);
+}
+
+/* Already done today: not a failure, so it takes the accent tone rather than
+   the error red the "失败" pill uses. */
+.wb-state-pill.wb-state-pending {
+  background: var(--accent-tint);
+  color: var(--accent-ink);
+  border: 1px solid var(--accent-tint-border);
+}
+
+.wb-sticky-note {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+#wb-status.error {
+  color: var(--error);
+}
+
+.wb-pool-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0 12px 0;
+}
+
+.wb-manual-section {
+  padding: 12px;
+  background: var(--neutral-tint);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+/* ── WorkBuddy schedule row ─────────────────────────────────────── */
+
+/* The page-side row that opens the automation dialog and states what is
+   currently running. `is-on` is the load-bearing part: an automation left ON is
+   invisible once its dialog is closed, and an invisible unattended job is the
+   one a user forgets is touching their accounts. */
+.wb-auto-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.wb-auto-row .wb-schedule-hint.is-on {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.wb-schedule-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.wb-checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.wb-time-input {
+  width: 110px;
+}
+
+.wb-schedule-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ── WorkBuddy API key pool ─────────────────────────────────────── */
+
+/* Unified default-identity selector (accounts + keys in one). */
+.wb-default-identity-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+  padding: 8px 10px;
+  background: var(--accent-tint);
+  border: 1px solid var(--accent-tint-border);
+  border-radius: 8px;
+}
+
+.wb-default-identity-row label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.wb-default-identity-select {
+  min-width: 240px;
+  max-width: 380px;
+  padding: 5px 8px;
+}
+
+.wb-default-key-hint {
+  font-size: 11px;
+}
+
+/* Type marker distinguishing an account (login state) from an API key. */
+.wb-type-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+
+.wb-type-account {
+  background: var(--identity-account-tint);
+  color: var(--identity-account-ink);
+  border: 1px solid var(--identity-account-border);
+}
+
+.wb-type-key {
+  background: var(--identity-key-tint);
+  color: var(--identity-key-ink);
+  border: 1px solid var(--identity-key-border);
+}
+
+.wb-key-add-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.wb-key-input {
+  width: 240px;
+}
+
+.wb-label-input {
+  width: 140px;
+}
+
+/* Default-account / default-key marker. Accent-tinted so it reads as a
+   selection state rather than as another status pill. */
+.wb-default-pill {
+  background: var(--accent-tint);
+  color: var(--accent-ink);
+  border: 1px solid var(--accent-tint-border);
+  font-size: 10px;
+  padding: 1px 6px;
+}
+
+/* The row that holds the default identity.
+ *
+ * Marked by surface, not by an accent outline: an accent border made one row of
+ * the pool look like a different *kind* of object from its neighbours, and it
+ * competed with the accent-tinted pills inside the row. `--surface2` is the
+ * app's established selected-surface ( `.metric-card.expandable.active` on the
+ * overview uses the same pair), so a selected pool row now reads the same way a
+ * selected card does. */
+.wb-credential-row--default {
+  background: var(--surface2);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Growth-run progress output.
+ *
+ * A live log rather than a spinner: a full-pool run reports per-account and
+ * per-task results, and seeing "which account is it on" is what makes a long
+ * run tolerable. Monospace + `pre-wrap` keeps the indentation of the per-task
+ * lines, and `max-height` stops a 20-task run from pushing the pool list off
+ * screen. */
+.wb-growth-progress {
+  margin: 8px 0;
+  padding: 8px 10px;
+  max-height: 140px;
+  overflow-y: auto;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--muted);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.wb-points {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+/* ── Drag-to-reorder the credential pool ──────────────────────────
+ *
+ * The row order *is* the failover priority (the pool tries credentials
+ * top-down), so the affordance has to look draggable without pretending every
+ * row is a control: a grip on the left, a grab cursor, and an accent line where
+ * the row will land. Colours come from tokens so dark mode follows. */
+.wb-credential-row--draggable {
+  cursor: grab;
+}
+
+.wb-credential-row--dragging {
+  opacity: .45;
+  /* No transition on the dragged row: a moving ghost under the pointer reads as
+   * lag rather than feedback. */
+}
+
+.wb-credential-row--drop-target {
+  /* An inset accent bar rather than a border: adding a border would shift the
+   * row's layout by its width and make the whole list jump while dragging. */
+  box-shadow: inset 0 2px 0 0 var(--accent);
+  border-color: var(--accent-tint-border);
+}
+
+.wb-drag-handle {
+  /* Sits flush with the row's left padding so every row's text starts at the
+   * same x whether or not it is draggable. */
+  margin-left: -2px;
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: -2px;
+  line-height: 1;
+  user-select: none;
+  flex: 0 0 auto;
+}
+
