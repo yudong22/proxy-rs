@@ -116,11 +116,17 @@ fn test_router() -> axum::Router {
 
 /// A fresh state for tests that only need the login route.
 fn test_state() -> Arc<AdminState> {
+    test_state_with_auth(Arc::new(ClientAuthState::disabled()))
+}
+
+/// A state whose live inbound gate is injectable, so a test can inspect it
+/// *after* a settings save without reaching into the router.
+fn test_state_with_auth(client_auth: Arc<ClientAuthState>) -> Arc<AdminState> {
     Arc::new(AdminState {
         sessions: Arc::new(AdminSessions::new()),
         stats: StatsDb::in_memory().expect("in-memory sqlite"),
         logs: Arc::new(LogBuffer::new(200)),
-        client_auth: Arc::new(ClientAuthState::disabled()),
+        client_auth,
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
@@ -1048,4 +1054,105 @@ async fn a_failed_form_login_keeps_the_landing_tab() {
         .unwrap_or("");
     assert!(loc.contains("e=invalid_token"), "{loc}");
     assert!(loc.ends_with("&next=logs"), "{loc}");
+}
+
+// ── BUG-1 regression: saving client_auth_enabled must hot-apply ───────────
+
+/// Both server surfaces (RPC + REST) must update the *live* inbound gate, not
+/// just the settings file. Before the fix, `admin::save_settings` only wrote
+/// the file, so the switch reported success while the data plane stayed open.
+///
+/// The gate starts disabled; a save with `client_auth_enabled: true` must flip
+/// `is_enabled()` on the very same `Arc` the middleware reads.
+#[tokio::test]
+async fn saving_settings_hot_applies_the_inbound_gate_via_rpc() {
+    let _iso = isolate("hot-apply-rpc", Some("tok")).await;
+    // `enabled_from` honours PROXY_CLIENT_AUTH from the env; keep the test
+    // deterministic by removing any override (GLOBAL_LOCK serialises us).
+    std::env::remove_var("PROXY_CLIENT_AUTH");
+
+    let auth = Arc::new(ClientAuthState::disabled());
+    let state = test_state_with_auth(auth.clone());
+    let app = app_for(state);
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    assert!(!auth.is_enabled(), "gate starts disabled");
+    let (status, body) = post_rpc(
+        app.clone(),
+        "save_settings",
+        &json!({ "body": { "client_auth_enabled": true } }).to_string(),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        auth.is_enabled(),
+        "the live gate must be enabled right after the save, without a restart"
+    );
+
+    // An unrelated save must not silently turn the feature back off.
+    let (status, body) = post_rpc(
+        app,
+        "save_settings",
+        &json!({ "body": { "sanitize_terms": "x" } }).to_string(),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        auth.is_enabled(),
+        "an unrelated save must keep the saved flag"
+    );
+}
+
+#[tokio::test]
+async fn saving_settings_hot_applies_the_inbound_gate_via_rest() {
+    let _iso = isolate("hot-apply-rest", Some("tok")).await;
+    std::env::remove_var("PROXY_CLIENT_AUTH");
+
+    let auth = Arc::new(ClientAuthState::disabled());
+    let state = test_state_with_auth(auth.clone());
+    let app = app_for(state);
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, body, _) = call(
+        app,
+        "POST",
+        "/admin/api/settings",
+        Some(&cookie),
+        Some(json!({ "client_auth_enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(auth.is_enabled(), "REST save must hot-apply too");
+}
+
+// ── BUG-2 regression: the reissue command must exist on the desktop ───────
+
+/// The shared settings view calls `client_account_reissue`; the server RPC has
+/// it, but the desktop `generate_handler!` list did not, so the button always
+/// failed there. Guard the command-name set by source-parsing the registration
+/// list — a runtime dispatch test cannot see the desktop binary.
+#[test]
+fn the_desktop_registers_every_client_account_command_the_ui_calls() {
+    let main = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src-tauri/src/main.rs"),
+    )
+    .expect("src-tauri/src/main.rs must be readable");
+    let handler = main
+        .split("tauri::generate_handler![")
+        .nth(1)
+        .and_then(|s| s.split("])").next())
+        .unwrap_or("");
+    for cmd in [
+        "client_account_create",
+        "client_account_toggle",
+        "client_account_delete",
+        "client_account_reissue",
+    ] {
+        assert!(
+            handler.contains(cmd),
+            "{cmd} missing from the desktop generate_handler! list"
+        );
+    }
 }

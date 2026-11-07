@@ -223,6 +223,30 @@ pub fn save_settings(update: SettingsUpdate) -> Result<Value> {
     Ok(settings_json())
 }
 
+/// Hot-apply the inbound access-key gate after a settings save.
+///
+/// `ClientAuthState` is built once at process start and deliberately not rebuilt
+/// on a proxy restart (it holds the throttled `last_used_ms` bookkeeping), so
+/// persisting the switch alone is not enough: without this call the GUI would
+/// report success while the data plane kept accepting keyless requests until a
+/// full restart. Both the desktop and the server console call this, so the
+/// "save means live" rule exists in exactly one place.
+///
+/// The flag is read back from the saved settings file rather than passed in:
+/// `SettingsUpdate.client_auth_enabled` is optional, so an unrelated save must
+/// not silently turn the feature off, and neither caller should have to
+/// remember to fold in the `PROXY_CLIENT_AUTH` env override. That folding
+/// happens here via [`client_accounts::enabled_from`].
+///
+/// `set_enabled` changes the live flag; `reload_from_store` re-reads the account
+/// list (but *not* the flag, which is held in an `AtomicBool`). Both matter.
+pub async fn hot_apply_client_auth(state: &Arc<crate::client_accounts::ClientAuthState>) {
+    let stored_flag = GuiSettings::load().client_auth_enabled;
+    let enabled = client_accounts::enabled_from(stored_flag);
+    state.set_enabled(enabled);
+    state.reload_from_store().await;
+}
+
 // ── Identity pool ──────────────────────────────────────────────────────────
 
 /// Masked view of one credential, shaped exactly like the desktop console's row.
