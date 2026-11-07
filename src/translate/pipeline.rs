@@ -83,6 +83,8 @@ pub fn translate_request(
         openai_messages.extend(core::translate_message(msg)?);
     }
 
+    openai_messages = normalize_message_sequence(openai_messages);
+
     let tools = req.tools.and_then(|tools| {
         let mut seen = std::collections::HashSet::new();
         let filtered: Vec<_> = tools
@@ -742,6 +744,176 @@ pub(crate) fn sanitize_openai_request(req: &mut openai::OpenAIRequest) {
             sanitize_tool_calls(calls);
         }
     }
+}
+
+/// Merges multiple `openai::MessageContent` values into a single `MessageContent`.
+///
+/// If all parts are text, they are joined with double newlines (`\n\n`).
+/// If image parts are present, all content parts are flattened into `MessageContent::Parts`.
+/// Returns `None` if the merged parts are empty.
+fn merge_message_contents(contents: Vec<openai::MessageContent>) -> Option<openai::MessageContent> {
+    let mut all_parts = Vec::new();
+    for content in contents {
+        match content {
+            openai::MessageContent::Text(t) => {
+                if !t.is_empty() {
+                    all_parts.push(openai::ContentPart::Text { text: t });
+                }
+            }
+            openai::MessageContent::Parts(parts) => {
+                for p in parts {
+                    match p {
+                        openai::ContentPart::Text { text } => {
+                            if !text.is_empty() {
+                                all_parts.push(openai::ContentPart::Text { text });
+                            }
+                        }
+                        img @ openai::ContentPart::ImageUrl { .. } => {
+                            all_parts.push(img);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if all_parts.is_empty() {
+        return None;
+    }
+
+    let all_text = all_parts
+        .iter()
+        .all(|p| matches!(p, openai::ContentPart::Text { .. }));
+    if all_text {
+        let joined = all_parts
+            .into_iter()
+            .filter_map(|p| match p {
+                openai::ContentPart::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if joined.is_empty() {
+            None
+        } else {
+            Some(openai::MessageContent::Text(joined))
+        }
+    } else {
+        Some(openai::MessageContent::Parts(all_parts))
+    }
+}
+
+/// Normalizes an OpenAI message sequence to conform strictly to OpenAI turn-taking rules.
+///
+/// 1. Merges adjacent consecutive `assistant` messages into a single `assistant` message:
+///    - Text contents are joined with double newlines.
+///    - `reasoning_content` chunks are joined with double newlines.
+///    - `tool_calls` are concatenated, stripping empty or corrupted tool calls (empty id / empty name).
+/// 2. Aligns and orders following `tool` messages strictly matching the `tool_calls` order:
+///    - If a tool call has no matching tool result, a synthetic stub `[result omitted]` is added
+///      so strict upstreams (MiniMax 11133 / GLM 11133) do not reject incomplete tool records.
+///    - Out-of-order tool results are reordered to match the tool_calls definition.
+///    - Orphan tool messages (results for uncalled tools or tool messages without preceding assistant)
+///      are pruned to prevent upstream 11148 ("tool calls and tool results do not match").
+pub fn normalize_message_sequence(messages: Vec<openai::Message>) -> Vec<openai::Message> {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut i = 0;
+
+    while i < messages.len() {
+        if messages[i].role == "assistant" {
+            let mut merged_contents = Vec::new();
+            let mut merged_reasoning = Vec::new();
+            let mut merged_tool_calls = Vec::new();
+
+            while i < messages.len() && messages[i].role == "assistant" {
+                let curr = &messages[i];
+                if let Some(content) = &curr.content {
+                    merged_contents.push(content.clone());
+                }
+                if let Some(rc) = &curr.reasoning_content {
+                    if !rc.is_empty() {
+                        merged_reasoning.push(rc.clone());
+                    }
+                }
+                if let Some(tcs) = &curr.tool_calls {
+                    for tc in tcs {
+                        if !tc.id.trim().is_empty() && !tc.function.name.trim().is_empty() {
+                            merged_tool_calls.push(tc.clone());
+                        }
+                    }
+                }
+                i += 1;
+            }
+
+            let final_content = merge_message_contents(merged_contents);
+            let final_reasoning = if merged_reasoning.is_empty() {
+                None
+            } else {
+                Some(merged_reasoning.join("\n\n"))
+            };
+            let has_tools = !merged_tool_calls.is_empty();
+
+            if final_content.is_none() && final_reasoning.is_none() && !has_tools {
+                continue;
+            }
+
+            normalized.push(openai::Message {
+                role: "assistant".to_string(),
+                content: final_content,
+                reasoning_content: final_reasoning,
+                tool_calls: if has_tools {
+                    Some(merged_tool_calls.clone())
+                } else {
+                    None
+                },
+                tool_call_id: None,
+                name: None,
+            });
+
+            if has_tools {
+                let mut tool_results_by_id: std::collections::HashMap<String, Vec<openai::Message>> =
+                    std::collections::HashMap::new();
+                while i < messages.len() && messages[i].role == "tool" {
+                    if let Some(id) = &messages[i].tool_call_id {
+                        let trimmed = id.trim();
+                        if !trimmed.is_empty() {
+                            tool_results_by_id
+                                .entry(trimmed.to_string())
+                                .or_default()
+                                .push(messages[i].clone());
+                        }
+                    }
+                    i += 1;
+                }
+
+                for tc in &merged_tool_calls {
+                    if let Some(list) = tool_results_by_id.get_mut(&tc.id) {
+                        if !list.is_empty() {
+                            normalized.push(list.remove(0));
+                            continue;
+                        }
+                    }
+                    normalized.push(openai::Message {
+                        role: "tool".to_string(),
+                        content: Some(openai::MessageContent::Text("[result omitted]".to_string())),
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                        name: None,
+                    });
+                }
+            } else {
+                while i < messages.len() && messages[i].role == "tool" {
+                    i += 1;
+                }
+            }
+        } else {
+            normalized.push(messages[i].clone());
+            i += 1;
+        }
+    }
+
+    normalized
 }
 
 #[cfg(test)]
@@ -2080,5 +2252,268 @@ mod tests {
             !out.chars().any(|c| c == '\u{200B}' || c == '\u{FEFF}'),
             "replacement must not smuggle zero-width characters: {out:?}"
         );
+    }
+
+    #[test]
+    fn normalize_message_sequence_merges_adjacent_assistants_with_text_and_tools() {
+        let input = vec![
+            openai::Message {
+                role: "user".to_string(),
+                content: Some(openai::MessageContent::Text("hello".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            openai::Message {
+                role: "assistant".to_string(),
+                content: Some(openai::MessageContent::Text("I will run bash:".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            openai::Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![openai::ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: openai::FunctionCall {
+                        name: "Bash".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+            openai::Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![openai::ToolCall {
+                    id: "call_2".to_string(),
+                    call_type: "function".to_string(),
+                    function: openai::FunctionCall {
+                        name: "Read".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+            openai::Message {
+                role: "tool".to_string(),
+                content: Some(openai::MessageContent::Text("result 2".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("call_2".to_string()),
+                name: None,
+            },
+            openai::Message {
+                role: "tool".to_string(),
+                content: Some(openai::MessageContent::Text("result 1".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                name: None,
+            },
+        ];
+
+        let normalized = normalize_message_sequence(input);
+        assert_eq!(normalized.len(), 4); // user, assistant, tool(call_1), tool(call_2)
+
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[1].role, "assistant");
+        assert_eq!(
+            normalized[1].content,
+            Some(openai::MessageContent::Text("I will run bash:".to_string()))
+        );
+        let calls = normalized[1].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[1].id, "call_2");
+
+        // Tool messages must be reordered strictly to match call_1, then call_2
+        assert_eq!(normalized[2].role, "tool");
+        assert_eq!(normalized[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(
+            normalized[2].content,
+            Some(openai::MessageContent::Text("result 1".to_string()))
+        );
+
+        assert_eq!(normalized[3].role, "tool");
+        assert_eq!(normalized[3].tool_call_id.as_deref(), Some("call_2"));
+        assert_eq!(
+            normalized[3].content,
+            Some(openai::MessageContent::Text("result 2".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalize_message_sequence_adds_stubs_for_missing_tool_results_and_drops_orphans() {
+        let input = vec![
+            openai::Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![
+                    openai::ToolCall {
+                        id: "call_a".to_string(),
+                        call_type: "function".to_string(),
+                        function: openai::FunctionCall {
+                            name: "Bash".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                    openai::ToolCall {
+                        id: "call_b".to_string(),
+                        call_type: "function".to_string(),
+                        function: openai::FunctionCall {
+                            name: "Read".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+                name: None,
+            },
+            // Only call_a has a tool result, plus an orphan call_x
+            openai::Message {
+                role: "tool".to_string(),
+                content: Some(openai::MessageContent::Text("res a".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("call_a".to_string()),
+                name: None,
+            },
+            openai::Message {
+                role: "tool".to_string(),
+                content: Some(openai::MessageContent::Text("orphan".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("call_x".to_string()),
+                name: None,
+            },
+        ];
+
+        let normalized = normalize_message_sequence(input);
+        assert_eq!(normalized.len(), 3); // assistant, tool(call_a), tool(call_b stub)
+
+        assert_eq!(normalized[1].tool_call_id.as_deref(), Some("call_a"));
+        assert_eq!(
+            normalized[1].content,
+            Some(openai::MessageContent::Text("res a".to_string()))
+        );
+
+        // call_b was missing, must have a stub
+        assert_eq!(normalized[2].tool_call_id.as_deref(), Some("call_b"));
+        assert_eq!(
+            normalized[2].content,
+            Some(openai::MessageContent::Text("[result omitted]".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalize_message_sequence_prunes_empty_tool_calls_and_merges_reasoning() {
+        let input = vec![
+            openai::Message {
+                role: "assistant".to_string(),
+                content: Some(openai::MessageContent::Text("First".to_string())),
+                reasoning_content: Some("think 1".to_string()),
+                tool_calls: Some(vec![openai::ToolCall {
+                    id: "".to_string(),
+                    call_type: "function".to_string(),
+                    function: openai::FunctionCall {
+                        name: "".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+            openai::Message {
+                role: "assistant".to_string(),
+                content: Some(openai::MessageContent::Text("Second".to_string())),
+                reasoning_content: Some("think 2".to_string()),
+                tool_calls: Some(vec![openai::ToolCall {
+                    id: "valid_id".to_string(),
+                    call_type: "function".to_string(),
+                    function: openai::FunctionCall {
+                        name: "valid_tool".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+            openai::Message {
+                role: "tool".to_string(),
+                content: Some(openai::MessageContent::Text("valid res".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("valid_id".to_string()),
+                name: None,
+            },
+        ];
+
+        let normalized = normalize_message_sequence(input);
+        assert_eq!(normalized.len(), 2); // assistant, tool(valid_id)
+
+        assert_eq!(
+            normalized[0].content,
+            Some(openai::MessageContent::Text("First\n\nSecond".to_string()))
+        );
+        assert_eq!(
+            normalized[0].reasoning_content,
+            Some("think 1\n\nthink 2".to_string())
+        );
+        let calls = normalized[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "valid_id");
+        assert_eq!(calls[0].function.name, "valid_tool");
+    }
+
+    #[test]
+    fn normalize_message_sequence_is_idempotent() {
+        let input = vec![
+            openai::Message {
+                role: "user".to_string(),
+                content: Some(openai::MessageContent::Text("go".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            openai::Message {
+                role: "assistant".to_string(),
+                content: Some(openai::MessageContent::Text("ok".to_string())),
+                reasoning_content: None,
+                tool_calls: Some(vec![openai::ToolCall {
+                    id: "c1".to_string(),
+                    call_type: "function".to_string(),
+                    function: openai::FunctionCall {
+                        name: "Bash".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+            openai::Message {
+                role: "tool".to_string(),
+                content: Some(openai::MessageContent::Text("done".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("c1".to_string()),
+                name: None,
+            },
+        ];
+
+        let once = normalize_message_sequence(input);
+        let twice = normalize_message_sequence(once.clone());
+
+        assert_eq!(format!("{:?}", once), format!("{:?}", twice));
     }
 }

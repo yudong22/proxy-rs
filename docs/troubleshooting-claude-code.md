@@ -148,3 +148,29 @@ Claude Code 默认会把内置的所有工具（Bash, Edit, Read, Write, Glob, G
 ### 3. 网关日志监控与状态检查
 - 请求头日志已内置：代理在收到所有 `/v1/messages` 和 `/v1/models` 请求时，均会在 `~/.proxy-rs/logs/proxy.log` 中记录 `POST /v1/messages headers: ...`，方便随时比对不同客户端的 Header。
 - 若遇到 `503 Service Unavailable: Proxy service is paused from the console`，说明服务处于暂停状态，在 macOS 顶部状态栏托盘或桌面 GUI 客户端中点击“恢复/启动代理”即可。
+
+---
+
+## 6. 上游模型校验拦截：Code 11133 与 11148（工具历史形态不合规）
+
+### 1) 现象与特征
+在 Claude Code 会话历史中存在并行工具调用（tool_use）时，使用 `minimax-m3.1-flash` 或 `glm-5.3-flashx` 等严格模型节点常返回 HTTP 400：
+```text
+UPSTREAM ERROR ... HTTP 400 · code 11133 the request parameters were rejected by the model provider
+// 或
+UPSTREAM ERROR ... HTTP 400 · code 11148 tool calls and tool results do not match
+```
+而在同样会话下换用 `hy4free` / `deepseek-v4.1-flash` 却能正常工作，且新建空会话也能正常工作。
+
+### 2) 根因剖析
+- **区分 11128 与 11133**：`11128` 是网关 WAF 安全策略/敏感词拦截；`11133` / `11148` 是**模型提供方对 OpenAI 消息序列与工具调用闭环规范的严格校验拦截**。
+- Claude Code 的 Anthropic 会话结构中，并发工具调用常拆分为多个消息块，甚至连续出现多个 `assistant` 消息（例如纯文本前导说明后跟工具调用）。直接按 1:1 翻译会产生连续的 `assistant` 消息，以及 `tool_result` 顺序与 `tool_calls` 不一致的情况。
+- 此外，Claude Code 在特定异常重试后，可能会在历史中残留 `id` 为空或函数名为空的伪 tool 调用。
+- 宽松节点对上述畸形格式予以宽容，而严格模型节点会判定参数非法并拒收。
+
+### 3) 代理内置解决方案（消息序列归一化器）
+代理在翻译管道中内置了纯函数 `normalize_message_sequence`：
+1. **合并相邻连续 assistant 消息**：自动拼接文本内容与 `reasoning_content`，合并并发 `tool_calls`，消除连续同角色助手消息。
+2. **过滤畸形伪工具调用**：剥离 `id` 为空或 `name` 为空的无效调用，防止触犯函数命名规范。
+3. **严格重排与闭环 tool 响应**：按当前助手消息中 `tool_calls` 的声明顺序重排后续的 `tool` 结果消息；若存在缺失结果自动补齐 `[result omitted]` 占位，若存在孤儿结果安全丢弃，确保完整闭环。
+4. **确定性保缓存**：整个归一化算法为无副作用纯函数，历史前缀归一化后字节完全稳定，不会破坏上游 Prompt Cache。

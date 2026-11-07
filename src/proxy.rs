@@ -1134,6 +1134,11 @@ async fn forward_request(
         pipeline::sanitize_openai_request(&mut openai_req);
     }
 
+    // Normalize message sequence so consecutive assistant messages are merged,
+    // tool_calls are paired and ordered with tool_results, and empty tool calls are scrubbed.
+    // Safe and idempotent for all endpoints (Anthropic, Responses, Chat).
+    openai_req.messages = pipeline::normalize_message_sequence(openai_req.messages);
+
     // DSH's own system prompt carries two literals the gateway rejects as an
     // "unapproved channel" (`11-128`): its identity opener and the `DeepSeek
     // Harness Web GUI` phrase. Rewriting both here means a DSH request is served
@@ -1675,7 +1680,7 @@ async fn forward_request(
                     // results do not match") can only be diagnosed from the message
                     // skeleton, so attach it whenever the upstream complains about
                     // tool-call pairing.
-                    if body.contains("11148") || body.contains("11152") {
+                    if body.contains("11148") || body.contains("11152") || body.contains("11133") {
                         gui_logs
                             .push(
                                 "ERROR",
