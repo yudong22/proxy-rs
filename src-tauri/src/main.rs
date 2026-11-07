@@ -1,252 +1,64 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use proxy_rs::{
+//! The Tauri desktop shell.
+//!
+//! ## Split note (3.4.1)
+//!
+//! `main.rs` was 1,080 lines: the app context, tray wiring, five IPC commands,
+//! the two listener lifecycles, and `main()`'s setup/build closures. They are now
+//! one file per concern under `app/`. The IPC command surface itself is
+//! **unchanged** — `tauri::generate_handler!` still lists exactly the five
+//! host-process commands, which `tests/admin_api.rs` pins. Everything except
+//! `main()` is re-exported here so that guard and the `#[tauri::command]`
+//! registration keep resolving without qualification.
+
+mod app {
+    pub mod context;
+    pub mod lifecycle;
+    pub mod server;
+    pub mod tray;
+}
+
+// Re-exported flat: `generate_handler![get_bootstrap_info, …]` and the tray code
+// refer to these by bare name, exactly as they did when everything was in one
+// file.
+use app::context::*;
+use app::lifecycle::*;
+use app::server::*;
+use app::tray::*;
+
+// Shared imports, re-exported to the `app` submodules through `use super::*`.
+// `pub(crate) use` rather than plain `use`: a private import is not visible to a
+// child module, so the submodules could not see `Arc`, `json!`, `State`… without
+// re-importing every one of them individually.
+pub(crate) use proxy_rs::{
     launch_agent, metrics, providers, router, service,
     settings::{self, GuiSettings, LogBuffer, DEFAULT_PORT},
     Config, StatsDb,
 };
-use serde_json::{json, Value};
-use std::sync::{atomic::AtomicU16, Arc};
-use tauri::{
+pub(crate) use serde_json::{json, Value};
+pub(crate) use std::sync::{atomic::AtomicU16, Arc};
+pub(crate) use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, State,
 };
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
+pub(crate) use tokio::sync::RwLock;
+pub(crate) use tokio_util::sync::CancellationToken;
 
-struct AppContext {
-    settings: Arc<RwLock<GuiSettings>>,
-    logs: Arc<LogBuffer>,
-    service_ctrl: Arc<service::ServiceController>,
-    client: reqwest::Client,
-    bound_port: Arc<AtomicU16>,
-    started_at: std::time::Instant,
-    stats: Arc<StatsDb>,
-    /// Cancellation token for the currently-running proxy server task.
-    server_shutdown: std::sync::Mutex<CancellationToken>,
-    /// Monotonic id of the active server task; bumped on every (re)start.
-    server_epoch: Arc<AtomicU16>,
-    /// Upstream credential pool (WorkBuddy login states / multi-key). Rebuilt
-    /// on every proxy (re)start so saved credential changes hot-apply.
-    credential_pool: Arc<proxy_rs::session_pool::CredentialPool>,
-    /// **Inbound** access-key gate (`x-proxy-rs-key`).
-    ///
-    /// Deliberately not rebuilt on restart: the GUI/HTTP CRUD commands mutate it
-    /// in place and call `reload_from_store`, so a key created or disabled takes
-    /// effect on the very next request. Rebuilding it per start would also reset
-    /// the throttled `last_used_ms` bookkeeping for no benefit.
-    client_auth: Arc<proxy_rs::client_accounts::ClientAuthState>,
-    /// Console sessions for the desktop's in-process `/admin/` surface.
-    ///
-    /// Lives on the context (not rebuilt per listener start) so the webview's
-    /// cookie survives the listener restarts that saving settings triggers.
-    /// Sessions are minted by `desktop-boot` — there is no token login on the
-    /// desktop, because the process itself is the operator.
-    admin_sessions: Arc<proxy_rs::admin_auth::AdminSessions>,
-    /// Growth-run progress lines, shared with the admin RPC layer (polled by
-    /// the console instead of pushed as Tauri events).
-    growth_progress: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    /// Port the **console** listens on, separate from the proxy's own port.
-    ///
-    /// The console must outlive the proxy: "启动服务" lives on it, so if the
-    /// two shared a listener, stopping the service would take away the button
-    /// that starts it again. It gets its own port (`proxy port + 1`) and its
-    /// own long-lived listener, started at boot and never stopped.
-    console_port: Arc<std::sync::atomic::AtomicU16>,
-}
-
-struct TrayState {
-    status_item: MenuItem<tauri::Wry>,
-    start_item: MenuItem<tauri::Wry>,
-    stop_item: MenuItem<tauri::Wry>,
-}
-
-fn update_tray_state(app: &tauri::AppHandle, ctx: &AppContext) {
-    let running = ctx.service_ctrl.is_running();
-    let port = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst);
-
-    if let Some(tray) = app.tray_by_id("main-tray") {
-        let active_bytes = include_bytes!("../icons/tray_active.png");
-        let stopped_bytes = include_bytes!("../icons/tray_stopped.png");
-        let img_bytes: &[u8] = if running { active_bytes } else { stopped_bytes };
-        if let Ok(img) = tauri::image::Image::from_bytes(img_bytes) {
-            let _ = tray.set_icon(Some(img));
-            let _ = tray.set_icon_as_template(false);
-        }
-        let tooltip = if running {
-            format!("Proxy RS · 运行中 (端口: {})", port)
-        } else {
-            "Proxy RS · 已停止".to_string()
-        };
-        let _ = tray.set_tooltip(Some(tooltip));
-    }
-
-    if let Some(tray_state) = app.try_state::<TrayState>() {
-        if running {
-            let _ = tray_state
-                .status_item
-                .set_text(format!("🟢 状态: 运行中 (端口: {})", port));
-            let _ = tray_state.start_item.set_enabled(false);
-            let _ = tray_state.stop_item.set_enabled(true);
-        } else {
-            let _ = tray_state.status_item.set_text("⚪️ 状态: 已停止");
-            let _ = tray_state.start_item.set_enabled(true);
-            let _ = tray_state.stop_item.set_enabled(false);
-        }
-    }
-}
-
-/// Tell the console the service state changed.
-///
-/// Replaces the UI's 2-second `get_status` poll: the front-end listens for
-/// `service-state` and re-reads status only when this fires. Every caller
-/// already calls `update_tray_state` at the same moment — the tray and the
-/// console show the same fact — so the two are kept adjacent deliberately.
-fn emit_service_state(app: &tauri::AppHandle) {
-    let _ = app.emit("service-state", ());
-}
-
-/// The identity currently serving requests, for the overview header.
-///
-/// Mirrors the resolution the request path applies
-/// ([`proxy_rs::workbuddy_auth::effective_default_identity`]) and attaches a
-/// human-readable label plus the last-known remaining points. `points` is
-/// `null` when it has never been queried — distinct from a real 0 balance.
-///
-/// An account's label is preferred; a key's label next; the static-key path and
-/// an explicitly empty pool fall back to a fixed description, because there is
-/// no account to name in either case.
-fn current_identity_summary() -> Value {
-    let id = proxy_rs::workbuddy_auth::effective_default_identity();
-
-    // (label, points) for the named identity, or a fallback when the id is the
-    // static-key path / the "no pool" sentinel and there is no account to name.
-    let (label, points) = match id.as_str() {
-        id if id.starts_with("wb-") => proxy_rs::workbuddy_auth::load_credentials()
-            .into_iter()
-            .find(|c| c.id == id)
-            .map(|c| (c.label, c.points))
-            .unwrap_or_else(|| ("未知账号".to_string(), None)),
-        id if id.starts_with("k-") => proxy_rs::workbuddy_auth::load_api_keys()
-            .into_iter()
-            .find(|k| k.id == id)
-            .map(|k| (k.label, k.points))
-            .unwrap_or_else(|| ("未知密钥".to_string(), None)),
-        _ => ("静态 API Key".to_string(), None),
-    };
-
-    json!({ "id": id, "label": label, "points": points })
-}
-
-/// Run a fire-and-forget task under supervision, so its death is visible.
-///
-/// The two long-lived background tasks (the proxy listener and the daily
-/// check-in scheduler) used to be spawned with their `JoinHandle` dropped on
-/// the floor. A panic inside either one therefore vanished without a trace:
-/// the scheduler's symptom was "my daily points stopped accruing" with nothing
-/// anywhere to explain it, and a listener panic was worse than silent — the
-/// service stayed flagged 🟢 running in the tray and console while the port
-/// was actually closed.
-///
-/// This awaits the handle and reports both failure modes: a panic (the join
-/// error) and an early return. Release builds are `panic = "abort"`, so a panic
-/// takes the process with it; this is what makes the *non*-panic exits — and
-/// any future non-abort build — observable.
-fn spawn_supervised<F>(ctx: Arc<AppContext>, label: &'static str, fut: F)
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    tauri::async_runtime::spawn(async move {
-        match tauri::async_runtime::spawn(fut).await {
-            Ok(()) => {
-                ctx.logs
-                    .push("WARN", format!("后台任务 {} 已提前结束", label))
-                    .await;
-                tracing::warn!("background task {} returned early", label);
-            }
-            Err(join_err) => {
-                let msg = format!("后台任务 {} 异常终止: {}", label, join_err);
-                ctx.logs.push("ERROR", msg.clone()).await;
-                tracing::error!("{}", msg);
-            }
-        }
-    });
-}
-
-/// Start (or restart) the proxy service and note it in the log. The server task
-/// logs the real outcome once the port is bound, so a failed bind is never
-/// reported as success here.
-fn desktop_status(ctx: &Arc<AppContext>) -> Value {
-    // `try_read`: the status poll must never block on a settings write in
-    // flight (a save). The stale-by-milliseconds answer is fine for a header.
-    let settings = match ctx.settings.try_read() {
-        Ok(g) => g,
-        Err(_) => return serde_json::json!({ "running": ctx.service_ctrl.is_running() }),
-    };
-    let service_running = ctx.service_ctrl.is_running();
-    let port = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst);
-    let presets = providers::builtin_presets();
-    let upstream = settings.chat_url(&presets);
-
-    json!({
-        "running": service_running,
-        "service_running": service_running,
-        "uptime_secs": ctx.started_at.elapsed().as_secs(),
-        "version": env!("CARGO_PKG_VERSION"),
-        "provider": settings.provider_id,
-        "upstream_url": upstream,
-        "port": port,
-        "configured_port": settings.port,
-        "bind": settings.bind,
-        "api_key_set": !settings.api_key.is_empty(),
-        // Whether launchd actually has the job, not merely whether a plist file
-        // is lying around. The two disagree after a user-initiated quit, which
-        // deliberately leaves the plist on disk.
-        "launch_at_login": launch_agent::is_loaded(),
-        "configured_launch_at_login": settings.launch_at_login,
-        "launch_at_login_path": launch_agent::plist_path().display().to_string(),
-        "launch_at_login_plist_present": launch_agent::plist_exists(),
-        "launch_at_login_stale": settings.launch_at_login
-            && !launch_agent::is_loaded(),
-        "data_dir": settings::data_dir().map(|d| d.display().to_string()),
-        "env_path": settings::dotenv_path().map(|p| p.display().to_string()),
-        "log_path": settings::log_file_path().map(|p| p.display().to_string()),
-        // A debug build (what `tauri dev` produces) shares the installed app's
-        // launchd label, so letting it write the login item would point the
-        // user's next login at a development binary. The console disables the
-        // switch on this flag.
-        "is_dev": cfg!(debug_assertions),
-        // The overview header's 配置厂商 / 当前账号 / 剩余积分 cards.
-        "current_identity": current_identity_summary(),
-    })
-}
-
-fn request_start(app: tauri::AppHandle, ctx: Arc<AppContext>) {
-    start_proxy_server(app.clone(), ctx.clone());
-    update_tray_state(&app, &ctx);
-    emit_service_state(&app);
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.eval("if (window.refreshStatus) { window.refreshStatus(); }");
-    }
-    tauri::async_runtime::spawn(async move {
-        ctx.logs.push("INFO", "正在启动代理服务...".into()).await;
-    });
-}
-
-/// Stop the proxy service and note it in the log.
-fn request_stop(app: tauri::AppHandle, ctx: Arc<AppContext>) {
-    stop_proxy_server(ctx.clone());
-    update_tray_state(&app, &ctx);
-    emit_service_state(&app);
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.eval("if (window.refreshStatus) { window.refreshStatus(); }");
-    }
-    tauri::async_runtime::spawn(async move {
-        ctx.logs.push("INFO", "代理服务已停止".into()).await;
-    });
-}
-
+// ── IPC commands ────────────────────────────────────────────────────────────
+//
+// These five live in `main.rs` rather than `app/commands.rs` on purpose: the
+// `#[tauri::command]` macro emits helper macros (`__cmd__<name>`) in the module
+// that *defines* the function, and `generate_handler!` resolves them in the
+// module that *registers* it. Splitting them across files fails to compile with
+// "cannot find macro `__cmd__get_bootstrap_info`" — so the definition site is
+// pinned here by the framework, not by preference. Everything these commands
+// call lives in `app/`.
+//
+// Exactly five: start/stop the process, read the bootstrap info, and two OS file
+// manager actions. Anything else belongs in `admin_rpc` (see the guard test
+// `the_desktop_ipc_surface_is_only_the_five_host_process_commands`).
 // ── Desktop bootstrap IPC (the smallest surface that survives 3.4.0) ──────
 //
 // The webview now loads the in-process `/admin/` console over HTTP; these two
@@ -331,66 +143,6 @@ async fn stop_service(
     Ok(json!({ "ok": true, "running": false }))
 }
 
-// ── WorkBuddy credential pool management ───────────────────────────────────
-
-/// Fold the legacy single `GuiSettings::api_key` into the key pool.
-///
-/// Called once at startup. The model-provider API Key field is removed from the
-/// GUI (the key pool now owns all keys), but existing installs still have a key
-/// there; importing it as a key entry means the unified 身份池 selector can
-/// manage it and the proxy keeps using it. Existing keys take precedence: a key
-/// whose material already exists is left untouched (its id is content-derived),
-/// so we only add when the pool has nothing matching yet.
-fn migrate_legacy_api_key(settings: &GuiSettings) {
-    let key = settings.api_key.trim();
-    if key.is_empty() {
-        return;
-    }
-    let id = proxy_rs::workbuddy_auth::api_key_id(key);
-    let items = proxy_rs::workbuddy_auth::load_api_keys();
-    if items.iter().any(|k| k.id == id) {
-        return;
-    }
-    let entry = proxy_rs::workbuddy_auth::ApiKeyEntry {
-        id,
-        label: "默认 API Key".to_string(),
-        key: key.to_string(),
-        enabled: true,
-        points: None,
-        points_fetched_at_ms: None,
-    };
-    let mut merged = items;
-    merged.push(entry);
-    let _ = proxy_rs::workbuddy_auth::save_api_keys(&merged);
-}
-
-// ── Upstream API key pool ──────────────────────────────────────────────────
-
-/// Bring the main window to the front, restoring it if it was hidden.
-fn focus_main_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
-}
-
-/// Quit for real, surviving launch-at-login.
-///
-/// The LaunchAgent plist restarts the job when the process exits *unsuccessfully*
-/// (`KeepAlive`/`SuccessfulExit=false`), so a plain `app.exit(0)` is enough to
-/// stop the current run. Booting the job out as well is what makes "退出" mean
-/// "do not come back": it removes launchd's record of the job, which would
-/// otherwise relaunch it at the next login. The plist stays on disk so
-/// launch-at-login is re-armed the next time the user starts the app with the
-/// setting still enabled.
-fn quit_app(app: &tauri::AppHandle) {
-    if let Err(e) = launch_agent::suspend() {
-        eprintln!("Warning: could not suspend launch-at-login before quitting: {e}");
-    }
-    app.exit(0);
-}
-
 /// Show the log directory in the OS file manager.
 #[tauri::command]
 fn open_logs_dir() {
@@ -448,284 +200,6 @@ fn reveal_in_file_manager(path: &std::path::Path) {
 #[tauri::command]
 fn reveal_path(path: String) {
     reveal_in_file_manager(std::path::Path::new(&path));
-}
-
-/// Monotonic id for the currently-running proxy server task. Incremented on
-/// every (re)start so a stale `stop` request can't cancel a newer server.
-fn next_server_id(ctx: &Arc<AppContext>) -> u16 {
-    ctx.server_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        + 1
-}
-
-/// Spawn (or respawn) the proxy listener. A fresh `CancellationToken` governs
-/// this specific server instance so it can be shut down independently of the
-/// whole process. Errors are logged and the service is marked stopped.
-fn run_proxy_server(
-    app: tauri::AppHandle,
-    ctx: Arc<AppContext>,
-    server_id: u16,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    let ctx_for_watch = ctx.clone();
-    spawn_supervised(ctx_for_watch, "代理监听", async move {
-        // If a newer start was requested while we were spinning up, bail out.
-        if ctx.server_epoch.load(std::sync::atomic::Ordering::SeqCst) != server_id {
-            return;
-        }
-
-        let initial_settings = ctx.settings.read().await.clone();
-        let cfg = match Config::from_settings(&initial_settings) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                ctx.logs.push("ERROR", format!("代理配置无效: {}", e)).await;
-                ctx.service_ctrl.mark_stopped();
-                update_tray_state(&app, &ctx);
-                emit_service_state(&app);
-                return;
-            }
-        };
-
-        let metrics_handle = metrics::install();
-        let config_arc = Arc::new(cfg);
-
-        let app_router = router::build_app_router(
-            ctx.service_ctrl.clone(),
-            ctx.logs.clone(),
-            config_arc.clone(),
-            ctx.client.clone(),
-            ctx.stats.clone(),
-            metrics_handle,
-            ctx.credential_pool.clone(),
-            ctx.client_auth.clone(),
-        );
-
-        let bind_addr = config_arc.bind.clone();
-        // No `+1` fallback: every client CLI is pointed at one fixed gateway
-        // URL, so binding a different port would break them invisibly. The
-        // single-instance guard is what keeps this port free.
-        let (listener, bound_port) = match service::ServiceController::bind(
-            &bind_addr,
-            config_arc.port,
-            ctx.service_ctrl.allow_port_fallback(),
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                let in_use = e.kind() == std::io::ErrorKind::AddrInUse;
-                let hint = if in_use {
-                    "（端口已被占用：请先退出另一个 Proxy RS 实例，或改用其它端口）"
-                } else {
-                    ""
-                };
-                ctx.logs
-                    .push(
-                        "ERROR",
-                        format!("代理监听端口绑定失败 {}: {}{}", config_arc.port, e, hint),
-                    )
-                    .await;
-                ctx.service_ctrl.mark_stopped();
-                update_tray_state(&app, &ctx);
-                emit_service_state(&app);
-                return;
-            }
-        };
-
-        // Another start may have superseded this one before we bound.
-        if ctx.server_epoch.load(std::sync::atomic::Ordering::SeqCst) != server_id {
-            let _ = listener.local_addr();
-            return;
-        }
-
-        ctx.bound_port
-            .store(bound_port, std::sync::atomic::Ordering::SeqCst);
-        ctx.service_ctrl.mark_running();
-        update_tray_state(&app, &ctx);
-        emit_service_state(&app);
-        ctx.logs
-            .push(
-                "INFO",
-                format!("代理服务已在 http://{}:{} 启动", bind_addr, bound_port),
-            )
-            .await;
-
-        // Peer-address extraction, same as the server binary: the desktop's
-        // desktop-boot endpoint answers loopback requests only.
-        let server = axum::serve(
-            listener,
-            app_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { shutdown.cancelled().await });
-
-        if let Err(e) = server.await {
-            ctx.logs
-                .push("ERROR", format!("代理服务运行异常: {}", e))
-                .await;
-        }
-
-        // Only clear state if this is still the active server instance.
-        if ctx.server_epoch.load(std::sync::atomic::Ordering::SeqCst) == server_id {
-            ctx.service_ctrl.mark_stopped();
-            update_tray_state(&app, &ctx);
-            emit_service_state(&app);
-        }
-    });
-}
-
-/// Start (or restart) the proxy listener.
-/// Start the console listener on its own port, for the life of the process.
-///
-/// ## Why it is separate from the proxy
-///
-/// The console is where "启动服务 / 停止服务" live. When both shared one
-/// listener, stopping the proxy closed the port that served the console, so the
-/// page lost the very button needed to start it again — a dead end the user
-/// hit for real. (The data plane already answers 503 while stopped, so nothing
-/// about the proxy's own behaviour needed the port closed.)
-///
-/// ## Where the port comes from
-///
-/// `proxy port + 1`, falling back up to `+9` if those are taken. No setting:
-/// the console is an implementation detail of the app, and a second port in
-/// `gui-settings.json` would be one more thing to keep in step with `port`.
-/// The bootstrap page reads it from `get_bootstrap_info`.
-fn start_console_listener(ctx: Arc<AppContext>) {
-    let (bind, base_port) = {
-        let settings = settings::GuiSettings::load();
-        let bind = if settings.bind.trim().is_empty() {
-            "127.0.0.1".to_string()
-        } else {
-            settings.bind.trim().to_string()
-        };
-        let port = if settings.port == 0 {
-            DEFAULT_PORT
-        } else {
-            settings.port
-        };
-        (bind, port)
-    };
-
-    tauri::async_runtime::spawn(async move {
-        let admin_state = Arc::new(proxy_rs::admin_routes::AdminState {
-            sessions: ctx.admin_sessions.clone(),
-            stats: ctx.stats.clone(),
-            logs: ctx.logs.clone(),
-            client_auth: ctx.client_auth.clone(),
-            pool: ctx.credential_pool.clone(),
-            process: proxy_rs::admin::ProcessInfo {
-                version: env!("CARGO_PKG_VERSION"),
-                // The proxy's live port: the console reports the port clients
-                // should be pointed at, not the console's own.
-                bound_port: ctx.bound_port.clone(),
-                started_at: ctx.started_at,
-                bind_addr: bind.clone(),
-            },
-            client: ctx.client.clone(),
-            desktop: true,
-            growth_progress: ctx.growth_progress.clone(),
-        });
-        let router = proxy_rs::admin_routes::build_admin_router(admin_state.clone())
-            .merge(proxy_rs::console::build_console_router(admin_state));
-
-        let mut chosen = None;
-        for offset in 1..=9u16 {
-            let Some(port) = base_port.checked_add(offset) else {
-                break;
-            };
-            match tokio::net::TcpListener::bind(format!("{bind}:{port}")).await {
-                Ok(l) => {
-                    chosen = Some((l, port));
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
-                Err(e) => {
-                    ctx.logs
-                        .push("ERROR", format!("控制台端口绑定失败 {bind}:{port}: {e}"))
-                        .await;
-                    return;
-                }
-            }
-        }
-        let Some((listener, port)) = chosen else {
-            ctx.logs
-                .push(
-                    "ERROR",
-                    format!("控制台端口绑定失败：{base_port} 之后的 9 个端口都不可用"),
-                )
-                .await;
-            return;
-        };
-
-        ctx.console_port
-            .store(port, std::sync::atomic::Ordering::SeqCst);
-        ctx.logs
-            .push(
-                "INFO",
-                format!("控制台已在 http://{bind}:{port}/admin/ 就绪"),
-            )
-            .await;
-
-        let server = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        );
-        if let Err(e) = server.await {
-            ctx.logs
-                .push("ERROR", format!("控制台服务异常退出: {e}"))
-                .await;
-        }
-    });
-}
-
-fn start_proxy_server(app: tauri::AppHandle, ctx: Arc<AppContext>) {
-    // Already up: nothing to do.
-    if ctx.service_ctrl.is_running() {
-        return;
-    }
-    // The listener stays up while the service is stopped (it also serves the
-    // console), so "start" after a "stop" is a **resume**: the port is already
-    // bound and the routes are already mounted. Re-binding would fail with
-    // "address in use" for a port we ourselves are holding.
-    //
-    // `bound_port` is the discriminator: it is non-zero exactly while a
-    // listener exists. It is zero before the first bind and stays non-zero
-    // after a stop (the port keeps answering 503).
-    if ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst) != 0 {
-        ctx.service_ctrl.mark_running();
-        update_tray_state(&app, &ctx);
-        emit_service_state(&app);
-        return;
-    }
-    // No listener at all (first start): bind one.
-    // Cancel any existing server and bump the epoch so stale tasks exit.
-    if let Ok(guard) = ctx.server_shutdown.lock() {
-        guard.cancel();
-    }
-    let server_id = next_server_id(&ctx);
-    let shutdown = tokio_util::sync::CancellationToken::new();
-    if let Ok(mut guard) = ctx.server_shutdown.lock() {
-        *guard = shutdown.clone();
-    }
-    run_proxy_server(app, ctx, server_id, shutdown);
-}
-
-/// Stop the proxy listener entirely (graceful shutdown). Unlike `pause`, this
-/// actually closes the port so the old 503 behavior is gone. The server task
-/// refreshes the tray once it has fully shut down.
-fn stop_proxy_server(ctx: Arc<AppContext>) {
-    // **The listener stays up.** It also serves the console, so closing it
-    // would take the "启动服务" button down together with the service it is
-    // supposed to restart — the user could not start it again. The data plane
-    // already refuses work while the service is stopped (`proxy.rs` answers
-    // 503 `service_unavailable`), so marking the state is what "stopped"
-    // means; the port keeps answering, and the console keeps answering with
-    // the truth.
-    //
-    // `bound_port` is deliberately left alone: the port is still listening, and
-    // it is what tells a later "start" that it should *resume* rather than try
-    // to bind a port we already hold.
-    ctx.service_ctrl.mark_stopped();
 }
 
 fn main() {
