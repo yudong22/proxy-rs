@@ -871,8 +871,10 @@ pub fn normalize_message_sequence(messages: Vec<openai::Message>) -> Vec<openai:
             });
 
             if has_tools {
-                let mut tool_results_by_id: std::collections::HashMap<String, Vec<openai::Message>> =
-                    std::collections::HashMap::new();
+                let mut tool_results_by_id: std::collections::HashMap<
+                    String,
+                    Vec<openai::Message>,
+                > = std::collections::HashMap::new();
                 while i < messages.len() && messages[i].role == "tool" {
                     if let Some(id) = &messages[i].tool_call_id {
                         let trimmed = id.trim();

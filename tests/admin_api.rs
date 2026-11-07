@@ -1179,14 +1179,26 @@ async fn call_with_peer(
     peer: &str,
     uri: &str,
 ) -> (StatusCode, Value, Option<String>) {
-    let req = Request::builder()
+    call_with_peer_and_headers(app, peer, uri, &[]).await
+}
+
+/// Same, with extra request headers (Origin, Sec-Fetch-Site, …).
+async fn call_with_peer_and_headers(
+    app: axum::Router,
+    peer: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value, Option<String>) {
+    let mut builder = Request::builder()
         .method("GET")
         .uri(uri)
         .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
             peer.parse().unwrap(),
-        ))
-        .body(Body::empty())
-        .unwrap();
+        ));
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder.body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let set_cookie = resp
@@ -1302,4 +1314,228 @@ async fn desktop_boot_refuses_non_loopback_peers() {
         resp.headers().get("set-cookie").is_none(),
         "a LAN peer must never receive a session"
     );
+}
+
+// ── Desktop console trust boundaries ──────────────────────────────────────
+
+/// A desktop state (the flag on) for the trust-boundary tests below.
+fn desktop_state() -> Arc<AdminState> {
+    Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: 3456,
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    })
+}
+
+/// An arbitrary website must not be granted credentialed access to the
+/// desktop boot endpoint.
+///
+/// The endpoint mints a session, so echoing the caller's `Origin` with
+/// `Allow-Credentials: true` would let any page the user visits read the
+/// response and keep the cookie alive. Only Tauri's own scheme qualifies.
+#[tokio::test]
+async fn desktop_boot_grants_cors_only_to_the_tauri_origin() {
+    let _iso = isolate("boot-cors", Some("tok")).await;
+    let app = app_for(desktop_state());
+
+    // The Tauri scheme is allowed.
+    let (status, _, _) = call_with_peer_and_headers(
+        app.clone(),
+        "127.0.0.1:50000",
+        "/admin/api/desktop-boot",
+        &[("origin", "tauri://localhost")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A random site is not: the request still succeeds (it is loopback), but
+    // the response carries no CORS grant, so the browser refuses to hand the
+    // body to the page.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/api/desktop-boot")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("origin", "https://evil.example")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "an arbitrary origin must not be granted access"
+    );
+    assert!(
+        resp.headers()
+            .get("access-control-allow-credentials")
+            .is_none(),
+        "credentials must not be granted to an arbitrary origin"
+    );
+}
+
+/// The desktop console page must not mint a session for a **cross-site**
+/// request: a page in the user's browser can reach the desktop's loopback
+/// port, and without this check it could use the desktop as a session oracle.
+///
+/// Same-origin navigation (`Sec-Fetch-Site: same-origin`) and non-browser
+/// clients (no header) are allowed; `cross-site` is not.
+#[tokio::test]
+async fn the_desktop_console_page_refuses_a_cross_site_visitor() {
+    let _iso = isolate("page-cross-site", Some("tok")).await;
+    let app = app_for(desktop_state());
+
+    // Cross-site: the login page, not the console.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "cross-site")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "a cross-site visitor must not receive a session"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("Proxy RS 管理台") || text.contains("管理令牌"),
+        "a cross-site visitor must get the login page, not the console"
+    );
+
+    // Same-origin: the console, with a session.
+    let (status, _, set_cookie) = call_with_peer_and_headers(
+        app.clone(),
+        "127.0.0.1:50000",
+        "/admin/",
+        &[("sec-fetch-site", "same-origin")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        set_cookie.is_some(),
+        "a same-origin load must mint a session"
+    );
+}
+
+/// The desktop console must not load the server bridge.
+///
+/// The bridge replaces `window.__TAURI__` with an HTTP-only shim, which would
+/// cost the desktop its native commands (service start/stop, file manager).
+/// The desktop's own `core/ipc.js` already speaks HTTP for the business
+/// commands, so it needs no bridge — and must not get one.
+#[tokio::test]
+async fn the_desktop_console_does_not_load_the_server_bridge() {
+    let _iso = isolate("no-bridge-desktop", Some("tok")).await;
+    let app = app_for(desktop_state());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "same-origin")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        !html.contains("src/bridge.js"),
+        "the desktop console must not load the server bridge"
+    );
+    assert!(html.contains("src/main.js"), "the console must still load");
+}
+
+/// A server console still loads the bridge — it has no Tauri to fall back on.
+#[tokio::test]
+async fn the_server_console_still_loads_the_bridge() {
+    let _iso = isolate("bridge-server", Some("tok")).await;
+    let app = app_for(test_state());
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .header("cookie", cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("src/bridge.js"),
+        "the server console must load the bridge"
+    );
+}
+
+/// The desktop has no `PROXY_API_TOKEN` — the process is the operator — so the
+/// "no token → console disabled" rule must not apply to it.
+///
+/// This was a real failure: the desktop minted a session through
+/// `desktop-boot`, and every RPC then answered `503 admin_disabled`.
+#[tokio::test]
+async fn the_desktop_console_works_without_a_configured_token() {
+    let _iso = isolate("desktop-no-token", None).await;
+    // A desktop session table, like the desktop app builds.
+    let base = desktop_state();
+    let state = Arc::new(AdminState {
+        sessions: Arc::new(proxy_rs::admin_auth::AdminSessions::desktop()),
+        stats: base.stats.clone(),
+        logs: base.logs.clone(),
+        client_auth: base.client_auth.clone(),
+        pool: base.pool.clone(),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: 3456,
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let app = app_for(state);
+
+    // Mint a session the way the desktop's page load does.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "same-origin")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap().to_string())
+        .expect("the desktop page load must mint a session");
+
+    // And the RPC surface must accept it — no 503 admin_disabled.
+    let (status, body, _) = call(app, "GET", "/admin/api/status", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK, "desktop RPC must work: {body}");
 }

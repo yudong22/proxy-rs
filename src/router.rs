@@ -112,6 +112,10 @@ pub fn build_app_router(
             "/api/scheduler/run/:loop_id",
             post(api::scheduler_run_handler),
         )
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/admin/") }),
+        )
         .route("/health", get(|| async { "OK" }))
         .route(
             "/metrics",

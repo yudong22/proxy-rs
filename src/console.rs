@@ -359,7 +359,23 @@ pub fn build_console_router(state: Arc<crate::admin_routes::AdminState>) -> Rout
         // the console page can probe it without a 404-vs-timeout distinction in
         // the JS), but the handler answers 404 unless this state is a desktop
         // build AND the request came from loopback. See [`desktop_boot`].
-        .route("/admin/api/desktop-boot", axum::routing::get(desktop_boot))
+        .route(
+            "/admin/api/desktop-boot",
+            axum::routing::get(desktop_boot).options(|headers: axum::http::HeaderMap| async move {
+                let mut res = axum::http::StatusCode::NO_CONTENT.into_response();
+                // Only the desktop's own scheme may preflight — see
+                // `desktop_origin` for why an arbitrary origin is not granted
+                // credentialed access.
+                if let Some(origin) = desktop_origin(&headers) {
+                    allow_desktop_origin(&mut res, &origin);
+                    res.headers_mut().insert(
+                        axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+                        axum::http::header::HeaderValue::from_static("GET, OPTIONS"),
+                    );
+                }
+                res
+            }),
+        )
         .merge(assets)
         .merge(gated)
         .fallback(console_fallback)
@@ -396,6 +412,7 @@ pub fn build_console_router(state: Arc<crate::admin_routes::AdminState>) -> Rout
 /// Idempotent by design: the page may call this on every (re)connect, and each
 /// call simply mints a fresh session; the previous one expires on its own.
 async fn desktop_boot(
+    headers: axum::http::HeaderMap,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::Extension(state): axum::extract::Extension<Arc<crate::admin_routes::AdminState>>,
 ) -> Response {
@@ -428,7 +445,48 @@ async fn desktop_boot(
         header::SET_COOKIE,
         admin_auth::set_cookie_header(&id, secure, ttl),
     );
+    // The desktop's bootstrap page lives on Tauri's own scheme, so it reaches
+    // this endpoint cross-origin. Only *that* origin is allowed — echoing an
+    // arbitrary `Origin` with `Allow-Credentials` would let any page the user
+    // visits read this response and keep the cookie alive.
+    if let Some(origin) = desktop_origin(&headers) {
+        allow_desktop_origin(&mut response, &origin);
+    }
     response
+}
+
+/// The desktop webview's own origin, or `None` when the request came from
+/// somewhere else.
+///
+/// Tauri's webview runs on a custom scheme (`tauri://localhost` on macOS and
+/// Linux, `http://tauri.localhost` on Windows), so the bootstrap page's origin
+/// is one of exactly two values. A request with **no** `Origin` header is a
+/// non-browser client (curl, the desktop's own `reqwest`): it is same-origin
+/// by definition and needs no CORS grant, but it must not be granted one
+/// either — that is the shape a cross-site request takes.
+fn desktop_origin(headers: &axum::http::HeaderMap) -> Option<axum::http::HeaderValue> {
+    const TAURI_ORIGINS: &[&str] = &["tauri://localhost", "http://tauri.localhost"];
+    let origin = headers.get(axum::http::header::ORIGIN)?;
+    let text = origin.to_str().ok()?;
+    TAURI_ORIGINS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(text))
+        .then(|| origin.clone())
+}
+
+/// Grant the desktop origin access to this response.
+///
+/// `Allow-Credentials` is required (the session rides a cookie) and only makes
+/// sense together with an exact origin — never with `*`.
+fn allow_desktop_origin(response: &mut Response, origin: &axum::http::HeaderValue) {
+    response.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        origin.clone(),
+    );
+    response.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        axum::http::header::HeaderValue::from_static("true"),
+    );
 }
 
 /// The console's JSON 404, usable from a non-async helper context.
@@ -586,7 +644,8 @@ async fn serve_login_js() -> Response {
 /// page, and the stale cookie was still there — an infinite reload loop. See the
 /// body for the fix.
 async fn serve_page(
-    State(sessions): State<Arc<crate::admin_auth::AdminSessions>>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    axum::extract::Extension(state): axum::extract::Extension<Arc<crate::admin_routes::AdminState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     // **Validate**, not merely detect. Checking only that a cookie *exists* was
@@ -598,10 +657,41 @@ async fn serve_page(
     //
     // `touch` also slides the expiry, which is right: loading the page is the
     // user being active.
-    match crate::admin_auth::session_cookie(&headers) {
-        Some(id) if sessions.touch(&id) => console_page(),
-        _ => login_page(),
+    let sessions = &state.sessions;
+    if let Some(id) = crate::admin_auth::session_cookie(&headers) {
+        if sessions.touch(&id) {
+            return console_page(state.desktop);
+        }
     }
+
+    // Desktop auto-boot: when running in desktop mode on loopback, mint a session
+    // directly on page load and return the console with Set-Cookie.
+    //
+    // The `Sec-Fetch-Site` check keeps a *browser* on another site from using
+    // the desktop's loopback port as a session oracle: a cross-site request
+    // (`cross-site`) is refused, while a same-origin navigation (`same-origin`,
+    // or no header at all for a non-browser client) is allowed. The peer being
+    // loopback already excludes remote hosts; this excludes the local ones
+    // that a page in the user's browser could reach.
+    let is_loopback = peer.map(|p| p.ip().is_loopback()).unwrap_or(false);
+    let same_site = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "same-origin" || v == "none")
+        .unwrap_or(true);
+    if state.desktop && is_loopback && same_site {
+        let secure = false;
+        let id = sessions.mint_session();
+        let ttl = crate::admin_auth::SESSION_TTL;
+        let mut response = console_page(true);
+        response.headers_mut().insert(
+            axum::http::header::SET_COOKIE,
+            crate::admin_auth::set_cookie_header(&id, secure, ttl),
+        );
+        return response;
+    }
+
+    login_page()
 }
 
 /// The console page, with the server bridge injected.
@@ -613,7 +703,7 @@ async fn serve_page(
 /// what the desktop app ships — which is the entire point of serving the same
 /// front-end — and puts the one mode-specific tag in the one place that knows
 /// which mode it is in.
-fn console_page() -> Response {
+fn console_page(desktop: bool) -> Response {
     let index = ASSETS
         .iter()
         .find(|(path, _, _)| *path == "/index.html")
@@ -624,7 +714,18 @@ fn console_page() -> Response {
     // are deferred until after parsing, but a classic script still executes
     // before the module graph runs, so `window.__TAURI__` exists by the time any
     // view reads it.
-    let bridge_tag = "<script src=\"src/bridge.js\"></script>\n  ";
+    //
+    // **Not in the desktop build.** The bridge replaces `window.__TAURI__` with
+    // an HTTP-only shim — which would cost the desktop its native commands
+    // (service start/stop, file manager). The desktop's own `core/ipc.js`
+    // already speaks HTTP for the business commands and keeps Tauri for the
+    // desktop-only ones, so it needs no bridge at all. A server build has no
+    // Tauri, so the bridge is the only thing that makes its `invoke` work.
+    let bridge_tag = if desktop {
+        ""
+    } else {
+        "<script src=\"src/bridge.js\"></script>\n  "
+    };
     let html = index.replace(
         "<script type=\"module\" src=\"src/main.js\"></script>",
         &format!("{bridge_tag}<script type=\"module\" src=\"src/main.js\"></script>"),

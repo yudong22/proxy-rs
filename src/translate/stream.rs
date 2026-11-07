@@ -8,7 +8,9 @@ use crate::translate::core;
 #[derive(Debug)]
 enum BlockState {
     Idle,
-    Text { index: usize },
+    Text {
+        index: usize,
+    },
     ToolUse {
         index: usize,
         id: String,

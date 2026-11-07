@@ -2645,7 +2645,10 @@ fn main() {
         credential_pool: Arc::new(proxy_rs::session_pool::CredentialPool::new(
             proxy_rs::workbuddy_auth::ordered_credentials(),
         )),
-        admin_sessions: Arc::new(proxy_rs::admin_auth::AdminSessions::new()),
+        // `desktop()`: the desktop console has no PROXY_API_TOKEN — the process
+        // is the operator and `desktop-boot` mints its session in-process — so
+        // the "no token → console disabled" rule must not apply to it.
+        admin_sessions: Arc::new(proxy_rs::admin_auth::AdminSessions::desktop()),
         growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
         client_auth: Arc::new(proxy_rs::client_accounts::ClientAuthState::new(
             client_auth_enabled,
