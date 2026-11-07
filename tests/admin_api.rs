@@ -78,7 +78,7 @@ fn test_router_with_sessions() -> (axum::Router, Arc<AdminSessions>) {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
@@ -107,7 +107,7 @@ fn test_router() -> axum::Router {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
@@ -134,7 +134,7 @@ fn test_state_with_auth(client_auth: Arc<ClientAuthState>) -> Arc<AdminState> {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
@@ -491,7 +491,7 @@ fn console_router() -> axum::Router {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
@@ -809,7 +809,7 @@ async fn the_admin_surface_does_not_advertise_cross_origin_access() {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "t",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".into(),
         },
@@ -882,7 +882,7 @@ fn build_console_router_for_cors_test() -> axum::Router {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "t",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".into(),
         },
@@ -1230,7 +1230,7 @@ async fn desktop_boot_mints_a_session_for_loopback_on_a_desktop_build() {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
@@ -1287,7 +1287,7 @@ async fn desktop_boot_refuses_non_loopback_peers() {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "0.0.0.0".to_string(),
         },
@@ -1328,7 +1328,7 @@ fn desktop_state() -> Arc<AdminState> {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
@@ -1507,7 +1507,7 @@ async fn the_desktop_console_works_without_a_configured_token() {
         pool: base.pool.clone(),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
@@ -1538,4 +1538,116 @@ async fn the_desktop_console_works_without_a_configured_token() {
     // And the RPC surface must accept it — no 503 admin_disabled.
     let (status, body, _) = call(app, "GET", "/admin/api/status", Some(&cookie), None).await;
     assert_eq!(status, StatusCode::OK, "desktop RPC must work: {body}");
+}
+
+// ── Desktop host-process hooks (3.4.0 A4) ───────────────────────────────
+
+/// The desktop registers its process-local capabilities, so the console's
+/// 启动/停止 buttons reach the process over HTTP.
+///
+/// The desktop console page runs on `http://127.0.0.1:<port>/admin/` — an
+/// origin the Tauri runtime does not inject IPC into — so this is the only
+/// channel those buttons have.
+#[tokio::test]
+async fn the_desktop_registers_its_host_process_capabilities() {
+    use proxy_rs::desktop_hooks::{self, DesktopHooks};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // The hook table is process-global, so this test owns it: register, assert,
+    // and unregister before anything else can observe it.
+    let starts = Arc::new(AtomicUsize::new(0));
+    let stops = Arc::new(AtomicUsize::new(0));
+    let starts_c = starts.clone();
+    let stops_c = stops.clone();
+    desktop_hooks::register(DesktopHooks {
+        start_service: Some(Arc::new(move || {
+            starts_c.fetch_add(1, Ordering::SeqCst);
+            Ok("started".into())
+        })),
+        stop_service: Some(Arc::new(move || {
+            stops_c.fetch_add(1, Ordering::SeqCst);
+            Ok("stopped".into())
+        })),
+        open_logs_dir: None,
+        reveal_path: None,
+    });
+
+    let app = app_for(desktop_state());
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, body) = post_rpc(app.clone(), "start_service", "{}", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["ok"], true, "{body}");
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "the desktop hook must run"
+    );
+
+    let (status, body) = post_rpc(app.clone(), "stop_service", "{}", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(stops.load(Ordering::SeqCst), 1, "the desktop hook must run");
+
+    desktop_hooks::unregister();
+}
+
+/// A **server** build registers nothing, so the same buttons answer with the
+/// systemd explanation rather than pretending to work.
+#[tokio::test]
+async fn a_server_build_refuses_the_desktop_only_commands() {
+    let _iso = isolate("server-no-hooks", Some("tok")).await;
+    let app = app_for(test_state());
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    for command in ["start_service", "stop_service"] {
+        let (status, body) = post_rpc(app.clone(), command, "{}", &cookie).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{command}: {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("systemd"),
+            "{command} must name the systemd alternative: {body}"
+        );
+    }
+}
+
+/// The reported port must be the one the gateway is **actually** listening on,
+/// not the one the settings file asks for.
+///
+/// The desktop binds its port *after* the admin state is built, so a snapshot
+/// taken then reported 0 and the console fell back to the configured port —
+/// which is how it came to show "3456" while serving on 3457.
+#[tokio::test]
+async fn the_reported_port_follows_the_live_listener() {
+    let _iso = isolate("live-port", Some("tok")).await;
+    let port = Arc::new(std::sync::atomic::AtomicU16::new(3499));
+    let state = Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: port.clone(),
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let app = app_for(state);
+
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let (status, body) = post_rpc(app.clone(), "get_status", "{}", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["port"], 3499);
+
+    // The port moves; the payload must follow it.
+    port.store(3500, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = post_rpc(app, "get_status", "{}", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["port"], 3500);
 }

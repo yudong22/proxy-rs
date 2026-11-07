@@ -2461,7 +2461,10 @@ fn run_proxy_server(
             pool: ctx.credential_pool.clone(),
             process: proxy_rs::admin::ProcessInfo {
                 version: env!("CARGO_PKG_VERSION"),
-                bound_port: ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst),
+                // The live handle: the admin state is built before the port is
+                // bound, so a snapshot here would report the configured port
+                // instead of the one actually serving.
+                bound_port: ctx.bound_port.clone(),
                 started_at: ctx.started_at,
                 bind_addr: config_arc.bind.clone(),
             },
@@ -2548,6 +2551,25 @@ fn run_proxy_server(
 
 /// Start (or restart) the proxy listener.
 fn start_proxy_server(app: tauri::AppHandle, ctx: Arc<AppContext>) {
+    // Already up: nothing to do.
+    if ctx.service_ctrl.is_running() {
+        return;
+    }
+    // The listener stays up while the service is stopped (it also serves the
+    // console), so "start" after a "stop" is a **resume**: the port is already
+    // bound and the routes are already mounted. Re-binding would fail with
+    // "address in use" for a port we ourselves are holding.
+    //
+    // `bound_port` is the discriminator: it is non-zero exactly while a
+    // listener exists. It is zero before the first bind and stays non-zero
+    // after a stop (the port keeps answering 503).
+    if ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        ctx.service_ctrl.mark_running();
+        update_tray_state(&app, &ctx);
+        emit_service_state(&app);
+        return;
+    }
+    // No listener at all (first start): bind one.
     // Cancel any existing server and bump the epoch so stale tasks exit.
     if let Ok(guard) = ctx.server_shutdown.lock() {
         guard.cancel();
@@ -2564,11 +2586,17 @@ fn start_proxy_server(app: tauri::AppHandle, ctx: Arc<AppContext>) {
 /// actually closes the port so the old 503 behavior is gone. The server task
 /// refreshes the tray once it has fully shut down.
 fn stop_proxy_server(ctx: Arc<AppContext>) {
-    if let Ok(guard) = ctx.server_shutdown.lock() {
-        guard.cancel();
-    }
-    next_server_id(&ctx);
-    ctx.bound_port.store(0, std::sync::atomic::Ordering::SeqCst);
+    // **The listener stays up.** It also serves the console, so closing it
+    // would take the "启动服务" button down together with the service it is
+    // supposed to restart — the user could not start it again. The data plane
+    // already refuses work while the service is stopped (`proxy.rs` answers
+    // 503 `service_unavailable`), so marking the state is what "stopped"
+    // means; the port keeps answering, and the console keeps answering with
+    // the truth.
+    //
+    // `bound_port` is deliberately left alone: the port is still listening, and
+    // it is what tells a later "start" that it should *resume* rather than try
+    // to bind a port we already hold.
     ctx.service_ctrl.mark_stopped();
 }
 
@@ -2696,6 +2724,49 @@ fn main() {
     builder
         .manage(ctx)
         .setup(move |app| {
+            // Register the desktop's process-local capabilities with the RPC layer.
+            //
+            // The console page runs on `http://127.0.0.1:<port>/admin/` — an origin
+            // the Tauri runtime does not inject IPC into — so the only way its
+            // "启动/停止服务" button can reach this process is over HTTP, through the
+            // RPC arms that call these hooks. A server build registers nothing and
+            // answers with the systemd explanation instead.
+            {
+                // `setup` gets `&mut tauri::App`; the handle is what the tray and the
+                // window helpers take.
+                let app = app.handle().clone();
+                let ctx_for_hooks = ctx_for_setup.clone();
+                let app_start = app.clone();
+                let ctx_start = ctx_for_hooks.clone();
+                let app_stop = app.clone();
+                let ctx_stop = ctx_for_hooks.clone();
+                proxy_rs::desktop_hooks::register(proxy_rs::desktop_hooks::DesktopHooks {
+                    start_service: Some(std::sync::Arc::new(move || {
+                        request_start(app_start.clone(), ctx_start.clone());
+                        Ok("代理服务已启动".to_string())
+                    })),
+                    stop_service: Some(std::sync::Arc::new(move || {
+                        request_stop(app_stop.clone(), ctx_stop.clone());
+                        Ok("代理服务已停止".to_string())
+                    })),
+                    open_logs_dir: Some(std::sync::Arc::new(|| match settings::log_dir() {
+                        Some(dir) => {
+                            reveal_in_file_manager(&dir);
+                            Ok("已打开日志目录".to_string())
+                        }
+                        None => Err("未找到日志目录".to_string()),
+                    })),
+                    reveal_path: Some(std::sync::Arc::new(|path: String| {
+                        let p = std::path::PathBuf::from(&path);
+                        if !p.exists() {
+                            return Err(format!("路径不存在: {path}"));
+                        }
+                        reveal_in_file_manager(&p);
+                        Ok(format!("已在文件管理器中显示: {path}"))
+                    })),
+                });
+            }
+
             // Re-arm launch-at-login only once the single-instance guard has
             // accepted this process. Tauri initializes plugins during `build()`,
             // before this closure runs, so a duplicate has already exited by

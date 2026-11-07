@@ -570,7 +570,7 @@ async fn settings_get(Extension(state): Extension<Arc<AdminState>>) -> Json<Valu
     let mut payload = admin::settings_json();
     if let Some(obj) = payload.as_object_mut() {
         // What is actually bound, which can differ from the configured port.
-        obj.insert("actual_port".into(), json!(state.process.bound_port));
+        obj.insert("actual_port".into(), json!(state.process.port()));
     }
     Json(payload)
 }

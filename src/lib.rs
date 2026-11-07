@@ -12,6 +12,7 @@ pub mod codex_config;
 pub mod config;
 pub mod console;
 pub mod credits;
+pub mod desktop_hooks;
 pub mod dsh_config;
 pub mod error;
 pub mod growth;

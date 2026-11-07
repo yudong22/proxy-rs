@@ -198,7 +198,9 @@ async fn main() -> Result<()> {
         pool: credential_pool.clone(),
         process: admin::ProcessInfo {
             version: env!("CARGO_PKG_VERSION"),
-            bound_port: port,
+            // The server's port never changes after start; the desktop's does
+            // (it binds after the admin state exists), hence the live handle.
+            bound_port: Arc::new(std::sync::atomic::AtomicU16::new(port)),
             started_at: std::time::Instant::now(),
             bind_addr: bind_addr.clone(),
         },

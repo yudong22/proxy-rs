@@ -51,9 +51,26 @@ use crate::workbuddy_auth::{self, ApiKeyEntry, WorkBuddyCredential};
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub version: &'static str,
-    pub bound_port: u16,
+    /// The port the gateway is listening on, read at call time.
+    ///
+    /// A live reference rather than a snapshot: the desktop binds its port
+    /// *after* the admin state is built (the state is built first, so the
+    /// console exists even when the bind fails), and a snapshot taken then
+    /// would report the configured port instead of the one actually in use —
+    /// which is how the console came to show "3456" while serving on 3457.
+    ///
+    /// The server build passes a fixed value (its port never changes after
+    /// start), so the shape is the same for both.
+    pub bound_port: std::sync::Arc<std::sync::atomic::AtomicU16>,
     pub started_at: std::time::Instant,
     pub bind_addr: String,
+}
+
+impl ProcessInfo {
+    /// The port the gateway is listening on right now.
+    pub fn port(&self) -> u16 {
+        self.bound_port.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl ProcessInfo {
@@ -89,7 +106,7 @@ impl ProcessInfo {
             "launch_at_login": false,
             "launch_at_login_stale": false,
             "managed_by": "systemd",
-            "port": self.bound_port,
+            "port": self.port(),
             "configured_port": settings.port,
             "bind": self.bind_addr,
             "client_auth_enabled": client_accounts::enabled_from(settings.client_auth_enabled),
@@ -833,7 +850,7 @@ pub async fn apply_dsh_config(
     if models.is_empty() {
         bail!("上游 {} 未返回任何模型，未改动 DSH 配置", preset.id);
     }
-    let base_url = format!("http://127.0.0.1:{}/v1", state.process.bound_port);
+    let base_url = format!("http://127.0.0.1:{}/v1", state.process.port());
     let dsh_models: Vec<crate::dsh_config::DshModel> =
         models.iter().map(crate::dsh_config::to_dsh_model).collect();
     let (patch, credentials, credential_added) =

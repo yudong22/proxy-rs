@@ -84,7 +84,7 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
         "get_settings" => {
             let mut payload = admin::settings_json();
             if let Some(obj) = payload.as_object_mut() {
-                obj.insert("actual_port".into(), json!(state.process.bound_port));
+                obj.insert("actual_port".into(), json!(state.process.port()));
             }
             Ok(payload)
         }
@@ -416,7 +416,7 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             apply_claude_config(state, body)
         }
         "get_codex_config" => get_codex_config(),
-        "apply_codex_config" => apply_codex_config(state.process.bound_port).await,
+        "apply_codex_config" => apply_codex_config(state.process.port()).await,
         // DSH writes into a profile's patch file. The implementation lives in
         // `admin` because the REST surface offers the same operation, and one
         // implementation is what keeps the two from disagreeing about which
@@ -461,24 +461,48 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             crate::admin::claude_subagent_detail(id, agent_id, detail_args).await
         }
 
-        // The two commands whose meaning does not survive the move to a server.
-        // Refused with the reason the operator needs, not faked: a button that
-        // silently does nothing is worse than one that says why. The shared UI
-        // renders this message in a toast (`操作失败: …`).
-        "start_service" | "stop_service" => bail!(
-            "服务器模式下服务由 systemd 托管，请用 systemctl {} proxy-rs",
-            if command == "start_service" {
-                "start"
-            } else {
-                "stop"
-            }
-        ),
+        // Service lifecycle and the OS file manager: process state, not
+        // business logic.
+        //
+        // The desktop registers these as in-process hooks
+        // (`crate::desktop_hooks`) — it *has* to: its console page runs on
+        // `http://127.0.0.1:<port>/admin/`, an origin the Tauri runtime does
+        // not inject IPC into, so there is no channel left but HTTP. A server
+        // registers nothing and gets the systemd explanation, which is the
+        // truth for a headless deployment.
+        "start_service" => hook_value(crate::desktop_hooks::call("start", |h| {
+            h.start_service.clone()
+        })),
+        "stop_service" => hook_value(crate::desktop_hooks::call("stop", |h| {
+            h.stop_service.clone()
+        })),
+        "open_logs_dir" => hook_value(crate::desktop_hooks::call("open", |h| {
+            h.open_logs_dir.clone()
+        })),
+        "reveal_path" => {
+            let path = req_str(&args, "path")?;
+            hook_value(crate::desktop_hooks::call_with_arg("reveal", path, |h| {
+                h.reveal_path.clone()
+            }))
+        }
 
         other => bail!("未知命令: {other}"),
     }
 }
 
 // ── Argument helpers ───────────────────────────────────────────────────────
+
+/// Wrap a desktop hook's outcome in the JSON shape the UI expects.
+///
+/// The desktop's own commands answered with a small object; the UI only reads
+/// `ok` (and ignores the rest), so the same shape is kept here rather than
+/// inventing a new one.
+fn hook_value(outcome: Result<String, String>) -> Result<Value> {
+    match outcome {
+        Ok(message) => Ok(json!({ "ok": true, "message": message })),
+        Err(e) => Err(anyhow!(e)),
+    }
+}
 
 fn req_str(args: &Map<String, Value>, name: &str) -> Result<String> {
     args.get(name)
@@ -661,7 +685,7 @@ async fn export_ack(state: &Arc<AdminState>, args: &Value) -> Result<Value> {
 
 /// Write the Claude Code configuration, honouring the fields the form sent.
 fn apply_claude_config(state: &Arc<AdminState>, body: Value) -> Result<Value> {
-    let base_url = format!("http://127.0.0.1:{}", state.process.bound_port);
+    let base_url = format!("http://127.0.0.1:{}", state.process.port());
     let mut updates = Vec::new();
     for (slot, key) in [
         ("model", "model"),
