@@ -11,6 +11,7 @@
     "windows": [
       {
         "title": "Proxy RS",
+        "url": "bootstrap.html",
         "label": "main",
         "width": 920,
         "height": 660,

@@ -43,6 +43,16 @@ struct AppContext {
     /// effect on the very next request. Rebuilding it per start would also reset
     /// the throttled `last_used_ms` bookkeeping for no benefit.
     client_auth: Arc<proxy_rs::client_accounts::ClientAuthState>,
+    /// Console sessions for the desktop's in-process `/admin/` surface.
+    ///
+    /// Lives on the context (not rebuilt per listener start) so the webview's
+    /// cookie survives the listener restarts that saving settings triggers.
+    /// Sessions are minted by `desktop-boot` — there is no token login on the
+    /// desktop, because the process itself is the operator.
+    admin_sessions: Arc<proxy_rs::admin_auth::AdminSessions>,
+    /// Growth-run progress lines, shared with the admin RPC layer (polled by
+    /// the console instead of pushed as Tauri events).
+    growth_progress: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 struct TrayState {
@@ -338,6 +348,27 @@ fn request_stop(app: tauri::AppHandle, ctx: Arc<AppContext>) {
     tauri::async_runtime::spawn(async move {
         ctx.logs.push("INFO", "代理服务已停止".into()).await;
     });
+}
+
+// ── Desktop bootstrap IPC (the smallest surface that survives 3.4.0) ──────
+//
+// The webview now loads the in-process `/admin/` console over HTTP; these two
+// commands (plus start/stop, dialogs and the tray) are what remains of the old
+// 58-command IPC surface. `ui/bootstrap.html` uses them because it must reach
+// the host *before* the gateway is listening — the console it opens cannot.
+
+/// What the bootstrap page needs: whether the gateway is listening, and on
+/// which port. Cheap and safe to poll.
+#[tauri::command]
+async fn get_bootstrap_info(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
+    // Give a just-issued start a moment to settle, mirroring `await_start_outcome`.
+    let running = ctx.service_ctrl.is_running()
+        || ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst) != 0;
+    Ok(json!({
+        "running": running,
+        "port": ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 /// Wait briefly for the startup attempt to settle, so the caller can be told
@@ -2415,10 +2446,32 @@ fn run_proxy_server(
             ctx.credential_pool.clone(),
             ctx.client_auth.clone(),
         );
-        // No admin console on the desktop: it drives the same capabilities
-        // through Tauri IPC, and serving a second browser-reachable surface from
-        // the desktop app would mean a second thing to authenticate.
-        let app_router = router::with_admin(app_router, None);
+        // The desktop now serves the SAME `/admin/` console the server binary
+        // does, and the webview loads it (see `ui/bootstrap.html`). The P1
+        // duplication — ~50 Tauri commands reimplementing `admin_rpc` arms —
+        // is the thing this deletes; the in-process console is what replaces
+        // it. `desktop: true` is what makes `desktop-boot` mint the webview's
+        // session (loopback only, see `console::desktop_boot`); the server
+        // build keeps `desktop: false` and its token login untouched.
+        let admin_state = Arc::new(proxy_rs::admin_routes::AdminState {
+            sessions: ctx.admin_sessions.clone(),
+            stats: ctx.stats.clone(),
+            logs: ctx.logs.clone(),
+            client_auth: ctx.client_auth.clone(),
+            pool: ctx.credential_pool.clone(),
+            process: proxy_rs::admin::ProcessInfo {
+                version: env!("CARGO_PKG_VERSION"),
+                bound_port: ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst),
+                started_at: ctx.started_at,
+                bind_addr: config_arc.bind.clone(),
+            },
+            client: ctx.client.clone(),
+            desktop: true,
+            growth_progress: ctx.growth_progress.clone(),
+        });
+        let admin_router = proxy_rs::admin_routes::build_admin_router(admin_state.clone())
+            .merge(proxy_rs::console::build_console_router(admin_state));
+        let app_router = router::with_admin(app_router, Some(admin_router));
 
         let bind_addr = config_arc.bind.clone();
         // No `+1` fallback: every client CLI is pointed at one fixed gateway
@@ -2470,8 +2523,13 @@ fn run_proxy_server(
             )
             .await;
 
-        let server = axum::serve(listener, app_router)
-            .with_graceful_shutdown(async move { shutdown.cancelled().await });
+        // Peer-address extraction, same as the server binary: the desktop's
+        // desktop-boot endpoint answers loopback requests only.
+        let server = axum::serve(
+            listener,
+            app_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await });
 
         if let Err(e) = server.await {
             ctx.logs
@@ -2587,6 +2645,8 @@ fn main() {
         credential_pool: Arc::new(proxy_rs::session_pool::CredentialPool::new(
             proxy_rs::workbuddy_auth::ordered_credentials(),
         )),
+        admin_sessions: Arc::new(proxy_rs::admin_auth::AdminSessions::new()),
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
         client_auth: Arc::new(proxy_rs::client_accounts::ClientAuthState::new(
             client_auth_enabled,
         )),
@@ -2777,6 +2837,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
+            get_bootstrap_info,
             get_stats,
             get_session_metrics,
             start_service,
