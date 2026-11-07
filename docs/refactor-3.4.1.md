@@ -2,7 +2,7 @@
 
 > 基线：`main` @ `2a8ba3d`（v3.4.0）
 > 目标：把妨碍扩展的超大文件拆成职责内聚的模块，**行为零变更**
-> 结果：10 个提交，101 个文件，`cargo test` 755 全绿（原 752，+3 守卫）
+> 结果：17 个提交，`cargo test` 755 全绿（原 752，+3 守卫），五项门禁全过
 
 ---
 
@@ -51,6 +51,10 @@ src/foo.rs  →  src/foo/mod.rs     模块文档 + 布局表 + mod 声明 + pub 
 | `translate/responses.rs` | 2314 | `translate/responses/{request,response,stream}` | 490 |
 | `proxy.rs` | 2420 | `proxy/{flavor,handlers,request,forward,response,models}` | 858 |
 | `admin.rs` | 1036 | `admin/{ops_settings,ops_identities,ops_client_accounts,ops_pool,ops_dsh,ops_points,ops_sessions,ops_stats}` | 376 |
+| `admin_routes.rs` | 1024 | `admin_routes/{login,observe,settings,identities,automation,client_accounts,pool,error}`，路由表留在 `mod.rs` | 264 |
+| `growth.rs` | 1320 | `growth/{protocol,tasks,events}` | 459 |
+| `scheduler.rs` | 976 | `scheduler/{loops,daily_checkin,login_scan,growth_tasks,engine,snapshot}` | 234 |
+| `credits.rs` | 828 | `credits/{fields,shapes,parse,fetch,handler}` | 295 |
 | `src-tauri/main.rs` | 1081 | `app/{context,tray,server,lifecycle}` + `main.rs` 保留 IPC 命令与 `main()` | 277 |
 
 ### 2.3 几个值得记录的判断
@@ -145,6 +149,10 @@ free 节点降级）。切开它必须改控制流，那已经不是"搬文件"�
 | translate/responses | 0 | 0 / 0（1259 行） |
 | proxy | 0 | `tests.rs` 2617 行 `git diff` 为空 |
 | admin | 0（仅 import 行） | 0 / 0 |
+| admin_routes | 0 | 无测试模块 |
+| growth | 0 | 0 / 0（10487 字节） |
+| scheduler | 0 | 0 / 0（7802 字节） |
+| credits | 0 | 0 / 0（2518 字节） |
 | ui/src 四个模块 | 0 | — |
 | src-tauri/main.rs | 2（`include_bytes!` 路径） | — |
 
@@ -180,14 +188,19 @@ sha256 `bba36599…a6123f`。浏览器解析到的样式流一个字节没变。
 | 文件 | 生产行数 | 判断 |
 |---|---:|---|
 | `src/proxy/tests.rs` | 2617 | 测试文件，见 §5 |
-| `src/admin_routes.rs` | 1023 | REST 路由表 + handler，单一职责（传输层）。可按资源分组再拆，收益中等 |
-| `src/growth.rs` | 994 | 成长任务协议：任务表 + 客户端 + 数据模型。任务表（`task_specs`）独立成文件收益明显 |
-| `src/proxy/forward.rs` | 858 | 见 §5，已知债务 |
-| `src/scheduler.rs` | 782 | 三个后台循环 + 调度状态，可按循环拆分 |
+| `src/proxy/forward.rs` | 858 | 单函数 `forward_request`，见 §5 已知债务 |
 | `src/admin_rpc.rs` | 777 | 命令分发表，本身就是薄 dispatch。**不该拆** |
+| `src/growth_runner.rs` | 668 | 编排层：预算、单账号推进、池级运行、汇总。可再按「单账号 / 池级」切 |
+| `src/pool_transfer/import.rs` | 647 | 已在 3.4.1 内拆到位；导入链本身是一条长流程，再切会把一次事务拆散 |
+| `src/console.rs` | 626 | 控制台路由 + 静态资源服务。真正的资产清单已移入 `build.rs` |
+| `src/codex_config.rs` | 606 | 单一职责（写 Codex 配置），长但只有一件事 |
+| `src/proxy/sse.rs` | 599 | SSE 分帧 + 请求台账 + TTFT 追踪，内聚 |
 
-这些是**下一步**的候选，不是 3.4.1 的遗留缺陷：3.4.1 的目标是把"多件事共用
-一个命名"的病灶清掉，而不是把所有文件压到某个行数以下。
+前三个是**明确的下一步候选**；后四个属于「长但只有一件事」，行数不是病灶。
+判据始终是"是否多件事共用一个命名"，而不是把所有文件压到某个行数以下。
+
+值得注意：`admin_routes.rs`（1023）、`growth.rs`（994）、`scheduler.rs`（782）、
+`credits.rs`（753）在初版文档里被列为"下一步候选"，已在同一轮内完成拆分。
 
 ---
 
