@@ -273,6 +273,20 @@ async function runExport() {
     }
     if (!res?.ok) throw new Error('导出未返回结果');
 
+    // HTTP-backed export (server console, and the desktop webview now that it
+    // runs the same-origin console): the backend cannot write a user-chosen
+    // file, so it hands back a download URL. Navigate to it — the browser owns
+    // the destination, which is also why `res.path` below reads "浏览器下载".
+    // (The desktop's old native save panel answered without `download_url`.)
+    if (res.download_url) {
+      const a = document.createElement('a');
+      a.href = res.download_url;
+      a.download = '';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
     // An empty export must never read as success. This is the case that produced
     // a 356-byte "backup" containing nothing: the file is written and valid, but
     // it restores no account, and the user's next step is to trust it on another
@@ -300,15 +314,21 @@ async function runExport() {
     if ($('#wb-export-passphrase')) $('#wb-export-passphrase').value = '';
     if ($('#wb-export-passphrase2')) $('#wb-export-passphrase2').value = '';
 
-    toast('账号池已导出', 'ok', {
-      label: '在文件夹中显示',
-      onClick: async (dismiss) => {
-        await invoke('reveal_path', { path: res.path });
-        dismiss();
-      },
-      timeout: 8000,
-    });
-    showWbStatus(`账号池已导出：${res.path}`);
+    if (res.download_url) {
+      // Browser download: there is no file to reveal.
+      toast('账号池已导出（浏览器下载）', 'ok', { timeout: 5000 });
+      showWbStatus('账号池已导出：浏览器下载');
+    } else {
+      toast('账号池已导出', 'ok', {
+        label: '在文件夹中显示',
+        onClick: async (dismiss) => {
+          await invoke('reveal_path', { path: res.path });
+          dismiss();
+        },
+        timeout: 8000,
+      });
+      showWbStatus(`账号池已导出：${res.path}`);
+    }
   } catch (e) {
     if (result) {
       result.textContent = `导出失败: ${e}`;

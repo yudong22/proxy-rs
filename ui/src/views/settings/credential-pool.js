@@ -22,6 +22,8 @@ let growthRunActive = false;
 let growthRunFinished = false;
 /** Recent progress lines, newest last. */
 let growthProgressLines = [];
+/** Poll draining the backend's progress buffer while a run is in flight. */
+let growthProgressTimer = null;
 
 /**
  * Paint the growth progress box.
@@ -559,6 +561,8 @@ function initAutomationDialog() {
 
 /** Wire the credential-pool controls and paint the initial list. */
 export function initCredentialPool() {
+  // A re-init (view remount) must not stack a second poll on the first.
+  if (growthProgressTimer) clearInterval(growthProgressTimer);
   // The QR flow repaints the list through this hook (see oauth-qr.js), and the
   // re-bind dialog does the same through its own (see relogin.js). Both are
   // injected rather than imported back, so neither module has to depend on this
@@ -575,19 +579,19 @@ export function initCredentialPool() {
 
   // 增长积分：跑一遍成长任务并领奖。结果里「跳过」和「未推进」必须显式告知，
   // 否则用户会以为"跑了=全拿到了"。
-  // Growth progress stream. Bound once per view init; the handler only updates
-  // the status line, so re-rendering the pool does not lose the listener.
-  // `initCredentialPool` is called synchronously from the view router, so the
-  // subscription is fired and forgotten rather than awaited: binding a listener
-  // must not delay first paint of the pool.
-  listen('growth-progress', (p) => {
+  // Growth progress stream, **polled**.
+  //
+  // The backend used to push these as Tauri events; a shared HTTP console has
+  // no push channel, so progress now lands in a server-side buffer that
+  // `get_growth_progress` drains (take-and-clear). The poll runs only while a
+  // run is in flight and its summary has not yet been written, so an idle view
+  // costs nothing. Gating on a strict "still in flight" flag lost the tail of
+  // very fast runs for the events path (the run resolves before its last
+  // events arrive), so the poll deliberately keeps draining until
+  // `growthRunFinished` — the buffer is empty by then, and the extra poll is
+  // free.
+  function appendProgress(p) {
     if (!p || !p.phase) return;
-    // Accept events whenever a run has been started and its summary has not yet
-    // been written. Gating on a strict "still in flight" flag lost the tail of
-    // very fast runs: with the mock backend (and any run that finishes inside a
-    // single tick) `growthRunActive` was already false by the time the final
-    // events arrived, so the box showed only "开始运行成长任务…".
-    if (growthRunFinished) return;
     const lines = growthProgressLines;
     if (p.phase === 'account_start') {
       lines.push(`⏳ 第 ${p.index}/${p.total} 个账号：${p.label}`);
@@ -607,7 +611,27 @@ export function initCredentialPool() {
     // Keep only the tail: a long pool run would otherwise fill the line.
     if (lines.length > 6) lines.splice(0, lines.length - 6);
     paintGrowthProgress(false);
+  }
+
+  // Dual-channel progress: listen() is active on desktop/harness, while HTTP
+  // console uses polling (where listen() degrades cleanly to a no-op).
+  listen('growth-progress', (p) => {
+    if (growthRunFinished) return;
+    appendProgress(p);
   });
+
+  growthProgressTimer = setInterval(async () => {
+    if (growthRunFinished) return;
+    let res;
+    try {
+      res = await invoke('get_growth_progress');
+    } catch {
+      return; // transient (listener restarting); next tick retries
+    }
+    for (const p of res?.lines || []) {
+      appendProgress(p);
+    }
+  }, 1000);
 
   $('#btn-wb-growth')?.addEventListener('click', async () => {
     const btn = $('#btn-wb-growth');
