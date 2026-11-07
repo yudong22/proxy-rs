@@ -615,23 +615,28 @@ export function initCredentialPool() {
 
   // Dual-channel progress: listen() is active on desktop/harness, while HTTP
   // console uses polling (where listen() degrades cleanly to a no-op).
-  listen('growth-progress', (p) => {
-    if (growthRunFinished) return;
-    appendProgress(p);
-  });
-
-  growthProgressTimer = setInterval(async () => {
+  // Drain the backend's progress buffer once.
+  //
+  // The endpoint is take-and-clear, so each call yields only what was
+  // produced since the last one. A failure is ignored: the next tick retries
+  // (a listener restart mid-run is transient, and the run itself will fail
+  // loudly if it was real).
+  async function drainProgress() {
     if (growthRunFinished) return;
     let res;
     try {
       res = await invoke('get_growth_progress');
     } catch {
-      return; // transient (listener restarting); next tick retries
+      return;
     }
     for (const p of res?.lines || []) {
       appendProgress(p);
     }
-  }, 1000);
+  }
+
+  // 250ms, not 1s: a whole-pool run can finish inside a second, and a slow
+  // first poll would report nothing at all for the runs that matter most.
+  growthProgressTimer = setInterval(drainProgress, 250);
 
   $('#btn-wb-growth')?.addEventListener('click', async () => {
     const btn = $('#btn-wb-growth');
@@ -639,7 +644,7 @@ export function initCredentialPool() {
       btn.disabled = true;
       btn.textContent = '⏳ 增长中...';
     }
-    // Progress state: the event handler appends lines while `growthRunActive`.
+    // Progress state: the poller appends lines while `growthRunActive`.
     growthRunActive = true;
     growthRunFinished = false;
     growthProgressLines = ['开始运行成长任务…'];
@@ -713,10 +718,11 @@ export function initCredentialPool() {
     } finally {
       growthRunActive = false;
       clearInterval(heartbeat);
-      // Let the last queued events land before freezing the box; the backend
-      // emits `finished` just before the command resolves, and Tauri delivers it
-      // on the same event loop.
-      await new Promise((r) => setTimeout(r, 150));
+      // Drain once more before freezing the box: the run's last progress lines
+      // are written just before the command resolves, and the poller may not
+      // have ticked since. The freeze flag is set *after* this drain, so those
+      // lines are not discarded.
+      await drainProgress();
       growthRunFinished = true;
       paintGrowthProgress(false);
       if (btn) {

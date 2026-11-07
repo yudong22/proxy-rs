@@ -457,6 +457,17 @@ try {
     window.__TAURI__ = {
       core: { invoke: (cmd, args) => { window.__CALLS__.push(cmd);
         window.__INVOKE_ARGS__[cmd] = args;
+        // get_growth_progress is take-and-clear on the real backend: the
+        // console drains the buffer and the next poll sees nothing new. The
+        // mock reproduces that, so a UI that kept re-reading the same lines
+        // would show duplicates here too.
+        if (cmd === 'get_growth_progress') {
+          const lines = window.__MOCKDATA__.__growth_progress_drained
+            ? []
+            : (window.__MOCKDATA__.__growth_progress_events || []);
+          window.__MOCKDATA__.__growth_progress_drained = true;
+          return Promise.resolve({ lines });
+        }
         return Promise.resolve(Object.prototype.hasOwnProperty.call(window.__MOCKDATA__, cmd)
           ? window.__MOCKDATA__[cmd] : null); } },
       // A real dispatcher: listen() records the handler and __emitTestEvent
@@ -640,16 +651,16 @@ try {
   // events the backend sends, and requires the progress box to show them.
   await send('Runtime.evaluate', { expression: `(() => {
     window.__CALLS__ = [];
+    // A fresh run starts with an empty buffer (the backend drains it).
+    window.__MOCKDATA__.__growth_progress_drained = false;
     document.querySelector('#btn-wb-growth').click();
   })()` });
   // Let the click handler set up its state before the events arrive.
   await new Promise((r) => setTimeout(r, 150));
-  await send('Runtime.evaluate', { expression: `(() => {
-    for (const p of window.__MOCKDATA__.__growth_progress_events) {
-      window.__emitTestEvent('growth-progress', p);
-    }
-  })()` });
-  await new Promise((r) => setTimeout(r, 1200));
+  // The progress lines now arrive by polling `get_growth_progress` (the
+  // console has no event channel over HTTP), so the harness waits for a poll
+  // tick instead of emitting events.
+  await new Promise((r) => setTimeout(r, 1400));
 
   const growthUi = await send('Runtime.evaluate', {
     returnByValue: true,

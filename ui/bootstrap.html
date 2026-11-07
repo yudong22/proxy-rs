@@ -67,7 +67,7 @@
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
         try {
-          const r = await fetch(`http://127.0.0.1:${port}/admin/api/desktop-boot`, { cache: 'no-store' });
+          const r = await fetch(`http://127.0.0.1:${port}/health`, { cache: 'no-store' });
           if (r.ok) return true;
         } catch { /* not up yet */ }
         await new Promise((r) => setTimeout(r, 250));

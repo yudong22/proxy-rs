@@ -47,7 +47,6 @@ const DESKTOP_ONLY = new Set([
   'stop_service',
   'open_logs_dir',
   'reveal_path',
-  'pool_export', // desktop: native save panel (HTTP equivalent: /admin/api/pool/export download)
 ]);
 
 /** True when this page was served by the gateway itself (same origin). */
