@@ -298,3 +298,496 @@ details.form-section[open] > summary {
   margin-top: 8px;
 }
 
+
+/* ── 会话 view ───────────────────────────────────────────────────────────── */
+/* A two-pane reader inside the standard `.logs-panel` card: the session list
+   on the left, the transcript on the right. Both panes scroll on their own,
+   which is why the pane is `.tab-content--fill`. */
+
+.sess-panel {
+  gap: 0;
+}
+
+.sess-split {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  flex: 1;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+  margin: 0 -16px;
+}
+
+.sess-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+
+.sess-rows {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* A fixed-height row: two lines, titles and paths clipped with an ellipsis.
+   Left to itself a long session title or cwd wraps onto a third line and the
+   list becomes a ragged column; a constant height keeps it scannable. */
+.sess-row {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  width: 100%;
+  /* border-box keeps the declared height the *rendered* height; content-box
+     would add the padding on top of it. */
+  box-sizing: border-box;
+  height: 60px;
+  padding: 0 12px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
+  color: var(--text);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.sess-row:hover {
+  background: var(--surface2);
+}
+
+/* Selection is a background, not a coloured border — the same convention as
+   `.metric-card.active` and the identity pool's default row. */
+.sess-row.active {
+  background: var(--surface2);
+}
+
+.sess-row-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.sess-row-path {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  max-width: 100%;
+}
+
+/* One line of counters; anything that does not fit is clipped, never wrapped. */
+.sess-row-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.sess-row-foot > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.sess-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-tint);
+  color: var(--accent);
+}
+
+.sess-approx {
+  color: var(--muted);
+}
+
+.sess-pager {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.sess-detail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.sess-detail-scroll {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  /* The scroll lives here, not on `.sess-timeline`: the header must scroll
+     away with the transcript, and the pane must fill the column even when the
+     transcript is short (otherwise the card collapses to its content). */
+  overflow-y: auto;
+}
+
+.sess-detail-scroll[hidden],
+.sess-pane-empty[hidden] {
+  display: none;
+}
+
+.sess-detail-head {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.sess-pane-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sess-empty {
+  padding: 24px 14px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.sess-detail-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-detail-path {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-detail-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.sess-muted {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.sess-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 18px;
+  margin-bottom: 8px;
+}
+
+.sess-stats-label {
+  font-size: 11px;
+  color: var(--muted);
+  width: 100%;
+}
+
+.sess-kv {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.sess-kv strong {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.sess-gateway {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 16px;
+}
+
+.sess-gateway--muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sess-gateway-title {
+  width: 100%;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.sess-gateway-title code {
+  font-size: 11px;
+}
+
+.sess-gateway-note {
+  width: 100%;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ── Detail timeline ───────────────────────────────────────────── */
+
+.sess-timeline-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.sess-timeline {
+  flex: 1 0 auto;
+  padding: 14px 20px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* A "turn" is one block of the transcript: a prompt, an assistant paragraph,
+   a tool call with its output, or a thinking block. */
+.sess-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sess-line-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.sess-time,
+.sess-model {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.sess-tokens {
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.sess-ribbon {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  background: var(--neutral-tint);
+  color: var(--muted-ink);
+}
+
+/* User prompt: the one bordered bubble, so the eye can find where a turn
+   begins while scrolling. */
+.sess-prompt {
+  align-self: flex-start;
+  max-width: 90%;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface2);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Assistant prose: inline, unwrapped, indented to align under the tool lines. */
+.sess-prose {
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+
+/* ⏺ Bash(ls -la) */
+.sess-tool-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.sess-tool-dot {
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.sess-tool-name {
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+.sess-tool-args-preview {
+  color: var(--muted-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* ⎿ output — indented under the call, full text, own scroll for huge output. */
+.sess-tool-result {
+  display: flex;
+  gap: 6px;
+  margin-left: 2px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+}
+
+.sess-tool-arrow {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+/* A failed tool is a status, so it gets the semantic colour. */
+.sess-tool-result.is-error {
+  border-left-color: var(--error-tint-border);
+}
+
+.sess-tool-result.is-error .sess-pre {
+  background: var(--error-tint);
+  border-color: var(--error-tint-border);
+}
+
+/* Folded result: the preview is the summary's own content; the full text only
+   exists in the DOM when opened, so a 1500-line result costs nothing at rest. */
+.sess-result-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.sess-result > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.sess-result > summary::-webkit-details-marker {
+  display: none;
+}
+
+.sess-result > summary .sess-pre {
+  margin-bottom: 2px;
+}
+
+.sess-result-more {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--accent);
+  padding: 0 0 2px 6px;
+}
+
+.sess-result[open] > summary {
+  margin-bottom: 2px;
+}
+
+.sess-tool-args summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 20px;
+}
+
+/* No scrollbar, ever: tool output is shown in full or folded, never in a nested
+   scrolling box (the timeline already scrolls). */
+.sess-pre {
+  margin: 2px 0 0;
+  padding: 6px 8px;
+  flex: 1;
+  min-width: 0;
+  overflow: visible;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Thinking: dim italic, visibly "not the answer". */
+.sess-thinking-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.sess-thinking-text {
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+  font-style: italic;
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+}
+
+.sess-meta-text {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.sess-cut {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.sess-model-table {
+  margin-top: 8px;
+  font-size: 11px;
+}
+
+@media (max-width: 720px) {
+  .sess-split {
+    grid-template-columns: 1fr;
+  }
+
+  .sess-sidebar {
+    border-right: none;
+  }
+}

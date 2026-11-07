@@ -58,6 +58,16 @@
 未配置 `PROXY_API_TOKEN` 时，管理台的登录接口返回 `503 admin_disabled`，
 页面显示如何配置而不是一个永远失败的登录框。
 
+### 登录后回到哪个标签
+
+登录页是原生表单提交（密码管理器需要真实跳转），所以「登录后去哪个标签」由表单里的隐藏字段
+`next` 带上：`POST /admin/login`（form）成功后重定向到 `/admin/#<tab>`。服务端**只认四个标签名**
+（`overview` / `logs` / `sessions` / `settings`），其余一律落到 `/admin/`——防止把表单字段当开放重定向用。
+令牌错误时重定向回 `/admin/login?e=…&next=<tab>`，重试后仍回到原标签。
+
+前端控制台的标签也各有 hash 地址（`#overview` / `#logs` / `#sessions` / `#settings`），
+刷新、粘贴链接、前进后退都落在同一个标签上。
+
 ### 会话存哪
 
 **进程内存**，不落盘：
@@ -150,6 +160,25 @@
 | `GET` | `/admin/api/logs` | 内存日志缓冲 |
 | `POST` | `/admin/api/logs/clear` | 清空日志缓冲 |
 | `GET` | `/admin/api/session-metrics` | 会话速度对比 |
+| `GET` | `/admin/api/claude-sessions?limit=&offset=` | 本机 Claude Code 会话列表（按 mtime 降序），每行带按 `claude:<uuid>` 关联的网关用量 |
+| `GET` | `/admin/api/claude-sessions/:id?limit=&offset=` | 单个会话的详情与时间线（默认返回最新 200 条，`offset` 向前翻） |
+| `GET` | `/admin/api/claude-sessions/:id/subagents/:agent` | 某个子代理的对话记录 |
+
+### 本地会话（会话页）
+
+读取的是**服务器进程用户**的 `~/.claude/projects/<编码 cwd>/<session-id>.jsonl`
+（可用 `CLAUDE_PROJECTS_DIR` 覆盖根目录，主要供测试）。要点：
+
+- 会话 id 即文件名 UUID，也是网关 `stats.db` 里 `claude:<uuid>` 的键；`gateway` 字段为 `null`
+  表示「网关未记录」（请求未经过本代理或未带会话头），**不是** 0 次。
+- `counts_partial: true` 表示列表只读了文件首尾，`turns` / `tool_calls` 为下界；打开详情得到精确值。
+- 时间戳一律是 epoch 毫秒，由浏览器按本地时区格式化。
+- 会话 id / 子代理 id 都严格校验（UUID / `[A-Za-z0-9_-]`），并做 canonicalize 越界检查。
+- **DSH 会话暂不支持**：其存档是 zstd 压缩的 `session.vN.jsonl.zstd`。列表响应的 `sources`
+  里 DSH 条目 `available: false` 并附原因，前端据此渲染为禁用项。
+
+对应的控制台命令（`/admin/api/rpc/<name>`，与桌面端 Tauri 命令同名）：
+`claude_sessions_list`、`claude_sessions_detail`、`claude_sessions_subagent`。
 
 ### 配置
 

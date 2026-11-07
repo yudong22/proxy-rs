@@ -332,6 +332,43 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
         "get_dsh_config" => crate::admin::read_dsh_config(),
         "apply_dsh_config" => crate::admin::apply_dsh_config(state).await,
 
+        // ── Local sessions (会话 page) ──────────────────────────────────
+        // Argument names mirror the Tauri signatures: `args` is the paging
+        // object, and the detail commands take a bare `id` (+ `agentId`).
+        "claude_sessions_list" => {
+            let list_args = args
+                .get("args")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| anyhow!("会话参数无效: {e}"))?
+                .unwrap_or_default();
+            crate::admin::claude_sessions_list(Some(state.stats.clone()), list_args).await
+        }
+        "claude_sessions_detail" => {
+            let id = req_str(&args, "id")?;
+            let detail_args = args
+                .get("args")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| anyhow!("会话参数无效: {e}"))?
+                .unwrap_or_default();
+            crate::admin::claude_session_detail(Some(state.stats.clone()), id, detail_args).await
+        }
+        "claude_sessions_subagent" => {
+            let id = req_str(&args, "id")?;
+            let agent_id = req_str(&args, "agentId")?;
+            let detail_args = args
+                .get("args")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| anyhow!("会话参数无效: {e}"))?
+                .unwrap_or_default();
+            crate::admin::claude_subagent_detail(id, agent_id, detail_args).await
+        }
+
         // The two commands whose meaning does not survive the move to a server.
         // Refused with the reason the operator needs, not faked: a button that
         // silently does nothing is worse than one that says why. The shared UI

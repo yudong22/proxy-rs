@@ -156,6 +156,11 @@ tasks:
   # The UI has no bundler, so nothing else would catch a stylesheet that is not
   # linked, an import that no module exports, or an id lookup that misses.
 
+  ui-dev:
+    desc: Serve ui/ in a browser with real local Claude sessions (no Rust build)
+    cmds:
+      - node ui/tools/dev.mjs
+
   ui-check:
     desc: Check ui/ consistency (stylesheet cascade, imports, ids)
     cmds:

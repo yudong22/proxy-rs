@@ -83,6 +83,12 @@ pub fn build_admin_router(state: Arc<AdminState>) -> Router<()> {
         .route("/admin/api/stats", get(stats))
         .route("/admin/api/request-logs", get(request_logs))
         .route("/admin/api/session-metrics", get(session_metrics))
+        .route("/admin/api/claude-sessions", get(claude_sessions))
+        .route("/admin/api/claude-sessions/:id", get(claude_session))
+        .route(
+            "/admin/api/claude-sessions/:id/subagents/:agent",
+            get(claude_subagent),
+        )
         .route("/admin/api/logs", get(logs_get))
         .route("/admin/api/logs/clear", post(logs_clear))
         .route("/admin/api/settings", get(settings_get).post(settings_save))
@@ -158,6 +164,9 @@ pub struct LoginBody {
     /// decision, not the fallback.
     #[serde(default)]
     pub remember: bool,
+    /// Form-only: the tab to land on. JSON clients omit it.
+    #[serde(default)]
+    pub next: Option<String>,
 }
 
 /// Parse `token=…&remember=1` from a form post.
@@ -169,6 +178,9 @@ fn parse_form_login(body: &[u8]) -> Option<LoginBody> {
     let text = std::str::from_utf8(body).ok()?;
     let mut token = None;
     let mut remember = false;
+    // The tab to land on after login (`#sessions`, …). Validated later in
+    // `landing_path`; the raw value is never trusted as a path.
+    let mut next = None;
     for pair in text.split('&') {
         let (k, v) = pair.split_once('=')?;
         let v = v.replace('+', " ");
@@ -176,6 +188,7 @@ fn parse_form_login(body: &[u8]) -> Option<LoginBody> {
         match k {
             "token" | "password" => token = Some(decoded),
             "remember" => remember = matches!(decoded.as_str(), "1" | "on" | "true"),
+            "next" => next = Some(decoded),
             _ => {}
         }
     }
@@ -183,7 +196,41 @@ fn parse_form_login(body: &[u8]) -> Option<LoginBody> {
     if token.is_empty() {
         return None;
     }
-    Some(LoginBody { token, remember })
+    Some(LoginBody {
+        token,
+        remember,
+        next,
+    })
+}
+
+/// Where a successful form login sends the browser.
+///
+/// `next` may only name a tab (`overview` / `logs` / `sessions` / `settings`).
+/// Anything else — an absolute URL, `//evil.example`, a path — is ignored,
+/// because a redirect target taken from a form field is an open redirect. The
+/// hash is re-attached so the console opens the tab the operator was looking at
+/// when the session expired.
+fn landing_path(next: Option<&str>) -> String {
+    const TABS: [&str; 4] = ["overview", "logs", "sessions", "settings"];
+    let tab = next
+        .map(|n| n.trim().trim_start_matches('#'))
+        .filter(|n| TABS.contains(n));
+    match tab {
+        Some(tab) => format!("/admin/#{tab}"),
+        None => "/admin/".to_string(),
+    }
+}
+
+/// `&next=<tab>` for a failed form login, or empty.
+///
+/// A rejected login must stay on the tab it came from: the operator retries the
+/// password, not the navigation. Same allow-list as [`landing_path`].
+fn next_tab_query(next: Option<&str>) -> String {
+    const TABS: [&str; 4] = ["overview", "logs", "sessions", "settings"];
+    next.map(|n| n.trim().trim_start_matches('#'))
+        .filter(|n| TABS.contains(n))
+        .map(|n| format!("&next={n}"))
+        .unwrap_or_default()
 }
 
 /// Minimal `%XX` decoder for form values.
@@ -281,6 +328,8 @@ pub async fn login_handler(
         }
     };
     let body = parsed;
+    // Only the form path carries `next` (a JSON client knows its own landing).
+    let next = body.next.clone();
     // Whether to believe the forwarding headers depends on whether a proxy is
     // actually in front of us (see `admin_auth::trusted_proxy`).
     let trust_forwarded = admin_auth::trusted_proxy(&crate::settings::GuiSettings::load().bind);
@@ -295,7 +344,7 @@ pub async fn login_handler(
                 // A form post must NAVIGATE, not return JSON: the password
                 // manager only records a save after a real page transition, and
                 // a user staring at `{"ok":true}` would think it failed.
-                axum::response::Redirect::to("/admin/").into_response()
+                axum::response::Redirect::to(&landing_path(next.as_deref())).into_response()
             } else {
                 Json(json!({
                     "ok": true,
@@ -317,7 +366,8 @@ pub async fn login_handler(
             let remaining = sessions.attempts_remaining(&client);
             if is_form {
                 return axum::response::Redirect::to(&format!(
-                    "/admin/login?e=invalid_token&left={remaining}"
+                    "/admin/login?e=invalid_token&left={remaining}{}",
+                    next_tab_query(next.as_deref())
                 ))
                 .into_response();
             }
@@ -426,6 +476,65 @@ async fn session_metrics(
         .map_err(|e| ApiError::internal(format!("查询异常终止: {e}")))?
         .map_err(|e| ApiError::internal(format!("查询失败: {e}")))?;
     Ok(Json(json!({ "sessions": rows })))
+}
+
+/// Local Claude Code sessions, for scripts as well as the console.
+fn not_found_or_internal(err: anyhow::Error) -> ApiError {
+    let msg = err.to_string();
+    if msg.contains("不存在") || msg.contains("无效的") {
+        ApiError::not_found(msg)
+    } else {
+        ApiError::internal(msg)
+    }
+}
+
+async fn claude_sessions(
+    Extension(state): Extension<Arc<AdminState>>,
+    Query(q): Query<ClaudeSessionsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let args = crate::claude_sessions::ListArgs {
+        limit: q.limit,
+        offset: q.offset,
+    };
+    crate::admin::claude_sessions_list(Some(state.stats.clone()), args)
+        .await
+        .map(Json)
+        .map_err(not_found_or_internal)
+}
+
+async fn claude_session(
+    Extension(state): Extension<Arc<AdminState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ClaudeSessionsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let args = crate::claude_sessions::DetailArgs {
+        limit: q.limit,
+        offset: q.offset,
+    };
+    crate::admin::claude_session_detail(Some(state.stats.clone()), id, args)
+        .await
+        .map(Json)
+        .map_err(not_found_or_internal)
+}
+
+async fn claude_subagent(
+    Path((id, agent)): Path<(String, String)>,
+    Query(q): Query<ClaudeSessionsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let args = crate::claude_sessions::DetailArgs {
+        limit: q.limit,
+        offset: q.offset,
+    };
+    crate::admin::claude_subagent_detail(id, agent, args)
+        .await
+        .map(Json)
+        .map_err(not_found_or_internal)
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeSessionsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 async fn logs_get(Extension(state): Extension<Arc<AdminState>>) -> Json<Value> {

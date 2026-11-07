@@ -39,6 +39,7 @@ impl Drop for Isolated {
     fn drop(&mut self) {
         std::env::remove_var(TOKEN_ENV);
         std::env::remove_var("PROXY_DATA_DIR");
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
         if !std::thread::panicking() {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -51,6 +52,8 @@ async fn isolate(name: &str, token: Option<&str>) -> Isolated {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
     std::env::set_var("PROXY_DATA_DIR", &dir);
+    // The session browser must never read the real home in a test.
+    std::env::set_var("CLAUDE_PROJECTS_DIR", dir.join("claude-projects"));
     settings::set_log_file_override_for_tests(dir.join("proxy.log"));
     match token {
         Some(t) => std::env::set_var(TOKEN_ENV, t),
@@ -109,6 +112,24 @@ fn test_router() -> axum::Router {
         client: reqwest::Client::new(),
     });
     app_for(state)
+}
+
+/// A fresh state for tests that only need the login route.
+fn test_state() -> Arc<AdminState> {
+    Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: 3456,
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+    })
 }
 
 async fn call(
@@ -224,6 +245,11 @@ async fn every_gated_route_refuses_an_anonymous_caller() {
         ("GET", "/admin/api/client-accounts"),
         ("GET", "/admin/api/logs"),
         ("POST", "/admin/api/checkin"),
+        ("GET", "/admin/api/claude-sessions"),
+        (
+            "GET",
+            "/admin/api/claude-sessions/00000000-0000-4000-8000-000000000000",
+        ),
     ] {
         let (status, body, _) = call(test_router(), method, uri, None, None).await;
         assert_eq!(
@@ -601,6 +627,7 @@ async fn rpc_dispatches_the_commands_the_console_calls() {
         ("wb_preferences", "result"),
         ("client_accounts_list", "result"),
         ("get_providers", "result"),
+        ("claude_sessions_list", "result"),
     ] {
         let (status, body) = post_rpc(app.clone(), command, "{}", &cookie).await;
         assert_eq!(status, StatusCode::OK, "{command}: {body}");
@@ -846,4 +873,179 @@ fn build_console_router_for_cors_test() -> axum::Router {
         client: reqwest::Client::new(),
     });
     build_console_router(state)
+}
+
+// ── Local Claude Code sessions (会话 page) ────────────────────────────────
+
+/// A fixture transcript under the isolated `CLAUDE_PROJECTS_DIR`.
+fn write_claude_fixture(dir: &std::path::Path, id: &str) {
+    let project = dir.join("-Users-denis-Sites-proxy-rs");
+    std::fs::create_dir_all(&project).unwrap();
+    let lines = [
+        json!({"type":"user","uuid":"u1","timestamp":"2026-11-01T10:00:00.000Z",
+               "cwd":"/Users/denis/Sites/proxy-rs","message":{"role":"user","content":"hello"}}),
+        json!({"type":"assistant","uuid":"a1","timestamp":"2026-11-01T10:00:05.000Z",
+               "message":{"id":"m1","model":"deepseek-v4.1-flash",
+                          "usage":{"input_tokens":10,"output_tokens":20},
+                          "content":[{"type":"text","text":"hi"}]}}),
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(project.join(format!("{id}.jsonl")), format!("{lines}\n")).unwrap();
+}
+
+#[tokio::test]
+async fn claude_sessions_lists_local_transcripts_with_source_descriptors() {
+    let iso = isolate("claude-sessions-ok", Some("tok")).await;
+    let id = "b9c3800a-311e-4c89-9a38-c533d8969b5d";
+    write_claude_fixture(&iso.dir.join("claude-projects"), id);
+
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let (status, body) = get_json(app.clone(), "/admin/api/claude-sessions", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], true);
+    assert_eq!(body["sessions"][0]["id"], id);
+    assert_eq!(body["sessions"][0]["cwd"], "/Users/denis/Sites/proxy-rs");
+    assert_eq!(body["sessions"][0]["title"], "hello");
+    // The DSH source is advertised but disabled, with the reason the UI shows.
+    let sources = body["sources"].as_array().unwrap();
+    assert_eq!(sources[0]["kind"], "claude_local");
+    assert_eq!(sources[1]["kind"], "dsh_local");
+    assert_eq!(sources[1]["available"], false);
+    assert!(!sources[1]["note"].as_str().unwrap().is_empty());
+
+    // Detail, through the same RPC the console uses.
+    let (status, body) = post_rpc(
+        app,
+        "claude_sessions_detail",
+        &json!({ "id": id, "args": {} }).to_string(),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["timeline"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_path_in_the_session_id_is_not_a_path() {
+    let iso = isolate("claude-sessions-traversal", Some("tok")).await;
+    let _ = &iso.dir;
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    for uri in [
+        "/admin/api/claude-sessions/..%2F..%2Fetc%2Fpasswd",
+        "/admin/api/claude-sessions/..",
+        "/admin/api/claude-sessions/etc/passwd",
+    ] {
+        let (status, _) = get_json(app.clone(), uri, &cookie).await;
+        assert_ne!(status, StatusCode::OK, "{uri} must not be served");
+    }
+}
+
+#[tokio::test]
+async fn claude_sessions_without_a_source_explains_itself() {
+    let iso = isolate("claude-sessions-none", Some("tok")).await;
+    // The isolated CLAUDE_PROJECTS_DIR was never created.
+    assert!(!iso.dir.join("claude-projects").exists());
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let (status, body) = get_json(app, "/admin/api/claude-sessions", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], false);
+    assert!(body["reason"]
+        .as_str()
+        .unwrap()
+        .contains(".claude/projects"));
+}
+
+/// Authenticated GET returning `(status, body)`.
+async fn get_json(app: axum::Router, uri: &str, cookie: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("cookie", cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+// ── Tab hash routing through login (`next`) ───────────────────────────────
+
+/// A native form post that names a valid tab lands on that tab's hash.
+#[tokio::test]
+async fn a_form_login_lands_on_the_requested_tab() {
+    let _iso = isolate("login-next", Some("tok")).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("password=tok&next=sessions"))
+        .unwrap();
+    let resp = app_for(test_state()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/admin/#sessions")
+    );
+}
+
+/// `next` is a form field, so it must never steer the browser off-site: only a
+/// bare tab name is honoured, everything else falls back to the default tab.
+#[tokio::test]
+async fn the_login_landing_tab_is_not_an_open_redirect() {
+    let _iso = isolate("login-next-evil", Some("tok")).await;
+    for evil in [
+        "//evil.example/x",
+        "https://evil.example",
+        "../../etc",
+        "/admin/logs",
+        "settings?x=1",
+    ] {
+        let body = format!("password=tok&next={}", evil.replace(' ', "%20"));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app_for(test_state()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{evil}");
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("/admin/"),
+            "{evil} must not become a redirect target"
+        );
+    }
+}
+
+/// A rejected login keeps the tab it came from, so a retry returns there.
+#[tokio::test]
+async fn a_failed_form_login_keeps_the_landing_tab() {
+    let _iso = isolate("login-next-fail", Some("tok")).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("password=wrong&next=logs"))
+        .unwrap();
+    let resp = app_for(test_state()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(loc.contains("e=invalid_token"), "{loc}");
+    assert!(loc.ends_with("&next=logs"), "{loc}");
 }

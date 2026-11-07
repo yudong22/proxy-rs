@@ -255,13 +255,13 @@ try {
   // the first RPC round trips take a beat longer than on loopback, and a bare
   // check here produced a false failure against production.
   await waitFor(
-    'document.querySelectorAll(".tab").length === 3',
+    'document.querySelectorAll(".tab").length === 4',
     'the tab bar to render'
   );
   ok(
     'the desktop tab bar rendered',
     (await evaluate('[...document.querySelectorAll(".tab")].map(t=>t.textContent.trim()).join("|")')) ===
-      '运行概览|实时日志|服务设置'
+      '运行概览|实时日志|会话|服务设置'
   );
   ok(
     'the desktop header chrome rendered',
@@ -308,7 +308,7 @@ try {
   );
 
   // ── Every tab renders ──────────────────────────────────────────────────
-  for (const tab of ['logs', 'settings', 'overview']) {
+  for (const tab of ['logs', 'sessions', 'settings', 'overview']) {
     await evaluate(`document.querySelector('.tab[data-tab="${tab}"]').click()`);
     await new Promise((r) => setTimeout(r, 700));
     const length = await evaluate(
@@ -322,6 +322,7 @@ try {
   // panel, which is exactly the failure this harness is for.
   for (const [command, args] of [
     ['get_providers', {}],
+    ['claude_sessions_list', { args: { limit: 5 } }],
     ['wb_credentials_list', {}],
     ['api_keys_list', {}],
     ['wb_preferences', {}],

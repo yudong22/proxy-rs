@@ -24,7 +24,7 @@ import {
   refreshSessionMetrics,
   renderOverview,
 } from './views/overview.js';
-import { renderTabs, setActiveTab } from './views/tabs.js';
+import { renderTabs, setActiveTab, TABS } from './views/tabs.js';
 import {
   initLogs,
   renderLogsView,
@@ -33,6 +33,11 @@ import {
   pollRequestLogs,
 } from './views/logs.js';
 import { fetchRequestLogs } from './components/table.js';
+import {
+  initSessions,
+  loadSessions,
+  renderSessions,
+} from './views/sessions/index.js';
 import { initSettings, loadSettings, renderSettings } from './views/settings/index.js';
 import { initPalette, close as closePalette } from './views/palette.js';
 
@@ -51,8 +56,41 @@ function showPane(tabName) {
   }
 }
 
-/** Show one tab and run whatever that view needs on entry. */
+/** The default tab when the URL carries no (or an unknown) hash. */
+const DEFAULT_TAB = 'overview';
+
+/**
+ * The tab named by `location.hash`, or the default.
+ *
+ * A hash makes a tab addressable — refresh keeps it, a link from another
+ * window lands on it, and the back button walks tab history the way a set of
+ * pages would. Only a known key is honoured: a stale `#old-view` must not leave
+ * the console with every pane hidden.
+ */
+function tabFromHash() {
+  const key = window.location.hash.replace(/^#/, '').toLowerCase();
+  return TABS.some((t) => t.key === key) ? key : DEFAULT_TAB;
+}
+
+/**
+ * Show one tab and run whatever that view needs on entry.
+ *
+ * The URL is the source of truth: every switch writes the hash (which itself
+ * fires `hashchange`), and `applyTab` is the single place that does the DOM
+ * work, so a click, a link and the back button cannot drift apart.
+ */
 export function switchTab(tabName) {
+  const key = TABS.some((t) => t.key === tabName) ? tabName : DEFAULT_TAB;
+  if (window.location.hash.replace(/^#/, '') !== key) {
+    window.location.hash = key;
+    // Navigating to the same hash fires no event; the guard above only skips
+    // the write, so the apply below always runs.
+  }
+  applyTab(key);
+}
+
+/** Paint one tab and run its on-entry work. */
+function applyTab(tabName) {
   appState.activeTab = tabName;
 
   setActiveTab(tabName);
@@ -61,6 +99,10 @@ export function switchTab(tabName) {
   if (tabName === 'logs') {
     if (appState.logsViewMode === 'table') fetchRequestLogs();
     else fetchLogs();
+  } else if (tabName === 'sessions') {
+    // Reads the local transcript directory; once per page lifetime, plus the
+    // toolbar's explicit 刷新 (sessions are files, not a live counter).
+    loadSessions();
   } else if (tabName === 'settings') {
     loadSettings();
   }
@@ -69,6 +111,13 @@ export function switchTab(tabName) {
 // Backend entry points (see the file header).
 window.switchTab = switchTab;
 window.refreshStatus = refreshStatus;
+
+// The hash is the router: back/forward and a pasted `#logs` link both land
+// here, and the hash was already honoured on first paint below.
+window.addEventListener('hashchange', () => {
+  const key = tabFromHash();
+  if (key !== appState.activeTab) applyTab(key);
+});
 
 // ── Escape closes whatever is on top ───────────────────────────
 // The palette and the confirm dialog both handle their own Escape; this is the
@@ -121,12 +170,14 @@ setInterval(() => {
 renderTabs();
 renderOverview();
 renderLogsView();
+renderSessions();
 renderSettings();
 
 initModal();
 initConfirm();
 initOverview();
 initLogs();
+initSessions();
 initSettings();
 initPalette(switchTab);
 
@@ -147,5 +198,7 @@ loadSettings();
 // Activate the default tab and put the logs view into its default mode. Both
 // are explicit now: index.html carries no `active` class or inline `display`,
 // so nothing is showing until these run.
-switchTab(appState.activeTab);
+// Honour the URL: a deep link (`#sessions`) wins over the default tab.
+if (!window.location.hash) window.history.replaceState(null, '', `#${DEFAULT_TAB}`);
+switchTab(tabFromHash());
 setLogsViewMode(appState.logsViewMode);

@@ -5,6 +5,7 @@ pub mod admin_rpc;
 pub mod api;
 pub mod api_token;
 pub mod claude_config;
+pub mod claude_sessions;
 pub mod client_accounts;
 pub mod client_auth;
 pub mod codex_config;
@@ -42,4 +43,4 @@ pub use settings::{
     data_dir, dotenv_path, log_dir, log_file_path, settings_path, GuiSettings, LogBuffer, LogEntry,
     DEFAULT_PORT,
 };
-pub use stats::{DayStats, StatsDb, TokenRecord};
+pub use stats::{DayStats, SessionUsageTotal, StatsDb, TokenRecord};

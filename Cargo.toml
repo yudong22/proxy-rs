@@ -83,6 +83,12 @@ argon2 = "0.5"
 aes-gcm = "0.10"
 base64 = "0.22"
 
+# Directory walk for the Claude Code session browser (`src/claude_sessions.rs`).
+# Only depth-1 iteration is used; `walkdir` is here because it skips symlinks by
+# default and reports per-entry errors instead of aborting the whole walk on one
+# unreadable project directory.
+walkdir = "2"
+
 # SHA-256 for the client-access-key store (`src/client_accounts.rs`).
 #
 # Only the *hash* of an inbound key is persisted, so a leaked state file cannot

@@ -149,6 +149,26 @@ const ASSETS: &[(&str, &str, &str)] = &[
         include_str!("../ui/src/views/logs.js"),
     ),
     (
+        "/src/views/sessions/index.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../ui/src/views/sessions/index.js"),
+    ),
+    (
+        "/src/views/sessions/list.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../ui/src/views/sessions/list.js"),
+    ),
+    (
+        "/src/views/sessions/timeline.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../ui/src/views/sessions/timeline.js"),
+    ),
+    (
+        "/src/views/sessions/entry.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../ui/src/views/sessions/entry.js"),
+    ),
+    (
         "/src/views/palette.js",
         "text/javascript; charset=utf-8",
         include_str!("../ui/src/views/palette.js"),

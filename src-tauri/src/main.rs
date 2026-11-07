@@ -407,6 +407,43 @@ async fn clear_logs(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
 /// `GET /api/request-logs`: the window prefers that endpoint and falls back to
 /// this command when the listener is down, so the two must be byte-identical
 /// rather than merely similar.
+/// The 会话 page: local Claude Code transcripts plus gateway usage.
+///
+/// Shares [`proxy_rs::admin::claude_sessions_list`] with the server console
+/// rather than reimplementing the join — the two front-ends must agree on what
+/// "未记录" means.
+#[tauri::command]
+async fn claude_sessions_list(
+    ctx: State<'_, Arc<AppContext>>,
+    args: Option<proxy_rs::claude_sessions::ListArgs>,
+) -> Result<Value, String> {
+    proxy_rs::admin::claude_sessions_list(Some(ctx.stats.clone()), args.unwrap_or_default())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn claude_sessions_detail(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+    args: Option<proxy_rs::claude_sessions::DetailArgs>,
+) -> Result<Value, String> {
+    proxy_rs::admin::claude_session_detail(Some(ctx.stats.clone()), id, args.unwrap_or_default())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn claude_sessions_subagent(
+    id: String,
+    agent_id: String,
+    args: Option<proxy_rs::claude_sessions::DetailArgs>,
+) -> Result<Value, String> {
+    proxy_rs::admin::claude_subagent_detail(id, agent_id, args.unwrap_or_default())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn get_request_logs(
     filter: Option<RequestLogFilter>,
@@ -2719,6 +2756,9 @@ fn main() {
             get_logs,
             clear_logs,
             get_request_logs,
+            claude_sessions_list,
+            claude_sessions_detail,
+            claude_sessions_subagent,
             clear_request_logs,
             get_settings,
             save_settings,

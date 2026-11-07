@@ -78,7 +78,10 @@ async function invoke(command, args = {}) {
     // ensures concurrent 401s from the boot burst only navigate once.
     if (!window.__PROXY_RS_REDIRECTING__) {
       window.__PROXY_RS_REDIRECTING__ = true;
-      window.location.replace('/admin/login');
+      // Keep the tab: after logging back in the operator lands where they were,
+      // not on the default tab.
+      const tab = window.location.hash || '';
+      window.location.replace(`/admin/login${tab}`);
     }
     throw '会话已过期，请重新登录';
   }
