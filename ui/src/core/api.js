@@ -70,12 +70,18 @@ function apiBase() {
   // Server-hosted console: the page came from a different machine than the
   // gateway it is talking to. Set by `ui/server/bridge.js`.
   if (window.__PROXY_RS_SERVER__) return null;
+  // Same-origin console (desktop webview after bootstrap, or a browser on
+  // /admin/): the endpoints are right here, relative wins — it follows the
+  // port the page was actually served from, even across listener restarts
+  // that changed it.
+  if (window.location.pathname.startsWith('/admin')) return '';
   // Test hook for `ui/tools/smoke.mjs`, which serves the page and the two
   // endpoints from one harness origin so the HTTP path is exercised without
   // depending on whether a real instance happens to own the configured port.
   // Unset in the app, where the port from `get_status` is the only correct base.
   const override = window.__PROXY_API_BASE__;
   if (typeof override === 'string' && override) return override.replace(/\/+$/, '');
+  // Legacy desktop path (page loaded from frontendDist): absolute loopback.
   return `http://127.0.0.1:${appState.port || 3456}`;
 }
 

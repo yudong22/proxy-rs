@@ -19,7 +19,8 @@
         "trafficLightPosition": {
           "x": 7,
           "y": 25.5
-        }
+        },
+        "url": "bootstrap.html"
       }
     ]
   }

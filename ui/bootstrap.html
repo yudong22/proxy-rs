@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Proxy RS</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0; height: 100vh; display: flex; align-items: center; justify-content: center;
+      font-family: -apple-system, "PingFang SC", "Segoe UI", sans-serif;
+      background: #f5f5f7; color: #1d1d1f;
+    }
+    @media (prefers-color-scheme: dark) { body { background: #1c1c1e; color: #f5f5f7; } }
+    .card { text-align: center; max-width: 360px; }
+    .logo { width: 48px; height: 48px; margin-bottom: 16px; }
+    h1 { font-size: 17px; margin: 0 0 6px; }
+    p { font-size: 13px; color: #86868b; margin: 0 0 18px; line-height: 1.5; }
+    button {
+      font: inherit; font-size: 14px; font-weight: 600; padding: 8px 24px;
+      border: none; border-radius: 8px; background: #0071e3; color: #fff; cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: default; }
+    .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(135,135,135,.3);
+      border-top-color: #86868b; border-radius: 50%; animation: r 0.8s linear infinite; vertical-align: -2px; margin-right: 8px; }
+    @keyframes r { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <img class="logo" src="assets/logo.svg" alt="">
+    <h1>Proxy RS</h1>
+    <p id="msg"><span class="spin"></span>正在启动管理台…</p>
+    <button id="btn" hidden>启动服务</button>
+  </div>
+  <script type="module">
+    /**
+     * Desktop bootstrap page — the only page the Tauri window loads directly.
+     *
+     * The webview cannot open the console until the in-process gateway is
+     * listening, and the gateway is what serves the console (same listener as
+     * the data plane). So this page sits outside it: it talks to the Rust host
+     * over the two commands IPC exists for (`get_bootstrap_info`, and the
+     * retained `start_service`), waits for the listener, mints a session via
+     * `desktop-boot`, then hands the window to the real console.
+     */
+
+    const { invoke } = window.__TAURI__.core;
+    const msg = document.getElementById('msg');
+    const btn = document.getElementById('btn');
+
+    const WAIT = '正在启动管理台…';
+    const RETRY = '服务已启动，正在连接…';
+
+    function showSpinning(text) {
+      msg.innerHTML = '<span class="spin"></span>' + text;
+      btn.hidden = true;
+    }
+
+    function showRetry(text) {
+      msg.textContent = text;
+      btn.hidden = false;
+      btn.textContent = '重试';
+    }
+
+    /**
+     * Poll the host until the console listener is up.
+     *
+     * **No `fetch` probe.** This page runs on `tauri://localhost`, so a
+     * request to `http://127.0.0.1:<port>` is cross-origin, and the console
+     * router deliberately sends no CORS headers (it is the authenticated
+     * surface; inheriting the data plane's `allow-origin: *` was the bug fixed
+     * in 3.2.2). The webview therefore cannot read a probe response even when
+     * the console is healthy — which is exactly how this page came to report
+     * "控制台端口无响应" while the console was serving fine.
+     *
+     * The host already knows: `get_bootstrap_info` reports `console_ready`
+     * from the listener it bound, so asking it over IPC is both correct and
+     * cheaper than a network round trip.
+     */
+    async function waitForConsoleReady(timeoutMs) {
+      const deadline = Date.now() + timeoutMs;
+      let info = await invoke('get_bootstrap_info');
+      while (Date.now() < deadline && !info.console_ready) {
+        await new Promise((r) => setTimeout(r, 250));
+        info = await invoke('get_bootstrap_info');
+      }
+      return info;
+    }
+
+    async function boot() {
+      btn.disabled = true;
+      showSpinning(WAIT);
+      let info;
+      try {
+        info = await waitForConsoleReady(10000);
+      } catch (e) {
+        showRetry('无法读取服务状态: ' + e);
+        btn.disabled = false;
+        return;
+      }
+      if (!info.console_ready) {
+        showRetry('控制台尚未就绪，请稍后重试');
+        btn.disabled = false;
+        return;
+      }
+      // Same-origin from here on: the console serves this page's future.
+      window.location.replace(`http://127.0.0.1:${info.port}/admin/`);
+    }
+
+    btn.addEventListener('click', boot);
+    boot();
+  </script>
+</body>
+</html>

@@ -14,6 +14,7 @@ import { $, html } from '../core/dom.js';
 export const TABS = [
   { key: 'overview', label: '运行概览' },
   { key: 'logs', label: '实时日志' },
+  { key: 'sessions', label: '会话' },
   { key: 'settings', label: '服务设置' },
 ];
 

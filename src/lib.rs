@@ -2,17 +2,22 @@ pub mod admin;
 pub mod admin_auth;
 pub mod admin_routes;
 pub mod admin_rpc;
+pub mod admin_state;
 pub mod api;
 pub mod api_token;
 pub mod claude_config;
+pub mod claude_sessions;
 pub mod client_accounts;
 pub mod client_auth;
 pub mod codex_config;
 pub mod config;
 pub mod console;
 pub mod credits;
+pub mod desktop_hooks;
 pub mod dsh_config;
+pub mod env;
 pub mod error;
+pub mod flavor;
 pub mod growth;
 pub mod growth_runner;
 pub mod launch_agent;
@@ -42,4 +47,4 @@ pub use settings::{
     data_dir, dotenv_path, log_dir, log_file_path, settings_path, GuiSettings, LogBuffer, LogEntry,
     DEFAULT_PORT,
 };
-pub use stats::{DayStats, StatsDb, TokenRecord};
+pub use stats::{DayStats, SessionUsageTotal, StatsDb, TokenRecord};

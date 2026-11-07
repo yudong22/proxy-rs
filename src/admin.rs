@@ -33,7 +33,9 @@
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
+use crate::claude_sessions;
 use crate::client_accounts;
 use crate::pool_transfer;
 use crate::session_pool::CredentialPool;
@@ -41,78 +43,10 @@ use crate::settings::{self, GuiSettings};
 use crate::stats::StatsDb;
 use crate::workbuddy_auth::{self, ApiKeyEntry, WorkBuddyCredential};
 
-/// Read-only view of the running process, for the console's status strip.
-///
-/// A struct rather than reading the environment at render time: the values must
-/// all describe *the same moment*, and a payload assembled from three separate
-/// reads can straddle a restart.
-#[derive(Debug, Clone)]
-pub struct ProcessInfo {
-    pub version: &'static str,
-    pub bound_port: u16,
-    pub started_at: std::time::Instant,
-    pub bind_addr: String,
-}
-
-impl ProcessInfo {
-    /// The status payload the console's header renders.
-    pub fn status_json(&self) -> Value {
-        let settings = GuiSettings::load();
-        let presets = crate::providers::builtin_presets();
-        json!({
-            // A headless gateway has no start/stop control — it is always
-            // "running" if this code is answering at all. Reporting `true`
-            // rather than omitting the field keeps the console's shape aligned
-            // with the desktop payload.
-            "running": true,
-            "service_running": true,
-            // Read by the shared front-end to label the process lifecycle. The
-            // console cannot hide the start/stop button (that file is shared
-            // with the desktop app), so clicking it surfaces the bridge's
-            // explanation instead of a silent no-op.
-            "managed_by": "systemd",
-            "can_control_service": false,
-            "uptime_secs": self.started_at.elapsed().as_secs(),
-            "version": self.version,
-            "provider": settings.provider_id,
-            "upstream_url": settings.chat_url(&presets),
-            "config_path": settings::settings_path().display().to_string(),
-            "log_path": settings::log_file_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            // Desktop-only fields the shared front-end reads. They are answered
-            // honestly rather than omitted: a missing key renders as the empty
-            // string in a `<code>` element, which looks like a bug, while an
-            // explicit "由 systemd 托管" reads as the truth.
-            "launch_at_login": false,
-            "launch_at_login_stale": false,
-            "managed_by": "systemd",
-            "port": self.bound_port,
-            "configured_port": settings.port,
-            "bind": self.bind_addr,
-            "client_auth_enabled": client_accounts::enabled_from(settings.client_auth_enabled),
-            "data_dir": settings::data_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            // Whether an upstream key is configured, so the settings form can say
-            // "already set, leave blank to keep" instead of looking empty.
-            "api_key_set": !settings.api_key.trim().is_empty(),
-            "env_path": settings::dotenv_path().map(|p| p.display().to_string()),
-            // **The overview's 剩余积分 / 当前账号 cards read this.**
-            //
-            // It was missing from the server payload, so on the web console those
-            // two cards rendered empty forever while the desktop app showed them
-            // — the same front-end, a hole in the data behind it. The shape must
-            // match the desktop command exactly (`id`/`label`/`points`).
-            "current_identity": current_identity_summary(),
-            // `is_dev` gates a couple of desktop-only affordances; a server is
-            // never a dev build.
-            "is_dev": false,
-            "configured_launch_at_login": false,
-            "launch_at_login_plist_present": false,
-        })
-    }
-}
+// `ProcessInfo` lives with the admin state now (it describes the state's
+// process). Re-exported so every existing `admin::ProcessInfo` path keeps
+// working.
+pub use crate::admin_state::{current_identity_summary, ProcessInfo};
 
 // ── Settings ───────────────────────────────────────────────────────────────
 
@@ -142,6 +76,25 @@ pub fn settings_json() -> Value {
         obj.insert("preset_name".into(), json!(preset.name));
     }
     payload
+}
+
+/// Decide what to store when the settings form posts an `api_key`.
+///
+/// Three cases, and the rule lives here so the desktop and the server console
+/// cannot disagree about them (they used to; see the `*` case):
+///
+/// * blank / omitted → keep what is stored. The form has no key field, so an
+///   empty string is "leave it alone", never "clear it".
+/// * a masked echo (`•` or `*` runs) → keep what is stored. The form renders
+///   the key masked, and a browser replaying that value must not overwrite the
+///   real one.
+/// * anything else → the new key, trimmed.
+fn resolve_api_key(posted: &str, stored: &str) -> String {
+    let v = posted.trim();
+    if v.is_empty() || v.contains('•') || v.contains('*') {
+        return stored.to_string();
+    }
+    v.to_string()
 }
 
 /// The fields a settings save may change.
@@ -182,9 +135,9 @@ pub fn save_settings(update: SettingsUpdate) -> Result<Value> {
     // Empty means "unchanged" — the form renders the key masked, so it cannot
     // echo a real value back and an empty submit must not wipe the key.
     if let Some(v) = update.api_key {
-        let v = v.trim();
-        if !v.is_empty() && !v.contains('•') {
-            s.api_key = v.to_string();
+        let v = resolve_api_key(&v, &s.api_key);
+        if !v.is_empty() {
+            s.api_key = v;
         }
     }
     if let Some(v) = update.port {
@@ -219,6 +172,30 @@ pub fn save_settings(update: SettingsUpdate) -> Result<Value> {
 
     s.save().map_err(|e| anyhow!("保存设置失败: {e}"))?;
     Ok(settings_json())
+}
+
+/// Hot-apply the inbound access-key gate after a settings save.
+///
+/// `ClientAuthState` is built once at process start and deliberately not rebuilt
+/// on a proxy restart (it holds the throttled `last_used_ms` bookkeeping), so
+/// persisting the switch alone is not enough: without this call the GUI would
+/// report success while the data plane kept accepting keyless requests until a
+/// full restart. Both the desktop and the server console call this, so the
+/// "save means live" rule exists in exactly one place.
+///
+/// The flag is read back from the saved settings file rather than passed in:
+/// `SettingsUpdate.client_auth_enabled` is optional, so an unrelated save must
+/// not silently turn the feature off, and neither caller should have to
+/// remember to fold in the `PROXY_CLIENT_AUTH` env override. That folding
+/// happens here via [`client_accounts::enabled_from`].
+///
+/// `set_enabled` changes the live flag; `reload_from_store` re-reads the account
+/// list (but *not* the flag, which is held in an `AtomicBool`). Both matter.
+pub async fn hot_apply_client_auth(state: &Arc<crate::client_accounts::ClientAuthState>) {
+    let stored_flag = GuiSettings::load().client_auth_enabled;
+    let enabled = client_accounts::enabled_from(stored_flag);
+    state.set_enabled(enabled);
+    state.reload_from_store().await;
 }
 
 // ── Identity pool ──────────────────────────────────────────────────────────
@@ -518,29 +495,6 @@ pub fn save_schedule(enabled: bool, time: &str, growth: Option<bool>) -> Result<
 
 // ── Overview cards ─────────────────────────────────────────────────────────
 
-/// The identity currently in force, for the overview header's three cards.
-///
-/// Resolved through `effective_default_identity` rather than the stored
-/// preference: with no explicit default the first usable entry wins, and the
-/// card must describe what is *actually* serving traffic.
-pub fn current_identity_summary() -> Value {
-    let id = workbuddy_auth::effective_default_identity();
-    let (label, points) = match id.as_str() {
-        id if id.starts_with("wb-") => workbuddy_auth::load_credentials()
-            .into_iter()
-            .find(|c| c.id == id)
-            .map(|c| (c.label, c.points))
-            .unwrap_or_else(|| ("未知账号".to_string(), None)),
-        id if id.starts_with("k-") => workbuddy_auth::load_api_keys()
-            .into_iter()
-            .find(|k| k.id == id)
-            .map(|k| (k.label, k.points))
-            .unwrap_or_else(|| ("未知密钥".to_string(), None)),
-        _ => ("静态 API Key".to_string(), None),
-    };
-    json!({ "id": id, "label": label, "points": points })
-}
-
 /// Credentials list in the shape the desktop console's identity pool expects.
 pub async fn credentials_list(pool: &CredentialPool) -> Result<Value> {
     let items = workbuddy_auth::load_credentials();
@@ -787,7 +741,7 @@ pub fn read_dsh_config() -> Result<Value> {
 
 /// Write this proxy into the active DSH profile's patch file.
 pub async fn apply_dsh_config(
-    state: &std::sync::Arc<crate::admin_routes::AdminState>,
+    state: &std::sync::Arc<crate::admin_state::AdminState>,
 ) -> Result<Value> {
     let Some(patch_path) = crate::dsh_config::patch_path() else {
         bail!("DSH_HOME / HOME 未设置，无法定位 DSH 配置");
@@ -807,7 +761,7 @@ pub async fn apply_dsh_config(
     if models.is_empty() {
         bail!("上游 {} 未返回任何模型，未改动 DSH 配置", preset.id);
     }
-    let base_url = format!("http://127.0.0.1:{}/v1", state.process.bound_port);
+    let base_url = format!("http://127.0.0.1:{}/v1", state.process.port());
     let dsh_models: Vec<crate::dsh_config::DshModel> =
         models.iter().map(crate::dsh_config::to_dsh_model).collect();
     let (patch, credentials, credential_added) =
@@ -825,7 +779,7 @@ pub async fn apply_dsh_config(
 
 /// Refresh every identity's point balance.
 pub async fn refresh_all_points(
-    state: &std::sync::Arc<crate::admin_routes::AdminState>,
+    state: &std::sync::Arc<crate::admin_state::AdminState>,
 ) -> Result<Value> {
     let report = workbuddy_auth::refresh_all_points(&state.client).await;
     let known = report.results.iter().filter(|r| r.points.is_some()).count();
@@ -848,7 +802,7 @@ pub async fn refresh_all_points(
 
 /// Refresh one identity's point balance.
 pub async fn refresh_one_points(
-    state: &std::sync::Arc<crate::admin_routes::AdminState>,
+    state: &std::sync::Arc<crate::admin_state::AdminState>,
     id: &str,
 ) -> Result<Value> {
     let Some(result) = workbuddy_auth::refresh_one_points(&state.client, id).await else {
@@ -875,6 +829,141 @@ pub async fn refresh_one_points(
     }))
 }
 
+// ── Local client sessions (Claude Code) ───────────────────────────────────
+
+/// A local-session source descriptor the console renders as a source segment.
+///
+/// DSH is listed even though it is not readable yet: an absent control reads
+/// as a missing feature, a disabled one with a reason reads as a known limit.
+fn session_sources() -> Value {
+    json!([
+        { "kind": "claude_local", "label": "Claude Code", "available": true, "note": Value::Null },
+        {
+            "kind": "dsh_local",
+            "label": "DSH",
+            "available": false,
+            "note": "DSH 会话是 zstd 压缩的本地存档，暂不支持浏览"
+        }
+    ])
+}
+
+fn sessions_unavailable(reason: String) -> Value {
+    json!({
+        "available": false,
+        "reason": reason,
+        "root": Value::Null,
+        "sources": session_sources(),
+        "stats_available": false,
+        "total": 0,
+        "offset": 0,
+        "limit": 0,
+        "sessions": [],
+    })
+}
+
+/// One filesystem pass over the page's transcripts, on a blocking thread.
+async fn read_session_page(
+    args: claude_sessions::ListArgs,
+) -> Result<Option<claude_sessions::ListPage>> {
+    let Some(src) = claude_sessions::ClaudeSessionsSource::from_env() else {
+        return Ok(None);
+    };
+    let page = tokio::task::spawn_blocking(move || claude_sessions::list_sessions(&src, &args))
+        .await
+        .map_err(|e| anyhow!("会话读取异常终止: {e}"))?
+        .map_err(|e| anyhow!("读取会话失败: {e}"))?;
+    Ok(Some(page))
+}
+
+/// Gateway totals for the page's ids, on their own blocking thread.
+///
+/// An error is reported per page (`gateway_error`) rather than failing the
+/// whole request: the local transcript is still worth showing when SQLite is
+/// locked or not yet open.
+async fn gateway_totals(
+    stats: Option<Arc<StatsDb>>,
+    ids: Vec<String>,
+) -> (bool, Option<String>, Vec<claude_sessions::GatewayUsage>) {
+    let Some(stats) = stats else {
+        return (false, None, Vec::new());
+    };
+    if ids.is_empty() {
+        return (true, None, Vec::new());
+    }
+    match tokio::task::spawn_blocking(move || stats.session_usage_totals_for(&ids)).await {
+        Ok(Ok(totals)) => (true, None, totals),
+        Ok(Err(e)) => (true, Some(format!("网关用量查询失败: {e}")), Vec::new()),
+        Err(e) => (true, Some(format!("网关用量查询异常终止: {e}")), Vec::new()),
+    }
+}
+
+/// The 会话 page: local Claude Code conversations with gateway usage joined
+/// by `claude:<uuid>`.
+pub async fn claude_sessions_list(
+    stats: Option<Arc<StatsDb>>,
+    args: claude_sessions::ListArgs,
+) -> Result<Value> {
+    let Some(page) = read_session_page(args).await? else {
+        return Ok(sessions_unavailable(
+            "未找到 ~/.claude/projects：当前用户没有 Claude Code 本地会话记录".to_string(),
+        ));
+    };
+    let ids = claude_sessions::gateway_ids(&page.sessions);
+    let (stats_available, gateway_error, totals) = gateway_totals(stats, ids).await;
+    let mut rows = page.sessions;
+    claude_sessions::attach_gateway(&mut rows, &totals);
+    Ok(json!({
+        "available": true,
+        "reason": Value::Null,
+        "root": page.root,
+        "sources": session_sources(),
+        "stats_available": stats_available,
+        "gateway_error": gateway_error,
+        "total": page.total,
+        "offset": page.offset,
+        "limit": page.limit,
+        "sessions": rows,
+    }))
+}
+
+/// One session's full transcript (the newest page of entries) plus totals.
+pub async fn claude_session_detail(
+    stats: Option<Arc<StatsDb>>,
+    id: String,
+    args: claude_sessions::DetailArgs,
+) -> Result<Value> {
+    let src = claude_sessions::ClaudeSessionsSource::from_env()
+        .ok_or_else(|| anyhow!("未找到 ~/.claude/projects"))?;
+    let sid = id.clone();
+    let mut detail =
+        tokio::task::spawn_blocking(move || claude_sessions::read_session(&src, &sid, &args))
+            .await
+            .map_err(|e| anyhow!("会话读取异常终止: {e}"))?
+            .map_err(|e| anyhow!("{e}"))?;
+    let ids = vec![format!("claude:{}", detail.summary.id)];
+    let (_, gateway_error, totals) = gateway_totals(stats, ids).await;
+    detail.gateway = totals.into_iter().next();
+    detail.gateway_error = gateway_error;
+    Ok(serde_json::to_value(detail)?)
+}
+
+/// One subagent transcript under a session.
+pub async fn claude_subagent_detail(
+    id: String,
+    agent: String,
+    args: claude_sessions::DetailArgs,
+) -> Result<Value> {
+    let src = claude_sessions::ClaudeSessionsSource::from_env()
+        .ok_or_else(|| anyhow!("未找到 ~/.claude/projects"))?;
+    let detail = tokio::task::spawn_blocking(move || {
+        claude_sessions::read_subagent(&src, &id, &agent, &args)
+    })
+    .await
+    .map_err(|e| anyhow!("会话读取异常终止: {e}"))?
+    .map_err(|e| anyhow!("{e}"))?;
+    Ok(serde_json::to_value(detail)?)
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /// Show a key's first and last four characters, never more.
@@ -897,6 +986,37 @@ pub fn mask_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Saving the settings form must never clear the stored key.
+    ///
+    /// Regression: the form has no `api_key` field, so it posted an empty
+    /// string on every save and the backend assigned it straight through —
+    /// silently wiping a value `migrate_legacy_api_key` reads at startup.
+    #[test]
+    fn save_settings_keeps_the_stored_key_when_the_form_omits_it() {
+        assert_eq!(resolve_api_key("", "ck-stored"), "ck-stored");
+        assert_eq!(resolve_api_key("   ", "ck-stored"), "ck-stored");
+    }
+
+    /// A masked value is not a key: it is the UI echoing back a secret it was
+    /// never given in the clear, so it must not overwrite the real one.
+    ///
+    /// Both mask characters are rejected. The desktop used to reject `•` and
+    /// `*`, the server console only `•` — a defensive divergence that would
+    /// become a bug the first time a `*` mask was produced.
+    #[test]
+    fn save_settings_does_not_store_a_masked_placeholder() {
+        assert_eq!(resolve_api_key("ck-••••wxyz", "ck-stored"), "ck-stored");
+        assert_eq!(resolve_api_key("ck-****wxyz", "ck-stored"), "ck-stored");
+    }
+
+    /// A genuine new key still replaces the old one, trimmed.
+    #[test]
+    fn save_settings_accepts_a_real_replacement_key() {
+        assert_eq!(resolve_api_key("ck-new", "ck-stored"), "ck-new");
+        assert_eq!(resolve_api_key("  ck-new  ", "ck-stored"), "ck-new");
+        assert_eq!(resolve_api_key("", ""), "");
+    }
 
     #[test]
     fn a_short_key_is_masked_entirely() {

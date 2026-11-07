@@ -1,6 +1,6 @@
 [package]
 name = "proxy-rs"
-version = "3.2.2"
+version = "3.4.0"
 edition = "2021"
 authors = [
     "yudong22 (孙东) <3cking@163.com>",
@@ -82,6 +82,12 @@ qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 argon2 = "0.5"
 aes-gcm = "0.10"
 base64 = "0.22"
+
+# Directory walk for the Claude Code session browser (`src/claude_sessions.rs`).
+# Only depth-1 iteration is used; `walkdir` is here because it skips symlinks by
+# default and reports per-entry errors instead of aborting the whole walk on one
+# unreadable project directory.
+walkdir = "2"
 
 # SHA-256 for the client-access-key store (`src/client_accounts.rs`).
 #

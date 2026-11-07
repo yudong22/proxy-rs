@@ -39,6 +39,7 @@ impl Drop for Isolated {
     fn drop(&mut self) {
         std::env::remove_var(TOKEN_ENV);
         std::env::remove_var("PROXY_DATA_DIR");
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
         if !std::thread::panicking() {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -51,6 +52,8 @@ async fn isolate(name: &str, token: Option<&str>) -> Isolated {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
     std::env::set_var("PROXY_DATA_DIR", &dir);
+    // The session browser must never read the real home in a test.
+    std::env::set_var("CLAUDE_PROJECTS_DIR", dir.join("claude-projects"));
     settings::set_log_file_override_for_tests(dir.join("proxy.log"));
     match token {
         Some(t) => std::env::set_var(TOKEN_ENV, t),
@@ -75,11 +78,13 @@ fn test_router_with_sessions() -> (axum::Router, Arc<AdminSessions>) {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     // Both routers, merged exactly as the server binary does: login/logout live
     // on the console router (the form it serves mints the cookie), while the
@@ -102,13 +107,41 @@ fn test_router() -> axum::Router {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     app_for(state)
+}
+
+/// A fresh state for tests that only need the login route.
+fn test_state() -> Arc<AdminState> {
+    test_state_with_auth(Arc::new(ClientAuthState::disabled()))
+}
+
+/// A state whose live inbound gate is injectable, so a test can inspect it
+/// *after* a settings save without reaching into the router.
+fn test_state_with_auth(client_auth: Arc<ClientAuthState>) -> Arc<AdminState> {
+    Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth,
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    })
 }
 
 async fn call(
@@ -224,6 +257,11 @@ async fn every_gated_route_refuses_an_anonymous_caller() {
         ("GET", "/admin/api/client-accounts"),
         ("GET", "/admin/api/logs"),
         ("POST", "/admin/api/checkin"),
+        ("GET", "/admin/api/claude-sessions"),
+        (
+            "GET",
+            "/admin/api/claude-sessions/00000000-0000-4000-8000-000000000000",
+        ),
     ] {
         let (status, body, _) = call(test_router(), method, uri, None, None).await;
         assert_eq!(
@@ -453,11 +491,13 @@ fn console_router() -> axum::Router {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "test",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".to_string(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     app_for(state)
 }
@@ -601,6 +641,7 @@ async fn rpc_dispatches_the_commands_the_console_calls() {
         ("wb_preferences", "result"),
         ("client_accounts_list", "result"),
         ("get_providers", "result"),
+        ("claude_sessions_list", "result"),
     ] {
         let (status, body) = post_rpc(app.clone(), command, "{}", &cookie).await;
         assert_eq!(status, StatusCode::OK, "{command}: {body}");
@@ -768,11 +809,13 @@ async fn the_admin_surface_does_not_advertise_cross_origin_access() {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "t",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".into(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
 
     // Built the way the server binary builds it: data plane, then admin merged
@@ -839,11 +882,1091 @@ fn build_console_router_for_cors_test() -> axum::Router {
         pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         process: ProcessInfo {
             version: "t",
-            bound_port: 3456,
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
             started_at: std::time::Instant::now(),
             bind_addr: "127.0.0.1".into(),
         },
         client: reqwest::Client::new(),
+        desktop: false,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     build_console_router(state)
+}
+
+// ── Local Claude Code sessions (会话 page) ────────────────────────────────
+
+/// A fixture transcript under the isolated `CLAUDE_PROJECTS_DIR`.
+fn write_claude_fixture(dir: &std::path::Path, id: &str) {
+    let project = dir.join("-Users-denis-Sites-proxy-rs");
+    std::fs::create_dir_all(&project).unwrap();
+    let lines = [
+        json!({"type":"user","uuid":"u1","timestamp":"2026-11-01T10:00:00.000Z",
+               "cwd":"/Users/denis/Sites/proxy-rs","message":{"role":"user","content":"hello"}}),
+        json!({"type":"assistant","uuid":"a1","timestamp":"2026-11-01T10:00:05.000Z",
+               "message":{"id":"m1","model":"deepseek-v4.1-flash",
+                          "usage":{"input_tokens":10,"output_tokens":20},
+                          "content":[{"type":"text","text":"hi"}]}}),
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(project.join(format!("{id}.jsonl")), format!("{lines}\n")).unwrap();
+}
+
+#[tokio::test]
+async fn claude_sessions_lists_local_transcripts_with_source_descriptors() {
+    let iso = isolate("claude-sessions-ok", Some("tok")).await;
+    let id = "b9c3800a-311e-4c89-9a38-c533d8969b5d";
+    write_claude_fixture(&iso.dir.join("claude-projects"), id);
+
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let (status, body) = get_json(app.clone(), "/admin/api/claude-sessions", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], true);
+    assert_eq!(body["sessions"][0]["id"], id);
+    assert_eq!(body["sessions"][0]["cwd"], "/Users/denis/Sites/proxy-rs");
+    assert_eq!(body["sessions"][0]["title"], "hello");
+    // The DSH source is advertised but disabled, with the reason the UI shows.
+    let sources = body["sources"].as_array().unwrap();
+    assert_eq!(sources[0]["kind"], "claude_local");
+    assert_eq!(sources[1]["kind"], "dsh_local");
+    assert_eq!(sources[1]["available"], false);
+    assert!(!sources[1]["note"].as_str().unwrap().is_empty());
+
+    // Detail, through the same RPC the console uses.
+    let (status, body) = post_rpc(
+        app,
+        "claude_sessions_detail",
+        &json!({ "id": id, "args": {} }).to_string(),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["timeline"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_path_in_the_session_id_is_not_a_path() {
+    let iso = isolate("claude-sessions-traversal", Some("tok")).await;
+    let _ = &iso.dir;
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    for uri in [
+        "/admin/api/claude-sessions/..%2F..%2Fetc%2Fpasswd",
+        "/admin/api/claude-sessions/..",
+        "/admin/api/claude-sessions/etc/passwd",
+    ] {
+        let (status, _) = get_json(app.clone(), uri, &cookie).await;
+        assert_ne!(status, StatusCode::OK, "{uri} must not be served");
+    }
+}
+
+#[tokio::test]
+async fn claude_sessions_without_a_source_explains_itself() {
+    let iso = isolate("claude-sessions-none", Some("tok")).await;
+    // The isolated CLAUDE_PROJECTS_DIR was never created.
+    assert!(!iso.dir.join("claude-projects").exists());
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let (status, body) = get_json(app, "/admin/api/claude-sessions", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], false);
+    assert!(body["reason"]
+        .as_str()
+        .unwrap()
+        .contains(".claude/projects"));
+}
+
+/// Authenticated GET returning `(status, body)`.
+async fn get_json(app: axum::Router, uri: &str, cookie: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("cookie", cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+// ── Tab hash routing through login (`next`) ───────────────────────────────
+
+/// A native form post that names a valid tab lands on that tab's hash.
+#[tokio::test]
+async fn a_form_login_lands_on_the_requested_tab() {
+    let _iso = isolate("login-next", Some("tok")).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("password=tok&next=sessions"))
+        .unwrap();
+    let resp = app_for(test_state()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/admin/#sessions")
+    );
+}
+
+/// `next` is a form field, so it must never steer the browser off-site: only a
+/// bare tab name is honoured, everything else falls back to the default tab.
+#[tokio::test]
+async fn the_login_landing_tab_is_not_an_open_redirect() {
+    let _iso = isolate("login-next-evil", Some("tok")).await;
+    for evil in [
+        "//evil.example/x",
+        "https://evil.example",
+        "../../etc",
+        "/admin/logs",
+        "settings?x=1",
+    ] {
+        let body = format!("password=tok&next={}", evil.replace(' ', "%20"));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app_for(test_state()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{evil}");
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("/admin/"),
+            "{evil} must not become a redirect target"
+        );
+    }
+}
+
+/// A rejected login keeps the tab it came from, so a retry returns there.
+#[tokio::test]
+async fn a_failed_form_login_keeps_the_landing_tab() {
+    let _iso = isolate("login-next-fail", Some("tok")).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("password=wrong&next=logs"))
+        .unwrap();
+    let resp = app_for(test_state()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(loc.contains("e=invalid_token"), "{loc}");
+    assert!(loc.ends_with("&next=logs"), "{loc}");
+}
+
+// ── BUG-1 regression: saving client_auth_enabled must hot-apply ───────────
+
+/// Both server surfaces (RPC + REST) must update the *live* inbound gate, not
+/// just the settings file. Before the fix, `admin::save_settings` only wrote
+/// the file, so the switch reported success while the data plane stayed open.
+///
+/// The gate starts disabled; a save with `client_auth_enabled: true` must flip
+/// `is_enabled()` on the very same `Arc` the middleware reads.
+#[tokio::test]
+async fn saving_settings_hot_applies_the_inbound_gate_via_rpc() {
+    let _iso = isolate("hot-apply-rpc", Some("tok")).await;
+    // `enabled_from` honours PROXY_CLIENT_AUTH from the env; keep the test
+    // deterministic by removing any override (GLOBAL_LOCK serialises us).
+    std::env::remove_var("PROXY_CLIENT_AUTH");
+
+    let auth = Arc::new(ClientAuthState::disabled());
+    let state = test_state_with_auth(auth.clone());
+    let app = app_for(state);
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    assert!(!auth.is_enabled(), "gate starts disabled");
+    let (status, body) = post_rpc(
+        app.clone(),
+        "save_settings",
+        &json!({ "body": { "client_auth_enabled": true } }).to_string(),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        auth.is_enabled(),
+        "the live gate must be enabled right after the save, without a restart"
+    );
+
+    // An unrelated save must not silently turn the feature back off.
+    let (status, body) = post_rpc(
+        app,
+        "save_settings",
+        &json!({ "body": { "sanitize_terms": "x" } }).to_string(),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        auth.is_enabled(),
+        "an unrelated save must keep the saved flag"
+    );
+}
+
+#[tokio::test]
+async fn saving_settings_hot_applies_the_inbound_gate_via_rest() {
+    let _iso = isolate("hot-apply-rest", Some("tok")).await;
+    std::env::remove_var("PROXY_CLIENT_AUTH");
+
+    let auth = Arc::new(ClientAuthState::disabled());
+    let state = test_state_with_auth(auth.clone());
+    let app = app_for(state);
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, body, _) = call(
+        app,
+        "POST",
+        "/admin/api/settings",
+        Some(&cookie),
+        Some(json!({ "client_auth_enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(auth.is_enabled(), "REST save must hot-apply too");
+}
+
+// ── BUG-2 regression: the reissue command must exist on the desktop ───────
+
+/// The shared settings view calls `client_account_reissue`; the server RPC has
+/// it, but the desktop `generate_handler!` list did not, so the button always
+/// failed there. Guard the command-name set by source-parsing the registration
+/// list — a runtime dispatch test cannot see the desktop binary.
+/// **Structural guard (3.4.0 A5):** the desktop's IPC surface must be exactly
+/// the five host-process commands.
+///
+/// Everything else — settings, credentials, sessions, accounts, OAuth, growth —
+/// is business logic and lives in `admin_rpc`, reached over HTTP by the same
+/// console page the server serves. A new `#[tauri::command]` here means a
+/// second implementation has started growing again, which is precisely the
+/// duplication 3.4.0 exists to delete.
+#[test]
+fn the_desktop_ipc_surface_is_only_the_five_host_process_commands() {
+    let main = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src-tauri/src/main.rs"),
+    )
+    .expect("src-tauri/src/main.rs must be readable");
+    let handler = main
+        .split("tauri::generate_handler![")
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .expect("generate_handler! must exist");
+    let mut names: Vec<&str> = handler
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    names.sort_unstable();
+
+    let expected = [
+        "get_bootstrap_info",
+        "open_logs_dir",
+        "reveal_path",
+        "start_service",
+        "stop_service",
+    ];
+    assert_eq!(
+        names, expected,
+        "the desktop IPC surface must be exactly the host-process commands; \
+         anything else belongs in admin_rpc"
+    );
+}
+
+/// The other half of the guard: every command the UI calls must be answerable.
+///
+/// For the five host-process commands the answer is the Tauri IPC / the RPC
+/// hook; for everything else it is an `admin_rpc` arm. A UI call with neither
+/// would fail at runtime with an opaque "unknown command".
+#[test]
+fn every_command_the_ui_calls_has_a_server_side_answer() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rpc = std::fs::read_to_string(repo.join("src/admin_rpc.rs")).expect("admin_rpc.rs");
+    let main = std::fs::read_to_string(repo.join("src-tauri/src/main.rs")).expect("main.rs");
+
+    // Collect `invoke('name'` from the UI sources.
+    let mut ui_cmds = std::collections::BTreeSet::new();
+    fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "js") {
+                let src = std::fs::read_to_string(&p).unwrap_or_default();
+                for chunk in src.split("invoke('").skip(1) {
+                    if let Some(name) = chunk.split('\'').next() {
+                        if !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                        {
+                            out.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    walk(&repo.join("ui/src"), &mut ui_cmds);
+
+    let host_cmds = [
+        "get_bootstrap_info",
+        "start_service",
+        "stop_service",
+        "open_logs_dir",
+        "reveal_path",
+    ];
+    let mut missing = Vec::new();
+    for cmd in &ui_cmds {
+        let in_rpc =
+            rpc.contains(&format!("\"{cmd}\" =>")) || rpc.contains(&format!("\"{cmd}\" |"));
+        let in_host = host_cmds.contains(&cmd.as_str());
+        // The UI also calls `invoke` from the bootstrap page, which is outside ui/src.
+        if !in_rpc && !in_host && !main.is_empty() {
+            missing.push(cmd.clone());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "UI commands with no server-side answer: {missing:?}"
+    );
+}
+
+// ── Desktop session bootstrap (desktop-boot endpoint) ─────────────────────
+
+/// `call()` rides `oneshot`, which has no transport and therefore no
+/// `ConnectInfo`; the desktop-boot handler *requires* that extractor, so tests
+/// attach a forged peer address directly.
+async fn call_with_peer(
+    app: axum::Router,
+    peer: &str,
+    uri: &str,
+) -> (StatusCode, Value, Option<String>) {
+    call_with_peer_and_headers(app, peer, uri, &[]).await
+}
+
+/// Same, with extra request headers (Origin, Sec-Fetch-Site, …).
+async fn call_with_peer_and_headers(
+    app: axum::Router,
+    peer: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value, Option<String>) {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            peer.parse().unwrap(),
+        ));
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder.body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        set_cookie,
+    )
+}
+
+/// A desktop state with the flag on: a loopback call mints a session the
+/// regular `require_session` gate accepts — one authorisation path, two
+/// transports.
+#[tokio::test]
+async fn desktop_boot_mints_a_session_for_loopback_on_a_desktop_build() {
+    let _iso = isolate("desktop-boot-ok", Some("tok")).await;
+    let state = Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let app = app_for(state);
+
+    let (status, body, set_cookie) =
+        call_with_peer(app.clone(), "127.0.0.1:50000", "/admin/api/desktop-boot").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cookie = set_cookie.expect("boot must set the session cookie");
+    let pair = cookie.split(';').next().unwrap().to_string();
+
+    // The minted session must open the gated surface — that is the whole point.
+    let (status, body, _) = call(app, "GET", "/admin/api/status", Some(&pair), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "minted session must pass require_session: {body}"
+    );
+}
+
+/// On a server build the endpoint is a plain 404: it does not exist for a
+/// remote operator, and nothing about the deployment's trust model changes.
+#[tokio::test]
+async fn desktop_boot_is_a_plain_404_on_a_server_build() {
+    let _iso = isolate("desktop-boot-server", Some("tok")).await;
+    let (status, body, set_cookie) =
+        call_with_peer(test_router(), "127.0.0.1:50000", "/admin/api/desktop-boot").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        set_cookie.is_none(),
+        "a server build must never mint a session"
+    );
+}
+
+/// Even on a desktop build, a non-loopback peer is refused — covering a desktop
+/// bound to 0.0.0.0: the port may be reachable from the LAN, the console must
+/// not be loggable from it.
+///
+/// `call()` cannot set a peer address (oneshot has no transport), so this test
+/// drives the handler directly with a forged non-loopback ConnectInfo.
+#[tokio::test]
+async fn desktop_boot_refuses_non_loopback_peers() {
+    let _iso = isolate("desktop-boot-lan", Some("tok")).await;
+    let sessions = Arc::new(AdminSessions::new());
+    let state = Arc::new(AdminState {
+        sessions: sessions.clone(),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
+            started_at: std::time::Instant::now(),
+            bind_addr: "0.0.0.0".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/api/desktop-boot")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "192.168.1.50:55555".parse().unwrap(),
+        ))
+        .header("x-proxy-rs-test-extension", "1")
+        .body(Body::empty())
+        .unwrap();
+    // Build only the console router (it carries the Extension layer the
+    // handler needs) and extend the request with the state.
+    let router = proxy_rs::console::build_console_router(state);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "a LAN peer must never receive a session"
+    );
+}
+
+// ── Desktop console trust boundaries ──────────────────────────────────────
+
+/// A desktop state (the flag on) for the trust-boundary tests below.
+fn desktop_state() -> Arc<AdminState> {
+    Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    })
+}
+
+/// An arbitrary website must not be granted credentialed access to the
+/// desktop boot endpoint.
+///
+/// The endpoint mints a session, so echoing the caller's `Origin` with
+/// `Allow-Credentials: true` would let any page the user visits read the
+/// response and keep the cookie alive. Only Tauri's own scheme qualifies.
+#[tokio::test]
+async fn desktop_boot_grants_cors_only_to_the_tauri_origin() {
+    let _iso = isolate("boot-cors", Some("tok")).await;
+    let app = app_for(desktop_state());
+
+    // The Tauri scheme is allowed.
+    let (status, _, _) = call_with_peer_and_headers(
+        app.clone(),
+        "127.0.0.1:50000",
+        "/admin/api/desktop-boot",
+        &[("origin", "tauri://localhost")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A random site is not: the request still succeeds (it is loopback), but
+    // the response carries no CORS grant, so the browser refuses to hand the
+    // body to the page.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/api/desktop-boot")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("origin", "https://evil.example")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "an arbitrary origin must not be granted access"
+    );
+    assert!(
+        resp.headers()
+            .get("access-control-allow-credentials")
+            .is_none(),
+        "credentials must not be granted to an arbitrary origin"
+    );
+}
+
+/// The desktop console page must not mint a session for a **cross-site
+/// subresource**: a page in the user's browser can reach the desktop's
+/// loopback port, and without this check it could use the desktop as a session
+/// oracle.
+///
+/// Same-origin navigation and non-browser clients (no header) are allowed. A
+/// cross-site **navigation** is also allowed — that is the desktop webview's
+/// own first load from `tauri://localhost`, covered by
+/// `the_desktop_console_accepts_the_webviews_cross_site_navigation`. What this
+/// test pins is the subresource case, which is not a navigation.
+#[tokio::test]
+async fn the_desktop_console_page_refuses_a_cross_site_visitor() {
+    let _iso = isolate("page-cross-site", Some("tok")).await;
+    let app = app_for(desktop_state());
+
+    // Cross-site: the login page, not the console.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "cross-site")
+        // A subresource fetch, not a navigation.
+        .header("sec-fetch-mode", "no-cors")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "a cross-site subresource must not receive a session"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("Proxy RS 管理台") || text.contains("管理令牌"),
+        "a cross-site visitor must get the login page, not the console"
+    );
+
+    // Same-origin: the console, with a session.
+    let (status, _, set_cookie) = call_with_peer_and_headers(
+        app.clone(),
+        "127.0.0.1:50000",
+        "/admin/",
+        &[("sec-fetch-site", "same-origin")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        set_cookie.is_some(),
+        "a same-origin load must mint a session"
+    );
+}
+
+/// The desktop console must not load the server bridge.
+///
+/// The bridge replaces `window.__TAURI__` with an HTTP-only shim, which would
+/// cost the desktop its native commands (service start/stop, file manager).
+/// The desktop's own `core/ipc.js` already speaks HTTP for the business
+/// commands, so it needs no bridge — and must not get one.
+#[tokio::test]
+async fn the_desktop_console_does_not_load_the_server_bridge() {
+    let _iso = isolate("no-bridge-desktop", Some("tok")).await;
+    let app = app_for(desktop_state());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "same-origin")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        !html.contains("src/bridge.js"),
+        "the desktop console must not load the server bridge"
+    );
+    assert!(html.contains("src/main.js"), "the console must still load");
+}
+
+/// A server console still loads the bridge — it has no Tauri to fall back on.
+#[tokio::test]
+async fn the_server_console_still_loads_the_bridge() {
+    let _iso = isolate("bridge-server", Some("tok")).await;
+    let app = app_for(test_state());
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .header("cookie", cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("src/bridge.js"),
+        "the server console must load the bridge"
+    );
+}
+
+/// The desktop has no `PROXY_API_TOKEN` — the process is the operator — so the
+/// "no token → console disabled" rule must not apply to it.
+///
+/// This was a real failure: the desktop minted a session through
+/// `desktop-boot`, and every RPC then answered `503 admin_disabled`.
+#[tokio::test]
+async fn the_desktop_console_works_without_a_configured_token() {
+    let _iso = isolate("desktop-no-token", None).await;
+    // A desktop session table, like the desktop app builds.
+    let base = desktop_state();
+    let state = Arc::new(AdminState {
+        sessions: Arc::new(proxy_rs::admin_auth::AdminSessions::desktop()),
+        stats: base.stats.clone(),
+        logs: base.logs.clone(),
+        client_auth: base.client_auth.clone(),
+        pool: base.pool.clone(),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(3456)),
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let app = app_for(state);
+
+    // Mint a session the way the desktop's page load does.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "same-origin")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap().to_string())
+        .expect("the desktop page load must mint a session");
+
+    // And the RPC surface must accept it — no 503 admin_disabled.
+    let (status, body, _) = call(app, "GET", "/admin/api/status", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK, "desktop RPC must work: {body}");
+}
+
+// ── Desktop host-process hooks (3.4.0 A4) ───────────────────────────────
+
+/// The desktop registers its process-local capabilities, so the console's
+/// 启动/停止 buttons reach the process over HTTP.
+///
+/// The desktop console page runs on `http://127.0.0.1:<port>/admin/` — an
+/// origin the Tauri runtime does not inject IPC into — so this is the only
+/// channel those buttons have.
+#[tokio::test]
+async fn the_desktop_registers_its_host_process_capabilities() {
+    use proxy_rs::desktop_hooks::{self, DesktopHooks};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // The hook table is process-global, so this test owns it: register, assert,
+    // and unregister before anything else can observe it.
+    let starts = Arc::new(AtomicUsize::new(0));
+    let stops = Arc::new(AtomicUsize::new(0));
+    let starts_c = starts.clone();
+    let stops_c = stops.clone();
+    desktop_hooks::register(DesktopHooks {
+        start_service: Some(Arc::new(move || {
+            starts_c.fetch_add(1, Ordering::SeqCst);
+            Ok("started".into())
+        })),
+        stop_service: Some(Arc::new(move || {
+            stops_c.fetch_add(1, Ordering::SeqCst);
+            Ok("stopped".into())
+        })),
+        open_logs_dir: None,
+        reveal_path: None,
+        status: None,
+    });
+
+    let app = app_for(desktop_state());
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, body) = post_rpc(app.clone(), "start_service", "{}", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["ok"], true, "{body}");
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "the desktop hook must run"
+    );
+
+    let (status, body) = post_rpc(app.clone(), "stop_service", "{}", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(stops.load(Ordering::SeqCst), 1, "the desktop hook must run");
+
+    desktop_hooks::unregister();
+}
+
+/// A **server** build registers nothing, so the same buttons answer with the
+/// systemd explanation rather than pretending to work.
+#[tokio::test]
+async fn a_server_build_refuses_the_desktop_only_commands() {
+    let _iso = isolate("server-no-hooks", Some("tok")).await;
+    let app = app_for(test_state());
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    for command in ["start_service", "stop_service"] {
+        let (status, body) = post_rpc(app.clone(), command, "{}", &cookie).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{command}: {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("systemd"),
+            "{command} must name the systemd alternative: {body}"
+        );
+    }
+}
+
+/// The reported port must be the one the gateway is **actually** listening on,
+/// not the one the settings file asks for.
+///
+/// The desktop binds its port *after* the admin state is built, so a snapshot
+/// taken then reported 0 and the console fell back to the configured port —
+/// which is how it came to show "3456" while serving on 3457.
+#[tokio::test]
+async fn the_reported_port_follows_the_live_listener() {
+    let _iso = isolate("live-port", Some("tok")).await;
+    let port = Arc::new(std::sync::atomic::AtomicU16::new(3499));
+    let state = Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(200)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "test",
+            bound_port: port.clone(),
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".to_string(),
+        },
+        client: reqwest::Client::new(),
+        desktop: true,
+        growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let app = app_for(state);
+
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let (status, body) = post_rpc(app.clone(), "get_status", "{}", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["port"], 3499);
+
+    // The port moves; the payload must follow it.
+    port.store(3500, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = post_rpc(app, "get_status", "{}", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["port"], 3500);
+}
+
+// ── Structure guard (3.4.0 A5/A6): module dependency cycles ──────────────
+
+/// The module graph must not grow new cycles.
+///
+/// 3.4.0 took the graph from seven cycles to one. The remaining one
+/// (`config → workbuddy_auth → credits → config`, with `session_pool` inside it)
+/// is a real dependency knot: the credits handler needs the proxy config, and
+/// the credential layer reads balances. Splitting it further would duplicate the
+/// response parser, which is the opposite of what 3.4.0 is for — so it is
+/// recorded here as a known exception rather than papered over.
+///
+/// This test is the guard: a *new* cycle, or a change to the known one, fails.
+/// The parser mirrors the audit script (`docs/audit-3.3.0/module-graph.md`).
+#[test]
+fn the_module_graph_has_no_new_cycles() {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut modules: BTreeSet<String> = BTreeSet::new();
+    for entry in std::fs::read_dir(&src).expect("src dir") {
+        let p = entry.unwrap().path();
+        if p.is_dir() {
+            if p.join("mod.rs").exists() {
+                modules.insert(p.file_name().unwrap().to_string_lossy().to_string());
+            }
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            modules.insert(p.file_stem().unwrap().to_string_lossy().to_string());
+        }
+    }
+
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).expect("dir") {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+
+    let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in &files {
+        let rel = f.strip_prefix(&src).unwrap();
+        let from = rel
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_string_lossy()
+            .trim_end_matches(".rs")
+            .to_string();
+        if !modules.contains(&from) {
+            continue;
+        }
+        let text = std::fs::read_to_string(f).unwrap_or_default();
+        // Drop test modules: they are not part of the shipped graph.
+        let text = text.split("\n#[cfg(test)]").next().unwrap_or("");
+        for line in text.lines() {
+            // Doc comments mention `crate::x` without calling it.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(i) = rest.find("crate::") {
+                rest = &rest[i + 7..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if modules.contains(&name) && name != from {
+                    edges.entry(from.clone()).or_default().insert(name);
+                }
+            }
+        }
+    }
+
+    // Tarjan SCC, iterative enough for a small graph.
+    let names: Vec<String> = modules.iter().cloned().collect();
+    let idx: HashMap<&str, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); names.len()];
+    for (from, tos) in &edges {
+        for to in tos {
+            adj[idx[from.as_str()]].push(idx[to.as_str()]);
+        }
+    }
+
+    let mut counter = 0usize;
+    let mut index = vec![usize::MAX; names.len()];
+    let mut low = vec![0usize; names.len()];
+    let mut on_stack = vec![false; names.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+    // Tarjan over shared state, so the recursive helper keeps a small
+    // signature (clippy rejects eight positional arguments, and the mutable
+    // slices are all the same "graph walk state").
+    struct Walkers<'a> {
+        adj: &'a [Vec<usize>],
+        index: &'a mut [usize],
+        low: &'a mut [usize],
+        on_stack: &'a mut [bool],
+        stack: &'a mut Vec<usize>,
+        counter: &'a mut usize,
+        sccs: &'a mut Vec<Vec<usize>>,
+    }
+
+    fn strongconnect(v: usize, w: &mut Walkers<'_>) {
+        w.index[v] = *w.counter;
+        w.low[v] = *w.counter;
+        *w.counter += 1;
+        w.stack.push(v);
+        w.on_stack[v] = true;
+        for i in 0..w.adj[v].len() {
+            let to = w.adj[v][i];
+            if w.index[to] == usize::MAX {
+                strongconnect(to, w);
+                w.low[v] = w.low[v].min(w.low[to]);
+            } else if w.on_stack[to] {
+                w.low[v] = w.low[v].min(w.index[to]);
+            }
+        }
+        if w.low[v] == w.index[v] {
+            let mut comp = Vec::new();
+            while let Some(x) = w.stack.pop() {
+                w.on_stack[x] = false;
+                comp.push(x);
+                if x == v {
+                    break;
+                }
+            }
+            if comp.len() > 1 {
+                w.sccs.push(comp);
+            }
+        }
+    }
+
+    for v in 0..names.len() {
+        if index[v] == usize::MAX {
+            let mut walkers = Walkers {
+                adj: &adj,
+                index: &mut index,
+                low: &mut low,
+                on_stack: &mut on_stack,
+                stack: &mut stack,
+                counter: &mut counter,
+                sccs: &mut sccs,
+            };
+            strongconnect(v, &mut walkers);
+        }
+    }
+
+    let mut found: Vec<Vec<String>> = sccs
+        .into_iter()
+        .map(|c| {
+            let mut v: Vec<String> = c.into_iter().map(|i| names[i].clone()).collect();
+            v.sort();
+            v
+        })
+        .collect();
+    found.sort();
+
+    let known: Vec<String> = ["config", "credits", "session_pool", "workbuddy_auth"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        found,
+        vec![known],
+        "the module graph must have exactly one known cycle (config/credits/session_pool/\
+         workbuddy_auth); a new or changed cycle means a dependency was reintroduced"
+    );
+}
+
+/// The desktop webview's **first navigation** to the console is cross-site.
+///
+/// It sits on `tauri://localhost` and navigates to
+/// `http://127.0.0.1:<port>/admin/`, so `Sec-Fetch-Site: cross-site` with
+/// `Sec-Fetch-Mode: navigate`. Rejecting that showed the server's login page
+/// inside the app — "服务器模式 · 需要管理令牌" — while the same URL opened
+/// fine in a browser.
+///
+/// A cross-site *subresource* must still be refused.
+#[tokio::test]
+async fn the_desktop_console_accepts_the_webviews_cross_site_navigation() {
+    let _iso = isolate("nav-cross-site", Some("tok")).await;
+
+    // Navigation from the Tauri scheme: the console, with a session.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-mode", "navigate")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app_for(desktop_state()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("set-cookie").is_some(),
+        "the webview's navigation must mint a session"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&body).contains("管理令牌"),
+        "the webview must not land on the login page"
+    );
+
+    // A cross-site subresource (no `navigate`) is still refused.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-mode", "no-cors")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app_for(desktop_state()).oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "a cross-site subresource must not mint a session"
+    );
 }

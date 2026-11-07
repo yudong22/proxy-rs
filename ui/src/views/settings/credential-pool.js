@@ -19,9 +19,19 @@ import { overlay, modalShell } from '../../components/overlay.js';
 /** Whether a growth run is in flight (drives the progress line). */
 let growthRunActive = false;
 /** Set once the run's summary is written, so late events cannot overwrite it. */
-let growthRunFinished = false;
+let growthRunFinished = true;
+/**
+ * Timestamp until which the poller keeps talking to the backend even though the
+ * run is over. A run resolves before its last progress lines are necessarily
+ * flushed, so the drain continues for a short grace window to catch the tail.
+ * Without it the final lines are dropped; without the window the poller would
+ * keep asking forever (see `drainProgress`).
+ */
+let growthPollGraceUntil = 0;
 /** Recent progress lines, newest last. */
 let growthProgressLines = [];
+/** Poll draining the backend's progress buffer while a run is in flight. */
+let growthProgressTimer = null;
 
 /**
  * Paint the growth progress box.
@@ -559,6 +569,8 @@ function initAutomationDialog() {
 
 /** Wire the credential-pool controls and paint the initial list. */
 export function initCredentialPool() {
+  // A re-init (view remount) must not stack a second poll on the first.
+  if (growthProgressTimer) clearInterval(growthProgressTimer);
   // The QR flow repaints the list through this hook (see oauth-qr.js), and the
   // re-bind dialog does the same through its own (see relogin.js). Both are
   // injected rather than imported back, so neither module has to depend on this
@@ -575,19 +587,19 @@ export function initCredentialPool() {
 
   // 增长积分：跑一遍成长任务并领奖。结果里「跳过」和「未推进」必须显式告知，
   // 否则用户会以为"跑了=全拿到了"。
-  // Growth progress stream. Bound once per view init; the handler only updates
-  // the status line, so re-rendering the pool does not lose the listener.
-  // `initCredentialPool` is called synchronously from the view router, so the
-  // subscription is fired and forgotten rather than awaited: binding a listener
-  // must not delay first paint of the pool.
-  listen('growth-progress', (p) => {
+  // Growth progress stream, **polled**.
+  //
+  // The backend used to push these as Tauri events; a shared HTTP console has
+  // no push channel, so progress now lands in a server-side buffer that
+  // `get_growth_progress` drains (take-and-clear). The poll runs only while a
+  // run is in flight and its summary has not yet been written, so an idle view
+  // costs nothing. Gating on a strict "still in flight" flag lost the tail of
+  // very fast runs for the events path (the run resolves before its last
+  // events arrive), so the poll deliberately keeps draining until
+  // `growthRunFinished` — the buffer is empty by then, and the extra poll is
+  // free.
+  function appendProgress(p) {
     if (!p || !p.phase) return;
-    // Accept events whenever a run has been started and its summary has not yet
-    // been written. Gating on a strict "still in flight" flag lost the tail of
-    // very fast runs: with the mock backend (and any run that finishes inside a
-    // single tick) `growthRunActive` was already false by the time the final
-    // events arrived, so the box showed only "开始运行成长任务…".
-    if (growthRunFinished) return;
     const lines = growthProgressLines;
     if (p.phase === 'account_start') {
       lines.push(`⏳ 第 ${p.index}/${p.total} 个账号：${p.label}`);
@@ -607,7 +619,39 @@ export function initCredentialPool() {
     // Keep only the tail: a long pool run would otherwise fill the line.
     if (lines.length > 6) lines.splice(0, lines.length - 6);
     paintGrowthProgress(false);
-  });
+  }
+
+  // Dual-channel progress: listen() is active on desktop/harness, while HTTP
+  // console uses polling (where listen() degrades cleanly to a no-op).
+  // Drain the backend's progress buffer once.
+  //
+  // The endpoint is take-and-clear, so each call yields only what was
+  // produced since the last one. A failure is ignored: the next tick retries
+  // (a listener restart mid-run is transient, and the run itself will fail
+  // loudly if it was real).
+  //
+  // The network call happens **only** while a run is in flight or inside the
+  // short grace window that follows it. The timer itself ticks forever, but an
+  // idle settings page must not ask the backend four times a second — that
+  // was the actual bug: the poller used to be gated on `growthRunFinished`,
+  // which starts out "not finished", so every idle page hammered
+  // `get_growth_progress` at 4 Hz forever.
+  async function drainProgress(force = false) {
+    if (!force && !growthRunActive && Date.now() > growthPollGraceUntil) return;
+    let res;
+    try {
+      res = await invoke('get_growth_progress');
+    } catch {
+      return;
+    }
+    for (const p of res?.lines || []) {
+      appendProgress(p);
+    }
+  }
+
+  // 250ms, not 1s: a whole-pool run can finish inside a second, and a slow
+  // first poll would report nothing at all for the runs that matter most.
+  growthProgressTimer = setInterval(drainProgress, 250);
 
   $('#btn-wb-growth')?.addEventListener('click', async () => {
     const btn = $('#btn-wb-growth');
@@ -615,9 +659,10 @@ export function initCredentialPool() {
       btn.disabled = true;
       btn.textContent = '⏳ 增长中...';
     }
-    // Progress state: the event handler appends lines while `growthRunActive`.
+    // Progress state: the poller appends lines while `growthRunActive`.
     growthRunActive = true;
     growthRunFinished = false;
+    growthPollGraceUntil = 0;
     growthProgressLines = ['开始运行成长任务…'];
     paintGrowthProgress(true);
 
@@ -689,10 +734,15 @@ export function initCredentialPool() {
     } finally {
       growthRunActive = false;
       clearInterval(heartbeat);
-      // Let the last queued events land before freezing the box; the backend
-      // emits `finished` just before the command resolves, and Tauri delivers it
-      // on the same event loop.
-      await new Promise((r) => setTimeout(r, 150));
+      // Drain once more before freezing the box: the run's last progress lines
+      // are written just before the command resolves, and the poller may not
+      // have ticked since. The freeze flag is set *after* this drain, so those
+      // lines are not discarded.
+      await drainProgress(true);
+      // Keep polling for a short grace window so a line flushed just after the
+      // command resolved still shows up — but stop after it, instead of asking
+      // the backend forever.
+      growthPollGraceUntil = Date.now() + 2000;
       growthRunFinished = true;
       paintGrowthProgress(false);
       if (btn) {

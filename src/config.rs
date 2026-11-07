@@ -2,123 +2,33 @@ use crate::settings::{GuiSettings, DEFAULT_PORT};
 use anyhow::{bail, Result};
 use reqwest::Url;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::OnceLock;
 
-/// Values parsed from the `.env` file, loaded once per process.
-///
-/// Deliberately *not* pushed into the process environment. `dotenvy::dotenv()`
-/// exists to call `std::env::set_var`, which is unsound to run while other
-/// threads read the environment — and `Config::from_settings` runs on a tokio
-/// worker on every proxy (re)start, i.e. on every settings save, while request
-/// handlers concurrently read env (`PROXY_TZ_OFFSET_HOURS`, the upstream keys).
-/// Parsing the file into a map keeps the documented `.env` behaviour without
-/// mutating shared process state.
-fn dotenv_values() -> &'static std::collections::HashMap<String, String> {
-    static VALUES: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
-    VALUES.get_or_init(load_dotenv_file)
-}
+// Environment lookup now lives in `crate::env`, so modules that only need a
+// variable (client_accounts, api_token) do not depend on the proxy config.
+// These wrappers keep this module's surface — and its callers — unchanged.
+pub use crate::env::value as env_value;
 
-/// Parse a `.env` file's contents into a map, first occurrence winning.
-///
-/// Split from [`load_dotenv_file`] so the parsing rules can be asserted without
-/// depending on which `.env` happens to exist on the machine.
-fn parse_dotenv(path: &std::path::Path) -> Option<std::collections::HashMap<String, String>> {
-    let iter = dotenvy::from_path_iter(path).ok()?;
-    Some(
-        iter.flatten()
-            .fold(std::collections::HashMap::new(), |mut acc, (k, v)| {
-                acc.entry(k).or_insert(v);
-                acc
-            }),
-    )
-}
-
-/// Read the first `.env` that exists, in the documented search order.
-///
-/// Uses `from_path_iter`, whose iterator only *parses* — the mutating
-/// `set_var` calls live in the separate `load`/`load_override` methods, which
-/// this never calls.
-fn load_dotenv_file() -> std::collections::HashMap<String, String> {
-    let mut candidates = vec![PathBuf::from(".env")];
-    // `home_dir` rather than `HOME`: Windows does not set `HOME`, and without
-    // this the documented `~/.proxy-rs/.env` location is never even probed
-    // there.
-    if let Some(home) = crate::settings::home_dir() {
-        candidates.push(home.join(".proxy-rs").join(".env"));
-        candidates.push(home.join(".proxy-rs.env"));
-        candidates.push(home.join(".anthropic-proxy.env"));
-    }
-    candidates.push(PathBuf::from("/etc/proxy-rs/.env"));
-    candidates.push(PathBuf::from("/etc/anthropic-proxy/.env"));
-
-    candidates
-        .iter()
-        .find_map(|path| path.exists().then(|| parse_dotenv(path)).flatten())
-        .unwrap_or_default()
-}
-
-/// Look up a configuration value: the `.env` file first, then the real process
-/// environment.
-///
-/// `.env` wins because it is the more specific, project-local setting, and
-/// because it is the documented override for `gui-settings.json`. The process
-/// environment is still consulted, so a variable exported by the shell or set
-/// by launchd keeps working.
-///
-/// Scope: this covers the configuration keys `from_settings` reads. Readers
-/// outside this module that go straight to `std::env` — `PROXY_TZ_OFFSET_HOURS`,
-/// `CODEX_HOME` — now see only the real process environment. Previously a
-/// `.env` value reached them as a side effect of `set_var`, but only after the
-/// first proxy start had run `load_dotenv`, so it was never dependable; those
-/// are system-level settings and belong in the environment or a settings file.
 fn env_lookup(name: &str) -> Option<String> {
-    dotenv_values()
-        .get(name)
-        .cloned()
-        .or_else(|| std::env::var(name).ok())
+    crate::env::lookup(name)
 }
 
-/// A configuration value from `.env` or the process environment, verbatim.
-///
-/// The same `.env`-aware lookup [`Config::from_settings`] uses, exposed for
-/// settings read outside the proxy config — today the `/api` mutation token.
-/// Without it a token placed in `~/.proxy-rs/.env` (the only place a
-/// Finder-launched `.app` can read a secret from) would be invisible, and the
-/// mutation routes would stay switched off no matter what the user wrote.
-pub fn env_value(name: &str) -> Option<String> {
-    env_lookup(name)
-}
-
-/// Trimmed, non-empty configuration value, if set.
 fn non_empty_env(name: &str) -> Option<String> {
-    env_lookup(name)
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    crate::env::non_empty(name)
 }
 
-/// Truthy configuration flag (`1` or `true`, case-insensitive).
 fn env_flag(name: &str) -> bool {
-    env_lookup(name)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::env::flag(name)
 }
 
-/// Environment variable parsed as a port number.
 fn env_u16(name: &str) -> Option<u16> {
-    non_empty_env(name).and_then(|v| v.parse().ok())
+    crate::env::u16_of(name)
 }
 
-/// How a provider exposes its model catalog.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ModelsFlavor {
-    /// Standard OpenAI `GET {base}/v1/models` returning `{"data":[{"id":…}]}`.
-    #[default]
-    OpenAI,
-    /// Vendor-specific config endpoint (WorkBuddy `/v3/config`) whose models
-    /// must be filtered by `agents[name=cli].models`.
-    WorkBuddyConfig,
-}
+// `ModelsFlavor` is a leaf type with no dependencies of its own, so it lives
+// in `flavor` — otherwise `credits` (which only needs the enum) had to depend
+// on the whole config module, and `config → workbuddy_auth → credits → config`
+// closed a cycle.
+pub use crate::flavor::ModelsFlavor;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -159,13 +69,6 @@ pub struct Config {
     /// Whether a 429/402/quota-code/failed-refresh exception may relocate a
     /// session onto another credential. Default true.
     pub session_switch_enabled: bool,
-    /// Whether `/v1/*` requires an inbound access key (`x-proxy-rs-key`).
-    ///
-    /// Independent of [`Config::passthrough_api_key`] and of the credential
-    /// pool: those decide which credential goes **upstream**, this decides who
-    /// may call the gateway **at all**. They coexist, which is why the two use
-    /// different headers — see `client_accounts::KEY_HEADER`.
-    pub client_auth_enabled: bool,
 }
 
 impl Default for Config {
@@ -189,7 +92,6 @@ impl Default for Config {
             force_stream_upstream: false,
             credential_pool_enabled: false,
             session_switch_enabled: true,
-            client_auth_enabled: false,
         }
     }
 }
@@ -335,13 +237,10 @@ impl Config {
         if let Some(raw) = non_empty_env("PROXY_SESSION_SWITCH") {
             self.session_switch_enabled = raw == "1" || raw.eq_ignore_ascii_case("true");
         }
-        // Inbound access-key gate. Deliberately *not* mutually exclusive with
-        // `passthrough_api_key`: passthrough decides which credential travels
-        // upstream (on `x-api-key`), this decides who may call the gateway (on
-        // `x-proxy-rs-key`). The two headers are independent, so a deployment
-        // may legitimately want both — see `client_accounts::KEY_HEADER`.
-        self.client_auth_enabled = crate::client_accounts::enabled_from(self.client_auth_enabled);
-
+        // The inbound access-key gate is **not** part of this config. It is
+        // held live by `ClientAuthState` (the switch can change without a
+        // restart), and reading it here only created a `config →
+        // client_accounts` edge with nothing on the other end.
         // Passthrough extracts the key per request, so a static key contradicts it.
         if self.passthrough_api_key && self.api_key.is_some() {
             bail!(
@@ -569,7 +468,7 @@ mod tests {
             "parse",
             "UPSTREAM_BASE_URL=https://example.test\nVERBOSE=1\n",
         );
-        let vars = parse_dotenv(&path).expect("parses");
+        let vars = crate::env::parse_dotenv(&path).expect("parses");
         assert_eq!(vars["UPSTREAM_BASE_URL"], "https://example.test");
         assert_eq!(vars["VERBOSE"], "1");
 
@@ -584,7 +483,7 @@ mod tests {
     fn a_repeated_key_keeps_its_first_value() {
         // Matches dotenv semantics: the first occurrence wins.
         let path = temp_env("dupe", "K=first\nK=second\n");
-        let vars = parse_dotenv(&path).expect("parses");
+        let vars = crate::env::parse_dotenv(&path).expect("parses");
         assert_eq!(vars["K"], "first");
         let _ = std::fs::remove_file(path);
     }
@@ -595,7 +494,7 @@ mod tests {
             "quotes",
             "# a comment\nQUOTED=\"has spaces\"\nPLAIN=bare\nexport EXPORTED=yes\n",
         );
-        let vars = parse_dotenv(&path).expect("parses");
+        let vars = crate::env::parse_dotenv(&path).expect("parses");
         assert_eq!(vars["QUOTED"], "has spaces");
         assert_eq!(vars["PLAIN"], "bare");
         assert_eq!(vars["EXPORTED"], "yes");
@@ -606,7 +505,7 @@ mod tests {
     #[test]
     fn a_missing_file_is_empty_rather_than_an_error() {
         let missing = std::env::temp_dir().join("proxy-rs-env-does-not-exist");
-        assert!(parse_dotenv(&missing).is_none());
+        assert!(crate::env::parse_dotenv(&missing).is_none());
     }
 
     #[test]

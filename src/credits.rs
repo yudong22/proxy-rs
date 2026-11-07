@@ -15,7 +15,6 @@
 //! The response always exposes the *raw* upstream credits (no currency
 //! conversion), matching the chosen `GET /v1/credits` contract.
 
-use crate::config::Config;
 use crate::error::{ProxyError, ProxyResult};
 use crate::settings::LogBuffer;
 use axum::{
@@ -28,7 +27,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config::ModelsFlavor;
+use crate::flavor::ModelsFlavor;
 
 /// WorkBuddy/CodeBuddy billing host. The CLI chat endpoint (`copilot.tencent.com`)
 /// serves inference; billing lives on the product site.
@@ -155,14 +154,14 @@ pub struct CreditsResponse {
 /// Honors an explicit `CREDITS_API_ENDPOINT`, then falls back to the
 /// WorkBuddy billing resource for the WorkBuddy flavor. Returns `None` when no
 /// balance source is configured (the handler then returns 501).
-fn credits_endpoint_for(config: &Config) -> Option<String> {
-    if let Some(ref ep) = config.credits_endpoint {
+fn credits_endpoint_for(credits_endpoint: &Option<String>, flavor: ModelsFlavor) -> Option<String> {
+    if let Some(ref ep) = credits_endpoint {
         let trimmed = ep.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
         }
     }
-    if config.models_flavor == ModelsFlavor::WorkBuddyConfig {
+    if flavor == ModelsFlavor::WorkBuddyConfig {
         return Some(format!(
             "{}{}",
             WORKBUDDY_BILLING_HOST, WORKBUDDY_RESOURCE_PATH
@@ -503,12 +502,13 @@ pub enum CreditsIdentity {
 
 /// Fetch and normalize the gateway wallet balance.
 pub async fn fetch_credits(
-    config: &Config,
+    credits_endpoint: &Option<String>,
+    flavor: ModelsFlavor,
     client: &reqwest::Client,
     api_key: &Option<String>,
     identity: CreditsIdentity,
 ) -> ProxyResult<CreditsResponse> {
-    let endpoint = credits_endpoint_for(config).ok_or_else(|| {
+    let endpoint = credits_endpoint_for(credits_endpoint, flavor).ok_or_else(|| {
         ProxyError::Config(
             "no credits endpoint configured (set CREDITS_API_ENDPOINT, or use the WorkBuddy flavor)".to_string(),
         )
@@ -674,7 +674,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// axum handler for `GET /v1/credits`.
 pub async fn credits_handler(
-    Extension(config): Extension<Arc<Config>>,
+    Extension(config): Extension<Arc<crate::config::Config>>,
     Extension(client): Extension<reqwest::Client>,
     Extension(gui_logs): Extension<Arc<LogBuffer>>,
     Extension(service): Extension<Arc<crate::service::ServiceController>>,
@@ -713,7 +713,14 @@ pub async fn credits_handler(
     } else {
         (config.api_key.clone(), CreditsIdentity::ApiKey)
     };
-    let result = fetch_credits(&config, &client, &api_key, identity).await;
+    let result = fetch_credits(
+        &config.credits_endpoint,
+        config.models_flavor.clone(),
+        &client,
+        &api_key,
+        identity,
+    )
+    .await;
 
     match result {
         Ok(resp) => {
@@ -792,14 +799,10 @@ mod tests {
     #[tokio::test]
     async fn no_endpoint_configured_returns_error() {
         // OpenAI flavor with no CREDITS_API_ENDPOINT must error before any network call.
-        let config = Config {
-            models_flavor: ModelsFlavor::OpenAI,
-            credits_endpoint: None,
-            ..Default::default()
-        };
         let client = reqwest::Client::new();
         let result = fetch_credits(
-            &config,
+            &None,
+            ModelsFlavor::OpenAI,
             &client,
             &Some("token".to_string()),
             CreditsIdentity::ApiKey,
@@ -810,13 +813,16 @@ mod tests {
 
     #[tokio::test]
     async fn missing_api_key_returns_error() {
-        let config = Config {
-            models_flavor: ModelsFlavor::OpenAI,
-            credits_endpoint: Some("https://example.invalid/credits".to_string()),
-            ..Default::default()
-        };
         let client = reqwest::Client::new();
-        let result = fetch_credits(&config, &client, &None, CreditsIdentity::ApiKey).await;
+        let endpoint = Some("https://example.invalid/credits".to_string());
+        let result = fetch_credits(
+            &endpoint,
+            ModelsFlavor::OpenAI,
+            &client,
+            &None,
+            CreditsIdentity::ApiKey,
+        )
+        .await;
         assert!(matches!(result, Err(ProxyError::Config(_))));
     }
 }

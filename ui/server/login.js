@@ -45,6 +45,29 @@ function showWarning(message) {
  * The one thing still done in JS is refusing to submit an empty token, so the
  * common mistake produces the inline message instead of a round trip.
  */
+/**
+ * The tab to return to after (re)login.
+ *
+ * Order: a `?next=` on this URL (carried forward by a failed attempt) → the
+ * hash this page was opened with. Only a bare tab name is accepted here; the
+ * server re-validates, so this is convenience, not the security boundary.
+ */
+function landingTab() {
+  const fromQuery = new URLSearchParams(window.location.search).get('next');
+  const fromHash = window.location.hash.replace(/^#/, '');
+  const candidate = fromQuery || fromHash;
+  return /^(overview|logs|sessions|settings)$/.test(candidate) ? candidate : '';
+}
+
+const nextInput = document.getElementById('next');
+const landing = landingTab();
+if (nextInput) nextInput.value = landing;
+// Keep the tab in the URL bar while on the login page, so the operator can see
+// where they will land and a refresh does not lose it.
+if (landing && window.location.hash !== `#${landing}`) {
+  window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${landing}`);
+}
+
 form.addEventListener('submit', (event) => {
   const token = tokenInput.value.trim();
   if (!token) {
@@ -69,6 +92,12 @@ form.addEventListener('submit', (event) => {
 (function reportFormError() {
   const params = new URLSearchParams(window.location.search);
   const code = params.get('e');
+  // Carry the landing tab forward so a retry still returns to it.
+  const carried = params.get('next');
+  if (carried && /^(overview|logs|sessions|settings)$/.test(carried)) {
+    if (nextInput) nextInput.value = carried;
+    window.history.replaceState(null, '', `${window.location.pathname}?${params.toString()}#${carried}`);
+  }
   if (!code) return;
 
   submit.disabled = false;

@@ -110,6 +110,70 @@ const MOCK = {
     provider_exists: true, model_count: 4, base_url: 'http://127.0.0.1:3457/v1',
     credential_present: true, session_header: true,
   },
+  // 会话 view. One row, one transcript. The timeline's text deliberately
+  // contains markup: the assertion below proves it renders as text (the
+  // transcript is model output, and this is the UI's largest injection surface).
+  claude_sessions_list: {
+    available: true,
+    reason: null,
+    root: '/Users/test/.claude/projects',
+    sources: [
+      { kind: 'claude_local', label: 'Claude Code', available: true, note: null },
+      { kind: 'dsh_local', label: 'DSH', available: false, note: 'DSH 会话是 zstd 压缩的本地存档，暂不支持浏览' },
+    ],
+    stats_available: true,
+    gateway_error: null,
+    total: 1,
+    offset: 0,
+    limit: 50,
+    // Flattened exactly like `SessionRow` (serde flatten): summary fields sit
+    // at the top level, beside `gateway`.
+    sessions: [{
+      id: 'b9c3800a-311e-4c89-9a38-c533d8969b5d',
+      encoded_project: '-Users-test-project', cwd: '/Users/test/project',
+      title: '会话页测试', first_seen_ms: 1794000000000, last_seen_ms: 1794000100000,
+      file_mtime_ms: 1794000100000, size_bytes: 2048, git_branch: 'main', version: '2.1.277',
+      turns: 1, assistant_turns: 2, tool_calls: 1, subagents: 0,
+      last_model: 'deepseek-v4.1-flash', counts_partial: false,
+      gateway: { session_id: 'claude:b9c3800a-311e-4c89-9a38-c533d8969b5d',
+                 requests: 3, input_tokens: 1200, output_tokens: 340,
+                 cache_read_tokens: 900, cache_write_tokens: 10,
+                 first_at: '2026-11-06 10:00:00', last_at: '2026-11-06 10:05:00',
+                 models: ['deepseek-v4.1-flash'] },
+      gateway_error: null,
+    }],
+  },
+  claude_sessions_detail: {
+    summary: { id: 'b9c3800a-311e-4c89-9a38-c533d8969b5d', encoded_project: '-Users-test-project',
+               cwd: '/Users/test/project', title: '会话页测试', first_seen_ms: 1794000000000,
+               last_seen_ms: 1794000100000, file_mtime_ms: 1794000100000, size_bytes: 2048,
+               git_branch: 'main', version: '2.1.277', turns: 1, assistant_turns: 1, tool_calls: 1,
+               subagents: 0, last_model: 'deepseek-v4.1-flash', counts_partial: false },
+    cost_state: null,
+    models: [{ model: 'deepseek-v4.1-flash', turns: 1,
+               tokens: { input: 10, output: 20, cache_read: 0, cache_write: 0, thinking: 0 } }],
+    tokens: { input: 10, output: 20, cache_read: 0, cache_write: 0, thinking: 0 },
+    tokens_incl_subagents: { input: 10, output: 20, cache_read: 0, cache_write: 0, thinking: 0 },
+    timeline: [
+      { uuid: 'u1', parent_uuid: null, ts_ms: 1794000000000, role: 'user', kind: 'text',
+        sidechain: false, text: '看下 <script>window.__XSS__=1</script>', text_truncated: false,
+        tool_name: null, tool_input: null, tool_use_id: null, tool_result_is_error: null,
+        model: null, tokens: null },
+      { uuid: 'a1', parent_uuid: null, ts_ms: 1794000005000, role: 'assistant', kind: 'tool_use',
+        sidechain: false, text: '', text_truncated: false, tool_name: 'Bash',
+        tool_input: '{"command":"ls"}', tool_use_id: 'toolu_1', tool_result_is_error: null,
+        model: 'deepseek-v4.1-flash', tokens: { input: 10, output: 20, cache_read: 0, cache_write: 0, thinking: 0 } },
+    ],
+    timeline_offset: 0, timeline_total: 2, has_more: false,
+    ignored: { user_noise: 0, duplicate_uuid: 0, other: 0, malformed: 0 },
+    subagents: [], agent_id: null,
+    gateway: { session_id: 'claude:b9c3800a-311e-4c89-9a38-c533d8969b5d',
+               requests: 3, input_tokens: 1200, output_tokens: 340,
+               cache_read_tokens: 900, cache_write_tokens: 10,
+               first_at: '2026-11-06 10:00:00', last_at: '2026-11-06 10:05:00',
+               models: ['deepseek-v4.1-flash'] },
+    gateway_error: null,
+  },
   get_request_logs: { items: [], total: 0, models: [], clients: [], sessions: [] },
   get_logs: { entries: [] },
   wb_credentials_list: {
@@ -393,6 +457,17 @@ try {
     window.__TAURI__ = {
       core: { invoke: (cmd, args) => { window.__CALLS__.push(cmd);
         window.__INVOKE_ARGS__[cmd] = args;
+        // get_growth_progress is take-and-clear on the real backend: the
+        // console drains the buffer and the next poll sees nothing new. The
+        // mock reproduces that, so a UI that kept re-reading the same lines
+        // would show duplicates here too.
+        if (cmd === 'get_growth_progress') {
+          const lines = window.__MOCKDATA__.__growth_progress_drained
+            ? []
+            : (window.__MOCKDATA__.__growth_progress_events || []);
+          window.__MOCKDATA__.__growth_progress_drained = true;
+          return Promise.resolve({ lines });
+        }
         return Promise.resolve(Object.prototype.hasOwnProperty.call(window.__MOCKDATA__, cmd)
           ? window.__MOCKDATA__[cmd] : null); } },
       // A real dispatcher: listen() records the handler and __emitTestEvent
@@ -576,16 +651,16 @@ try {
   // events the backend sends, and requires the progress box to show them.
   await send('Runtime.evaluate', { expression: `(() => {
     window.__CALLS__ = [];
+    // A fresh run starts with an empty buffer (the backend drains it).
+    window.__MOCKDATA__.__growth_progress_drained = false;
     document.querySelector('#btn-wb-growth').click();
   })()` });
   // Let the click handler set up its state before the events arrive.
   await new Promise((r) => setTimeout(r, 150));
-  await send('Runtime.evaluate', { expression: `(() => {
-    for (const p of window.__MOCKDATA__.__growth_progress_events) {
-      window.__emitTestEvent('growth-progress', p);
-    }
-  })()` });
-  await new Promise((r) => setTimeout(r, 1200));
+  // The progress lines now arrive by polling `get_growth_progress` (the
+  // console has no event channel over HTTP), so the harness waits for a poll
+  // tick instead of emitting events.
+  await new Promise((r) => setTimeout(r, 1400));
 
   const growthUi = await send('Runtime.evaluate', {
     returnByValue: true,
@@ -644,6 +719,69 @@ try {
   check('request log total came from /api/request-logs', lp.count, '1 条记录');
   check('harness served /api/request-logs', apiHits.includes('/api/request-logs'), true);
   check('request log table did not fall back to IPC', lp.logsViaIpc, false);
+
+  // 会话 view: the list renders, a click opens the transcript, and the
+  // transcript's markup is shown as text — not executed.
+  await send('Runtime.evaluate', { expression: `window.switchTab('sessions');` });
+  await new Promise((r) => setTimeout(r, 500));
+  const sess = await send('Runtime.evaluate', {
+    returnByValue: true,
+    awaitPromise: true,
+    expression: `(async () => {
+      const rows = [...document.querySelectorAll('#sessions-rows .sess-row')];
+      const dsh = document.querySelector('#sessions-sources [data-kind="dsh_local"]');
+      rows[0]?.click();
+      await new Promise((r) => setTimeout(r, 300));
+      return {
+        rowCount: rows.length,
+        title: rows[0]?.querySelector('.sess-row-title')?.textContent,
+        gatewayBadge: !!rows[0]?.querySelector('.sess-badge'),
+        dshDisabled: !!dsh && dsh.disabled,
+        detailCalled: window.__CALLS__.includes('claude_sessions_detail'),
+        timelineEntries: document.querySelectorAll('#session-timeline .sess-turn').length,
+        toolName: document.querySelector('#session-timeline .sess-tool-name')?.textContent || '',
+        innerScrollers: [...document.querySelectorAll('#session-timeline .sess-pre')].filter((p) => p.scrollHeight > p.clientHeight + 2).length,
+        bubbleText: document.querySelector('#session-timeline .sess-prompt')?.textContent || '',
+        xssRan: window.__XSS__ === 1,
+        gatewayShown: !!document.querySelector('.sess-gateway .sess-gateway-title'),
+      };
+    })()`,
+  });
+  const sv = sess.result.value;
+  check('sessions list renders one row', sv.rowCount, 1);
+  check('sessions row title', sv.title, '会话页测试');
+  check('sessions row shows the gateway badge', sv.gatewayBadge, true);
+  check('DSH source is disabled', sv.dshDisabled, true);
+  check('clicking a row loads the transcript', sv.detailCalled, true);
+  check('timeline entries rendered', sv.timelineEntries, 2);
+  check('tool call renders in Claude Code style', sv.toolName, 'Bash');
+  check('tool output never scrolls (collapse instead)', sv.innerScrollers, 0);
+  check('transcript text renders as text', sv.bubbleText.includes('<script>window.__XSS__=1</script>'), true);
+  check('transcript markup is not executed', sv.xssRan, false);
+  check('gateway totals shown in the detail', sv.gatewayShown, true);
+
+  // Tab routing is hash-driven: a switch writes the hash, and the hash alone
+  // (as a deep link would) repaints the pane.
+  const hashInfo = await send('Runtime.evaluate', {
+    returnByValue: true,
+    awaitPromise: true,
+    expression: `(async () => {
+      window.switchTab('logs');
+      await new Promise((r) => setTimeout(r, 100));
+      const afterClick = location.hash;
+      window.location.hash = 'settings';
+      await new Promise((r) => setTimeout(r, 150));
+      const afterHash = document.querySelector('.tab.active')?.dataset.tab;
+      location.hash = 'no-such-tab';
+      await new Promise((r) => setTimeout(r, 150));
+      const unknown = document.querySelector('.tab.active')?.dataset.tab;
+      return { afterClick, afterHash, unknown };
+    })()`,
+  });
+  const hi = hashInfo.result.value;
+  check('switching a tab writes the hash', hi.afterClick, '#logs');
+  check('the hash alone switches the pane', hi.afterHash, 'settings');
+  check('an unknown hash falls back to overview', hi.unknown, 'overview');
 
   // Back to the overview so the remaining integration checks find their elements.
   await send('Runtime.evaluate', { expression: `window.switchTab('overview');` });

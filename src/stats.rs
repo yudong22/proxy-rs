@@ -362,6 +362,26 @@ pub const SESSION_METRICS_MAX_TURNS: i64 = 3000;
 /// That is a time-weighted mean. Averaging the per-turn `tok/s` values instead
 /// would be wrong: it would let a 3-token reply and a 3000-token reply count
 /// equally.
+/// All-time totals for one conversation, as seen by the gateway.
+///
+/// Joined to a local transcript by its namespaced id (`claude:<uuid>`). Every
+/// field is a sum over every recorded request, never a window: this answers
+/// "what did this conversation cost through the proxy", not "how fast is it
+/// right now" (that is [`SessionMetrics`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionUsageTotal {
+    pub session_id: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub first_at: Option<String>,
+    pub last_at: Option<String>,
+    /// Distinct served models, sorted for a stable payload.
+    pub models: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionMetrics {
     pub session_id: String,
@@ -1373,6 +1393,68 @@ impl StatsDb {
         }
         metrics.subagent_sessions = child_ids.len() as i64;
         Ok(metrics)
+    }
+
+    /// All-time request/token totals for the given namespaced session ids.
+    ///
+    /// This is the join behind the console's 会话 page: a local transcript is
+    /// keyed `claude:<uuid>`, and this answers "what did the gateway see for
+    /// this conversation" in one query. Unlike [`Self::query_session_metrics`]
+    /// there is no turn cap and no date scope — a session can span days, and a
+    /// usage total that silently stopped at N turns would read as wrong.
+    ///
+    /// Ids with no rows are simply absent from the result: the caller renders
+    /// that as "not seen by the gateway", which is different from "zero".
+    pub fn session_usage_totals_for(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<SessionUsageTotal>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One parameter per id; rusqlite has no array binding.
+        let placeholders = std::iter::repeat_n("?", session_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT session_id, COUNT(*), COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    MIN(created_at), MAX(created_at),
+                    GROUP_CONCAT(DISTINCT model)
+             FROM request_logs
+             WHERE session_id IN ({placeholders})
+             GROUP BY session_id"
+        );
+        let handle = self.read_conn();
+        let conn = handle.get();
+        let mut stmt = conn.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(session_ids.iter());
+        let rows = stmt.query_map(params, |row| {
+            let models: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
+            Ok(SessionUsageTotal {
+                session_id: row.get(0)?,
+                requests: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                cache_read_tokens: row.get(4)?,
+                cache_write_tokens: row.get(5)?,
+                first_at: row.get(6)?,
+                last_at: row.get(7)?,
+                models: models
+                    .split(',')
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let mut total = row?;
+            total.models.sort();
+            out.push(total);
+        }
+        Ok(out)
     }
 
     /// Session-level speed metrics for the overview's 输出速度 card, as of today.

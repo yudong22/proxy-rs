@@ -29,7 +29,8 @@ let selected = 0;
 const actions = [
   { label: '打开概览 (Overview)', kbd: '1', run: () => switchTab('overview') },
   { label: '查看日志 (Logs)', kbd: '2', run: () => switchTab('logs') },
-  { label: '服务设置 (Settings)', kbd: '3', run: () => switchTab('settings') },
+  { label: '查看会话 (Sessions)', kbd: '3', run: () => switchTab('sessions') },
+  { label: '服务设置 (Settings)', kbd: '4', run: () => switchTab('settings') },
   { label: '启动/暂停代理服务', kbd: 'S', run: () => $('#btn-toggle-service')?.click() },
   {
     label: '测试上游连通性',

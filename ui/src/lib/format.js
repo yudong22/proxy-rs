@@ -160,3 +160,59 @@ export function formatSeconds(ms) {
   if (n < 1000) return `${Math.round(n)}毫秒`;
   return `${(n / 1000).toFixed(1)}秒`;
 }
+
+// ── Sessions view ──────────────────────────────────────────────
+
+/**
+ * Cached formatters. `Intl.DateTimeFormat` is expensive to construct and the
+ * sessions list re-renders on every selection, so build each once.
+ */
+const dateTimeFmt = new Intl.DateTimeFormat('zh-CN', {
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+const timeFmt = new Intl.DateTimeFormat('zh-CN', {
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
+/**
+ * Epoch milliseconds → `MM-DD HH:mm` in the **viewer's** timezone.
+ *
+ * Transcript timestamps arrive as UTC epoch ms and are formatted here rather
+ * than on the server: the gateway host's timezone is not the reader's, and a
+ * string formatted in the wrong one looks plausible instead of wrong.
+ */
+export function formatLocalDateTime(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const d = new Date(Number(ms));
+  return Number.isNaN(d.getTime()) ? '—' : dateTimeFmt.format(d);
+}
+
+/** Epoch milliseconds → `HH:mm:ss`, viewer-local. */
+export function formatLocalTime(ms) {
+  if (ms === null || ms === undefined) return '';
+  const d = new Date(Number(ms));
+  return Number.isNaN(d.getTime()) ? '' : timeFmt.format(d);
+}
+
+/**
+ * Token counts keep their exact value in a `title`; this is the compact form
+ * for the dense sidebar row. Below 1000 nothing is abbreviated.
+ */
+export function formatTokens(n) {
+  return formatNumber(Number(n) || 0);
+}
+
+/** File size for a transcript: `4.2 KB` / `10.3 MB`. */
+export function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}

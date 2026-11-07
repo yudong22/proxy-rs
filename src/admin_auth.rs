@@ -188,6 +188,16 @@ pub struct AdminSessions {
     /// stranger lock the operator out of their own gateway, which converts a
     /// brute-force defence into a denial-of-service primitive.
     attempts: std::sync::Mutex<HashMap<String, Attempts>>,
+    /// Whether this session table belongs to the **desktop app**.
+    ///
+    /// The desktop has no `PROXY_API_TOKEN` — the process itself is the
+    /// operator, and its console session is minted in-process by
+    /// `desktop-boot` rather than exchanged for a token. So the "no token
+    /// configured → console disabled" rule, which is right for a *server*
+    /// reachable from the network, must not switch off the desktop's own
+    /// console. This flag is what tells the two apart; a server build keeps it
+    /// `false` and its behaviour is unchanged.
+    desktop: bool,
 }
 
 impl Default for AdminSessions {
@@ -201,7 +211,52 @@ impl AdminSessions {
         Self {
             sessions: std::sync::Mutex::new(HashMap::new()),
             attempts: std::sync::Mutex::new(HashMap::new()),
+            desktop: false,
         }
+    }
+
+    /// A session table for the desktop app's in-process console.
+    ///
+    /// The only difference from [`Self::new`] is that the "no token → console
+    /// disabled" rule does not apply: the desktop mints its sessions in-process
+    /// and never had a token to begin with.
+    pub fn desktop() -> Self {
+        Self {
+            sessions: std::sync::Mutex::new(HashMap::new()),
+            attempts: std::sync::Mutex::new(HashMap::new()),
+            desktop: true,
+        }
+    }
+
+    /// Whether this table belongs to the desktop app.
+    pub fn is_desktop(&self) -> bool {
+        self.desktop
+    }
+
+    /// Mint a session **without** a token exchange, for the desktop app's
+    /// in-process console.
+    ///
+    /// The desktop webview loads the same `/admin/` surface the server serves,
+    /// but there is no human to type a token into: the console process *is* the
+    /// operator. It generates a random token at startup and mints the session
+    /// itself, so `require_session` keeps one code path for both transports.
+    /// The session lives in the same map with the same TTL and sliding expiry,
+    /// so nothing downstream can tell it apart from a logged-in server session.
+    ///
+    /// Deliberately not reachable over HTTP in the server build: the endpoint
+    /// that calls this exists only when `AdminState::desktop` is set, and only
+    /// answers loopback requests (see `console::desktop_boot`).
+    pub fn mint_session(&self) -> String {
+        let id = new_session_id();
+        let mut sessions = self.lock();
+        sessions.insert(
+            id.clone(),
+            Session {
+                last_seen: Instant::now(),
+                ttl: SESSION_TTL,
+            },
+        );
+        id
     }
 
     fn lock_attempts(&self) -> std::sync::MutexGuard<'_, HashMap<String, Attempts>> {
@@ -473,7 +528,11 @@ pub async fn require_session(
 ) -> Response {
     // No token configured → the console is switched off entirely. Answered here
     // rather than in each handler so a new route cannot forget the check.
-    if crate::api_token::configured_token().is_none() {
+    //
+    // The desktop is the one exception: it has no token (the process is the
+    // operator) and its sessions are minted in-process by `desktop-boot`. The
+    // server's behaviour — no token, no console — is unchanged.
+    if crate::api_token::configured_token().is_none() && !sessions.is_desktop() {
         return failure_response(SessionFailure::NotConfigured);
     }
 

@@ -78,7 +78,10 @@ async function invoke(command, args = {}) {
     // ensures concurrent 401s from the boot burst only navigate once.
     if (!window.__PROXY_RS_REDIRECTING__) {
       window.__PROXY_RS_REDIRECTING__ = true;
-      window.location.replace('/admin/login');
+      // Keep the tab: after logging back in the operator lands where they were,
+      // not on the default tab.
+      const tab = window.location.hash || '';
+      window.location.replace(`/admin/login${tab}`);
     }
     throw '会话已过期，请重新登录';
   }
@@ -139,12 +142,14 @@ setInterval(async () => {
 // `window.__TAURI__` inside `invoke`, so a later definition would work too — but
 // `isTauri()` is consulted during boot in some views, and a false answer there
 // would suppress work the server actually needs.
-window.__TAURI__ = {
-  core: { invoke },
-  event: { listen },
-};
-
-// A marker the console can read to adjust wording, if a future view needs to
-// know it is not in the desktop shell. Nothing reads it today; it exists so the
-// question has an answer that is not "sniff the user agent".
-window.__PROXY_RS_SERVER__ = true;
+//
+// In the desktop shell (Tauri webview), Tauri's native internals are already
+// present. We must never overwrite them, otherwise native IPC commands
+// (service start/stop, log folder, native dialogs) are lost.
+if (!window.__TAURI__ && !window.__TAURI_INTERNALS__) {
+  window.__TAURI__ = {
+    core: { invoke },
+    event: { listen },
+  };
+  window.__PROXY_RS_SERVER__ = true;
+}

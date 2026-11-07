@@ -88,6 +88,10 @@
     <label for="token">管理令牌</label>
     <input id="token" name="password" type="password" autocomplete="current-password"
            placeholder="PROXY_API_TOKEN" required autofocus>
+    <!-- Form-only. JavaScript fills it from the tab the operator came from so a
+         session expiry on 会话 returns them there; the server allow-lists it and
+         never treats it as a path. -->
+    <input type="hidden" id="next" name="next" value="">
     <label class="remember" for="remember">
       <input id="remember" type="checkbox">
       <span>记住我（7 天内免登录）</span>

@@ -5,6 +5,7 @@ Tauri 2 桌面应用的前端：原生 ES 模块 + 原生 CSS，**没有打包�
 
 ```bash
 task dev                              # 启动 Tauri 开发窗口（端口 3477，独立数据目录）
+task ui-dev                           # 浏览器里调试 UI，读本机真实 Claude 会话，无需编译 Rust
 task ui-check                         # 静态一致性检查（级联顺序、模块图、id）
 task ui-smoke                         # 无头 Chrome 启动真实页面 + mock 后端，断言行为
 task ui-test                          # 上面两个一起跑；已并入 task check
@@ -84,7 +85,7 @@ task ui-test          # = check-ui（静态）+ smoke（无头浏览器行为回
 - [ ] 级联顺序与文件清单未变（或已同步更新本文件与 `index.html`）
 - [ ] 新样式没写死颜色，或用的是既有令牌
 - [ ] 新 `id` 有归属前缀，且只创建一次
-- [ ] 页面无 console 报错，三个标签页均正常渲染
+- [ ] 页面无 console 报错，四个标签页均正常渲染（运行概览 / 实时日志 / 会话 / 服务设置）
 - [ ] 深色模式下目视确认（`prefers-color-scheme: dark`）
 
 `smoke.mjs` 会在无头 Chrome 里对着 mock 后端把真实页面完整启动一遍，断言概览指标、设置表单与身份池的渲染值，并验证两个跨模块集成点（命令面板的动态导入、扫码成功后身份池重绘）。改动这些路径后它应当仍然全绿；若断言值确实需要变，请一并更新脚本里的 `EXPECTED`，让改动是显式的而不是被忽略的。
@@ -92,3 +93,31 @@ task ui-test          # = check-ui（静态）+ smoke（无头浏览器行为回
 该脚本还在自己的 origin 上实现了 `/api/stats/today` 与 `/api/request-logs`，**且故意与 IPC mock 取不同的值**（`get_stats` 报 1234 条、`/api/stats/today` 报 4321 条）。于是「首页统计来自 HTTP」和「没有回退到 IPC」是两条可证的断言，而不是靠两条路径恰好同值蒙混过去。新增 HTTP 化的面板时请沿用这个做法。
 
 新增/调整视觉效果时，**改令牌或复用既有类**，不要为单个视图新开一套样式——这正是本目录各项约定要防的事。
+
+## 五、标签页的 URL（hash 路由）
+
+每个标签页都有自己的地址，**URL 是路由的唯一真相源**：
+
+| 标签 | 地址 |
+|---|---|
+| 运行概览 | `#overview`（默认） |
+| 实时日志 | `#logs` |
+| 会话 | `#sessions` |
+| 服务设置 | `#settings` |
+
+- 点击标签、`window.switchTab('logs')`（托盘「显示日志」）、粘贴一个 `#sessions` 链接，都会写同一个 hash；`hashchange` 是浏览器前进/后退的入口。
+- 未知 hash（例如旧链接的 `#old`）回落到 `#overview`，不会出现「所有面板都隐藏」。
+- 登录页也一样：`/admin/login#sessions` 登录成功后回到 `#sessions`；会话过期被踢到登录页时也会带上当前 hash。
+  登录表单里有一个隐藏的 `next` 字段，服务端**只接受四个已知标签名**——它是一个表单字段，绝不能变成开放重定向。
+
+## 六、本地调试页面（不编译 Rust）
+
+改 UI（布局、CSS、会话页）时不必每次 `task dev` 起 Tauri。`task ui-dev` 会：
+- 静态托管 `ui/`（你改文件后刷新标签页即可）；
+- 注入 `window.__TAURI__` 的 mock 桥接；
+- 「会话」页读取**你本机**的 `~/.claude/projects` 真实记录（`CLAUDE_PROJECTS_DIR` 可覆盖）。
+
+未实现的命令（除会话以外的设置/身份池操作）会**显式报错**而不是静默返回空，
+这样新接一条命令时一眼能看出「面板是空的」还是「命令没接上」。
+
+它**不是**网关：没有请求统计、没有服务启停。验证这些或验证真实 IPC 时仍用 `task dev` 或 `task ui-smoke`。

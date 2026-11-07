@@ -45,7 +45,16 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
 
     match command {
         // ── Status / observation ────────────────────────────────────────
-        "get_status" => Ok(state.process.status_json()),
+        "get_status" => {
+            // The desktop host speaks for itself when it has registered a
+            // status hook: its truth is dynamic (service running now, launchd
+            // owns the login item, this may be a dev build). A server has no
+            // hook and gets the headless payload from `ProcessInfo`.
+            match crate::desktop_hooks::status() {
+                Some(v) => Ok(v),
+                None => Ok(state.process.status_json()),
+            }
+        }
         "get_stats" => admin::stats_today(state.stats.clone()).await,
         "get_session_metrics" => session_metrics(state).await,
         "get_logs" => Ok(json!({ "entries": state.logs.snapshot().await })),
@@ -84,7 +93,7 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
         "get_settings" => {
             let mut payload = admin::settings_json();
             if let Some(obj) = payload.as_object_mut() {
-                obj.insert("actual_port".into(), json!(state.process.bound_port));
+                obj.insert("actual_port".into(), json!(state.process.port()));
             }
             Ok(payload)
         }
@@ -95,6 +104,10 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             let update: admin::SettingsUpdate =
                 serde_json::from_value(body).map_err(|e| anyhow!("设置参数无效: {e}"))?;
             let saved = admin::save_settings(update)?;
+            // `hot_apply_client_auth` reads the saved flag itself, so an
+            // unrelated save (no client_auth_enabled in the body) still keeps
+            // the live gate in sync with the file.
+            admin::hot_apply_client_auth(&state.client_auth).await;
             state
                 .logs
                 .push(
@@ -233,7 +246,25 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
                 .into_iter()
                 .filter(|c| c.enabled)
                 .collect();
-            let report = crate::growth_runner::run_pool(&client, &credentials, None, false).await;
+            // Stream progress into the shared buffer so a *polling* console
+            // (no event channel over HTTP) can show the same per-account lines
+            // the desktop used to receive as Tauri events.
+            let buf = state.growth_progress.clone();
+            let progress = |p: crate::growth_runner::GrowthProgress| {
+                if let Ok(v) = serde_json::to_value(&p) {
+                    if let Ok(mut b) = buf.lock() {
+                        b.push(v);
+                    }
+                }
+            };
+            let report = crate::growth_runner::run_pool_with_progress(
+                &client,
+                &credentials,
+                None,
+                false,
+                Some(&progress),
+            )
+            .await;
             let summary = crate::growth_runner::summarize(&report);
             state.logs.push("INFO", summary).await;
             serde_json::to_value(&report).map_err(|e| anyhow!("{e}"))
@@ -250,16 +281,86 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             let run = crate::growth_runner::run_account(&client, cred, None, dry_run).await;
             serde_json::to_value(&run).map_err(|e| anyhow!("{e}"))
         }
+        // Drain the growth-progress buffer (take-and-clear: the next poll
+        // sees only lines emitted since). Empty when no run is streaming.
+        "get_growth_progress" => {
+            let mut buf = state
+                .growth_progress
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            Ok(json!({ "lines": std::mem::take(&mut *buf) }))
+        }
         "wb_refresh_points" => admin::refresh_all_points(state).await,
         "wb_refresh_points_single" => {
             let id = req_str(&args, "id")?;
             admin::refresh_one_points(state, &id).await
         }
-        "wb_oauth_start" => Err(anyhow!(
-            "服务器模式不支持扫码登录：浏览器回调只能指向本机 localhost，服务器上无法完成。\
-             请在本机扫码后把登录态粘贴进来（「添加登录态」）。"
-        )),
-        "wb_oauth_poll" => bail!("服务器模式不支持扫码登录"),
+        // ── QR login (OAuth) ────────────────────────────────────────────
+        //
+        // The old "server mode doesn't support QR login" refusal assumed the
+        // console had no way to *show* a QR code and the upstream callback
+        // needed a local browser. Neither holds: the flow polls a remote
+        // endpoint (no localhost callback involved — see `poll_oauth_token`),
+        // and the QR arrives as an inline SVG the web console renders exactly
+        // like the desktop window did. Same implementation, same UI, one less
+        // desktop-only command.
+        "wb_oauth_start" => {
+            let client = reqwest::Client::new();
+            let res = crate::workbuddy_auth::start_oauth_flow(&client, None)
+                .await
+                .map_err(|e| anyhow!("生成扫码授权失败: {e}"))?;
+            state
+                .logs
+                .push("INFO", format!("已生成 WorkBuddy 扫码授权: {}", res.state))
+                .await;
+            Ok(json!({
+                "state": res.state,
+                "auth_url": res.auth_url,
+                "qr_svg": res.qr_svg,
+            }))
+        }
+        "wb_oauth_poll" => {
+            let flow_state = req_str(&args, "state")?;
+            let client = reqwest::Client::new();
+            let res = crate::workbuddy_auth::poll_oauth_token(&client, None, &flow_state)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            match res {
+                crate::workbuddy_auth::OAuthPollResult::Pending => {
+                    Ok(json!({ "status": "pending" }))
+                }
+                crate::workbuddy_auth::OAuthPollResult::Failed { error } => {
+                    state
+                        .logs
+                        .push(
+                            "ERROR",
+                            format!("WorkBuddy 扫码授权失败: {error} (state={flow_state})"),
+                        )
+                        .await;
+                    Ok(json!({ "status": "failed", "error": error }))
+                }
+                crate::workbuddy_auth::OAuthPollResult::Success { credential } => {
+                    state
+                        .logs
+                        .push(
+                            "INFO",
+                            format!(
+                                "WorkBuddy 扫码授权成功并保存: {} ({})",
+                                credential.label, credential.id
+                            ),
+                        )
+                        .await;
+                    // Same payload the desktop returned: the UI reads
+                    // credential.label / credential.id and re-renders the pool.
+                    let masked = admin::credential_json(&credential, 0, false);
+                    state.pool.reload_from_store().await;
+                    Ok(json!({
+                        "status": "success",
+                        "credential": masked,
+                    }))
+                }
+            }
+        }
 
         // ── Inbound access accounts ─────────────────────────────────────
         "client_accounts_list" => Ok(admin::client_accounts_json(&state.client_auth).await),
@@ -324,7 +425,7 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             apply_claude_config(state, body)
         }
         "get_codex_config" => get_codex_config(),
-        "apply_codex_config" => apply_codex_config(state.process.bound_port).await,
+        "apply_codex_config" => apply_codex_config(state.process.port()).await,
         // DSH writes into a profile's patch file. The implementation lives in
         // `admin` because the REST surface offers the same operation, and one
         // implementation is what keeps the two from disagreeing about which
@@ -332,24 +433,85 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
         "get_dsh_config" => crate::admin::read_dsh_config(),
         "apply_dsh_config" => crate::admin::apply_dsh_config(state).await,
 
-        // The two commands whose meaning does not survive the move to a server.
-        // Refused with the reason the operator needs, not faked: a button that
-        // silently does nothing is worse than one that says why. The shared UI
-        // renders this message in a toast (`操作失败: …`).
-        "start_service" | "stop_service" => bail!(
-            "服务器模式下服务由 systemd 托管，请用 systemctl {} proxy-rs",
-            if command == "start_service" {
-                "start"
-            } else {
-                "stop"
-            }
-        ),
+        // ── Local sessions (会话 page) ──────────────────────────────────
+        // Argument names mirror the Tauri signatures: `args` is the paging
+        // object, and the detail commands take a bare `id` (+ `agentId`).
+        "claude_sessions_list" => {
+            let list_args = args
+                .get("args")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| anyhow!("会话参数无效: {e}"))?
+                .unwrap_or_default();
+            crate::admin::claude_sessions_list(Some(state.stats.clone()), list_args).await
+        }
+        "claude_sessions_detail" => {
+            let id = req_str(&args, "id")?;
+            let detail_args = args
+                .get("args")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| anyhow!("会话参数无效: {e}"))?
+                .unwrap_or_default();
+            crate::admin::claude_session_detail(Some(state.stats.clone()), id, detail_args).await
+        }
+        "claude_sessions_subagent" => {
+            let id = req_str(&args, "id")?;
+            let agent_id = req_str(&args, "agentId")?;
+            let detail_args = args
+                .get("args")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| anyhow!("会话参数无效: {e}"))?
+                .unwrap_or_default();
+            crate::admin::claude_subagent_detail(id, agent_id, detail_args).await
+        }
+
+        // Service lifecycle and the OS file manager: process state, not
+        // business logic.
+        //
+        // The desktop registers these as in-process hooks
+        // (`crate::desktop_hooks`) — it *has* to: its console page runs on
+        // `http://127.0.0.1:<port>/admin/`, an origin the Tauri runtime does
+        // not inject IPC into, so there is no channel left but HTTP. A server
+        // registers nothing and gets the systemd explanation, which is the
+        // truth for a headless deployment.
+        "start_service" => hook_value(crate::desktop_hooks::call("start", |h| {
+            h.start_service.clone()
+        })),
+        "stop_service" => hook_value(crate::desktop_hooks::call("stop", |h| {
+            h.stop_service.clone()
+        })),
+        "open_logs_dir" => hook_value(crate::desktop_hooks::call("open", |h| {
+            h.open_logs_dir.clone()
+        })),
+        "reveal_path" => {
+            let path = req_str(&args, "path")?;
+            hook_value(crate::desktop_hooks::call_with_arg("reveal", path, |h| {
+                h.reveal_path.clone()
+            }))
+        }
 
         other => bail!("未知命令: {other}"),
     }
 }
 
 // ── Argument helpers ───────────────────────────────────────────────────────
+
+/// Wrap a desktop hook's outcome in the JSON shape the UI expects.
+///
+/// The desktop's own commands answered with a small object; the UI only reads
+/// `ok` (and ignores the rest), so the same shape is kept here rather than
+/// inventing a new one.
+fn hook_value(outcome: Result<String, String>) -> Result<Value> {
+    match outcome {
+        Ok(message) => Ok(json!({ "ok": true, "message": message })),
+        Err(e) => Err(anyhow!(e)),
+    }
+}
 
 fn req_str(args: &Map<String, Value>, name: &str) -> Result<String> {
     args.get(name)
@@ -532,7 +694,7 @@ async fn export_ack(state: &Arc<AdminState>, args: &Value) -> Result<Value> {
 
 /// Write the Claude Code configuration, honouring the fields the form sent.
 fn apply_claude_config(state: &Arc<AdminState>, body: Value) -> Result<Value> {
-    let base_url = format!("http://127.0.0.1:{}", state.process.bound_port);
+    let base_url = format!("http://127.0.0.1:{}", state.process.port());
     let mut updates = Vec::new();
     for (slot, key) in [
         ("model", "model"),
