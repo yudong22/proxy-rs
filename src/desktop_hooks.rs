@@ -51,7 +51,19 @@ pub struct DesktopHooks {
     pub open_logs_dir: Option<SimpleHook>,
     /// Reveal a path in the OS file manager.
     pub reveal_path: Option<ArgHook>,
+    /// The console's status payload, built by the desktop host.
+    ///
+    /// A server reports a fixed shape (`managed_by: "systemd"`, always
+    /// running). The desktop's truth is different and dynamic: whether the
+    /// service is running right now, whether launchd owns the login item, and
+    /// whether this is a dev build that must not write one. The desktop
+    /// registers this and the RPC layer prefers it — that is what lets
+    /// `get_status` exist in **one** place instead of two.
+    pub status: Option<StatusHook>,
 }
+
+/// A hook that produces the console status payload.
+pub type StatusHook = std::sync::Arc<dyn Fn() -> serde_json::Value + Send + Sync>;
 
 static HOOKS: OnceLock<Mutex<Option<DesktopHooks>>> = OnceLock::new();
 
@@ -105,6 +117,12 @@ pub fn call(
             "服务器模式下服务由 systemd 托管，请用 systemctl {what} proxy-rs"
         )),
     }
+}
+
+/// The desktop's status payload, or `None` when this build has none (a server).
+pub fn status() -> Option<serde_json::Value> {
+    let guard = slot().lock().unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().and_then(|h| h.status.as_ref()).map(|f| f())
 }
 
 /// The same, for the hook that takes an argument (`reveal_path`).

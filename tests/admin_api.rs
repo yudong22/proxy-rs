@@ -1145,8 +1145,16 @@ async fn saving_settings_hot_applies_the_inbound_gate_via_rest() {
 /// it, but the desktop `generate_handler!` list did not, so the button always
 /// failed there. Guard the command-name set by source-parsing the registration
 /// list — a runtime dispatch test cannot see the desktop binary.
+/// **Structural guard (3.4.0 A5):** the desktop's IPC surface must be exactly
+/// the five host-process commands.
+///
+/// Everything else — settings, credentials, sessions, accounts, OAuth, growth —
+/// is business logic and lives in `admin_rpc`, reached over HTTP by the same
+/// console page the server serves. A new `#[tauri::command]` here means a
+/// second implementation has started growing again, which is precisely the
+/// duplication 3.4.0 exists to delete.
 #[test]
-fn the_desktop_registers_every_client_account_command_the_ui_calls() {
+fn the_desktop_ipc_surface_is_only_the_five_host_process_commands() {
     let main = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src-tauri/src/main.rs"),
     )
@@ -1154,19 +1162,87 @@ fn the_desktop_registers_every_client_account_command_the_ui_calls() {
     let handler = main
         .split("tauri::generate_handler![")
         .nth(1)
-        .and_then(|s| s.split("])").next())
-        .unwrap_or("");
-    for cmd in [
-        "client_account_create",
-        "client_account_toggle",
-        "client_account_delete",
-        "client_account_reissue",
-    ] {
-        assert!(
-            handler.contains(cmd),
-            "{cmd} missing from the desktop generate_handler! list"
-        );
+        .and_then(|s| s.split(']').next())
+        .expect("generate_handler! must exist");
+    let mut names: Vec<&str> = handler
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    names.sort_unstable();
+
+    let expected = [
+        "get_bootstrap_info",
+        "open_logs_dir",
+        "reveal_path",
+        "start_service",
+        "stop_service",
+    ];
+    assert_eq!(
+        names, expected,
+        "the desktop IPC surface must be exactly the host-process commands; \
+         anything else belongs in admin_rpc"
+    );
+}
+
+/// The other half of the guard: every command the UI calls must be answerable.
+///
+/// For the five host-process commands the answer is the Tauri IPC / the RPC
+/// hook; for everything else it is an `admin_rpc` arm. A UI call with neither
+/// would fail at runtime with an opaque "unknown command".
+#[test]
+fn every_command_the_ui_calls_has_a_server_side_answer() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rpc = std::fs::read_to_string(repo.join("src/admin_rpc.rs")).expect("admin_rpc.rs");
+    let main = std::fs::read_to_string(repo.join("src-tauri/src/main.rs")).expect("main.rs");
+
+    // Collect `invoke('name'` from the UI sources.
+    let mut ui_cmds = std::collections::BTreeSet::new();
+    fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "js") {
+                let src = std::fs::read_to_string(&p).unwrap_or_default();
+                for chunk in src.split("invoke('").skip(1) {
+                    if let Some(name) = chunk.split('\'').next() {
+                        if !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                        {
+                            out.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
     }
+    walk(&repo.join("ui/src"), &mut ui_cmds);
+
+    let host_cmds = [
+        "get_bootstrap_info",
+        "start_service",
+        "stop_service",
+        "open_logs_dir",
+        "reveal_path",
+    ];
+    let mut missing = Vec::new();
+    for cmd in &ui_cmds {
+        let in_rpc =
+            rpc.contains(&format!("\"{cmd}\" =>")) || rpc.contains(&format!("\"{cmd}\" |"));
+        let in_host = host_cmds.contains(&cmd.as_str());
+        // The UI also calls `invoke` from the bootstrap page, which is outside ui/src.
+        if !in_rpc && !in_host && !main.is_empty() {
+            missing.push(cmd.clone());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "UI commands with no server-side answer: {missing:?}"
+    );
 }
 
 // ── Desktop session bootstrap (desktop-boot endpoint) ─────────────────────
@@ -1571,6 +1647,7 @@ async fn the_desktop_registers_its_host_process_capabilities() {
         })),
         open_logs_dir: None,
         reveal_path: None,
+        status: None,
     });
 
     let app = app_for(desktop_state());

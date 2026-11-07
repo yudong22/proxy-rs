@@ -45,7 +45,16 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
 
     match command {
         // ── Status / observation ────────────────────────────────────────
-        "get_status" => Ok(state.process.status_json()),
+        "get_status" => {
+            // The desktop host speaks for itself when it has registered a
+            // status hook: its truth is dynamic (service running now, launchd
+            // owns the login item, this may be a dev build). A server has no
+            // hook and gets the headless payload from `ProcessInfo`.
+            match crate::desktop_hooks::status() {
+                Some(v) => Ok(v),
+                None => Ok(state.process.status_json()),
+            }
+        }
         "get_stats" => admin::stats_today(state.stats.clone()).await,
         "get_session_metrics" => session_metrics(state).await,
         "get_logs" => Ok(json!({ "entries": state.logs.snapshot().await })),
