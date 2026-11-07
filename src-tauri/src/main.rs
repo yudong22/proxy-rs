@@ -585,12 +585,11 @@ async fn save_settings(
     // rebuilt on a proxy restart (it holds the throttled `last_used_ms`
     // bookkeeping). That made the GUI switch feel broken: the value was saved
     // and the listener restarted, yet requests kept being served without a key
-    // until the whole app was quit and relaunched. Updating the live state here
-    // — and re-reading the store, so accounts added elsewhere are picked up
-    // too — makes the switch mean what it says.
-    let auth_enabled = proxy_rs::client_accounts::enabled_from(body.client_auth_enabled);
-    ctx.client_auth.set_enabled(auth_enabled);
-    ctx.client_auth.reload_from_store().await;
+    // until the whole app was quit and relaunched. The shared hot-apply (same
+    // one the server console calls) updates the live gate and re-reads the
+    // store, so the switch means what it says on both transports.
+    proxy_rs::admin::hot_apply_client_auth(&ctx.client_auth).await;
+    let auth_enabled = ctx.client_auth.is_enabled();
     ctx.logs
         .push(
             "INFO",
@@ -2075,6 +2074,35 @@ async fn client_account_delete(
     Ok(json!({ "ok": true }))
 }
 
+/// Reissue an account's key. The response is the **only** place the new
+/// plaintext key ever appears — the store keeps a hash, so it cannot be read
+/// back later. That is also why this must exist on the desktop: the "重新签发"
+/// button in the shared settings view calls it there too.
+///
+/// Delegates to the library's shared implementation (the same one the server
+/// console uses) so the payload shape — `{account, api_key, header}` — matches
+/// what the UI's reissue handler reads (`res.account?.label`, `res.api_key`).
+/// The desktop's `client_account_create` builds a flat shape of its own; that
+/// is not the shape to copy here.
+#[tauri::command]
+async fn client_account_reissue(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<Value, String> {
+    let id_for_log = id.clone();
+    let out = tokio::task::spawn_blocking(move || proxy_rs::admin::reissue_client_account_key(&id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    // The id is derived from the key hash and moves with it; reload so the
+    // next request verifies against the new key instead of the old one.
+    ctx.client_auth.reload_from_store().await;
+    ctx.logs
+        .push("INFO", format!("已重新签发访问账户 {id_for_log} 的 key"))
+        .await;
+    Ok(out)
+}
+
 // ── Account-pool import / export ───────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -2800,6 +2828,7 @@ fn main() {
             client_account_create,
             client_account_toggle,
             client_account_delete,
+            client_account_reissue,
             api_keys_set_default,
             pool_export,
             pool_import_preview,

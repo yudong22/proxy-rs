@@ -95,6 +95,10 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             let update: admin::SettingsUpdate =
                 serde_json::from_value(body).map_err(|e| anyhow!("设置参数无效: {e}"))?;
             let saved = admin::save_settings(update)?;
+            // `hot_apply_client_auth` reads the saved flag itself, so an
+            // unrelated save (no client_auth_enabled in the body) still keeps
+            // the live gate in sync with the file.
+            admin::hot_apply_client_auth(&state.client_auth).await;
             state
                 .logs
                 .push(

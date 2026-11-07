@@ -562,6 +562,9 @@ async fn settings_save(
     Json(body): Json<admin::SettingsUpdate>,
 ) -> Result<Json<Value>, ApiError> {
     let saved = admin::save_settings(body)?;
+    // Same shared hot-apply as the RPC arm and the desktop app: the switch must
+    // affect the live gate, not just the settings file.
+    admin::hot_apply_client_auth(&state.client_auth).await;
     state
         .logs
         .push(
