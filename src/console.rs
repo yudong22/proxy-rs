@@ -674,10 +674,29 @@ async fn serve_page(
     // loopback already excludes remote hosts; this excludes the local ones
     // that a page in the user's browser could reach.
     let is_loopback = peer.map(|p| p.ip().is_loopback()).unwrap_or(false);
+    // Only a **navigation** is trusted here, and only from loopback.
+    //
+    // `Sec-Fetch-Site` is `cross-site` for the desktop's own first load: the
+    // webview sits on `tauri://localhost` and navigates to
+    // `http://127.0.0.1:<port>/admin/`, which is genuinely a cross-site
+    // navigation. Rejecting it showed the login page inside the app while the
+    // same URL opened fine in a browser.
+    //
+    // What must stay out is a *subresource* from another site (an `<img>`, a
+    // `fetch`): those carry `Sec-Fetch-Mode: no-cors` / `cors`, not
+    // `navigate`. Gating on the mode allows the desktop's navigation while
+    // still refusing a page that tries to mint its own session.
+    let is_navigation = headers
+        .get("sec-fetch-mode")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "navigate")
+        // No header at all: a non-browser client (curl, the desktop's own
+        // reqwest). Same-origin by definition.
+        .unwrap_or(true);
     let same_site = headers
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == "same-origin" || v == "none")
+        .map(|v| v == "same-origin" || v == "none" || (v == "cross-site" && is_navigation))
         .unwrap_or(true);
     if state.desktop && is_loopback && same_site {
         let secure = false;

@@ -1461,12 +1461,16 @@ async fn desktop_boot_grants_cors_only_to_the_tauri_origin() {
     );
 }
 
-/// The desktop console page must not mint a session for a **cross-site**
-/// request: a page in the user's browser can reach the desktop's loopback
-/// port, and without this check it could use the desktop as a session oracle.
+/// The desktop console page must not mint a session for a **cross-site
+/// subresource**: a page in the user's browser can reach the desktop's
+/// loopback port, and without this check it could use the desktop as a session
+/// oracle.
 ///
-/// Same-origin navigation (`Sec-Fetch-Site: same-origin`) and non-browser
-/// clients (no header) are allowed; `cross-site` is not.
+/// Same-origin navigation and non-browser clients (no header) are allowed. A
+/// cross-site **navigation** is also allowed — that is the desktop webview's
+/// own first load from `tauri://localhost`, covered by
+/// `the_desktop_console_accepts_the_webviews_cross_site_navigation`. What this
+/// test pins is the subresource case, which is not a navigation.
 #[tokio::test]
 async fn the_desktop_console_page_refuses_a_cross_site_visitor() {
     let _iso = isolate("page-cross-site", Some("tok")).await;
@@ -1480,12 +1484,14 @@ async fn the_desktop_console_page_refuses_a_cross_site_visitor() {
             "127.0.0.1:50000".parse().unwrap(),
         ))
         .header("sec-fetch-site", "cross-site")
+        // A subresource fetch, not a navigation.
+        .header("sec-fetch-mode", "no-cors")
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert!(
         resp.headers().get("set-cookie").is_none(),
-        "a cross-site visitor must not receive a session"
+        "a cross-site subresource must not receive a session"
     );
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
@@ -1906,5 +1912,61 @@ fn the_module_graph_has_no_new_cycles() {
         vec![known],
         "the module graph must have exactly one known cycle (config/credits/session_pool/\
          workbuddy_auth); a new or changed cycle means a dependency was reintroduced"
+    );
+}
+
+/// The desktop webview's **first navigation** to the console is cross-site.
+///
+/// It sits on `tauri://localhost` and navigates to
+/// `http://127.0.0.1:<port>/admin/`, so `Sec-Fetch-Site: cross-site` with
+/// `Sec-Fetch-Mode: navigate`. Rejecting that showed the server's login page
+/// inside the app — "服务器模式 · 需要管理令牌" — while the same URL opened
+/// fine in a browser.
+///
+/// A cross-site *subresource* must still be refused.
+#[tokio::test]
+async fn the_desktop_console_accepts_the_webviews_cross_site_navigation() {
+    let _iso = isolate("nav-cross-site", Some("tok")).await;
+
+    // Navigation from the Tauri scheme: the console, with a session.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-mode", "navigate")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app_for(desktop_state()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("set-cookie").is_some(),
+        "the webview's navigation must mint a session"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&body).contains("管理令牌"),
+        "the webview must not land on the login page"
+    );
+
+    // A cross-site subresource (no `navigate`) is still refused.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/")
+        .extension::<axum::extract::ConnectInfo<std::net::SocketAddr>>(axum::extract::ConnectInfo(
+            "127.0.0.1:50000".parse().unwrap(),
+        ))
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-mode", "no-cors")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app_for(desktop_state()).oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "a cross-site subresource must not mint a session"
     );
 }
