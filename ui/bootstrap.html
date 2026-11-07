@@ -62,13 +62,20 @@
       btn.textContent = '重试';
     }
 
-    /** Wait until the in-process gateway answers on loopback. */
-    async function waitForGateway(port, timeoutMs) {
+    /**
+     * Wait until the **console** answers on loopback.
+     *
+     * `/admin/` is the right probe now that the console has its own listener:
+     * it is ready as soon as this page can reach it, whether or not the proxy
+     * itself is running (the proxy is started from the console, not the other
+     * way round).
+     */
+    async function waitForConsole(port, timeoutMs) {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
         try {
-          const r = await fetch(`http://127.0.0.1:${port}/health`, { cache: 'no-store' });
-          if (r.ok) return true;
+          const r = await fetch(`http://127.0.0.1:${port}/admin/`, { cache: 'no-store' });
+          if (r.status === 200) return true;
         } catch { /* not up yet */ }
         await new Promise((r) => setTimeout(r, 250));
       }
@@ -86,20 +93,24 @@
         btn.disabled = false;
         return;
       }
-      // The service may not be listening yet (fire-and-forget start) or may
-      // have failed to bind; poll before concluding.
-      if (!info.running) {
-        showSpinning(RETRY);
-        try { await invoke('start_service'); } catch (e) {
-          showRetry('启动失败: ' + e);
-          btn.disabled = false;
-          return;
+      // The console port is assigned by the host at boot; give it a moment if
+      // this page was opened before it settled.
+      if (!info.console_ready) {
+        for (let i = 0; i < 40 && !info.console_ready; i++) {
+          await new Promise((r) => setTimeout(r, 250));
+          info = await invoke('get_bootstrap_info');
         }
-        info = await invoke('get_bootstrap_info');
       }
-      const ok = await waitForGateway(info.port, 8000);
+      const ok = info.console_ready && (await waitForConsole(info.port, 5000));
       if (!ok) {
-        showRetry('服务未在预期端口响应（端口 ' + info.port + '）');
+        // Say *which* thing failed. "服务未在预期端口响应" used to cover both
+        // the console and the proxy, and named a port that belonged to
+        // neither.
+        showRetry(
+          info.console_ready
+            ? `控制台端口 ${info.port} 无响应，请检查是否有其他程序占用`
+            : '控制台尚未就绪，请稍后重试',
+        );
         btn.disabled = false;
         return;
       }

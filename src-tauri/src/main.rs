@@ -47,6 +47,13 @@ struct AppContext {
     /// Growth-run progress lines, shared with the admin RPC layer (polled by
     /// the console instead of pushed as Tauri events).
     growth_progress: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    /// Port the **console** listens on, separate from the proxy's own port.
+    ///
+    /// The console must outlive the proxy: "启动服务" lives on it, so if the
+    /// two shared a listener, stopping the service would take away the button
+    /// that starts it again. It gets its own port (`proxy port + 1`) and its
+    /// own long-lived listener, started at boot and never stopped.
+    console_port: Arc<std::sync::atomic::AtomicU16>,
 }
 
 struct TrayState {
@@ -251,12 +258,26 @@ fn request_stop(app: tauri::AppHandle, ctx: Arc<AppContext>) {
 /// which port. Cheap and safe to poll.
 #[tauri::command]
 async fn get_bootstrap_info(ctx: State<'_, Arc<AppContext>>) -> Result<Value, String> {
-    // Give a just-issued start a moment to settle, mirroring `await_start_outcome`.
-    let running = ctx.service_ctrl.is_running()
-        || ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst) != 0;
+    let bound = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst);
+    let console = ctx.console_port.load(std::sync::atomic::Ordering::SeqCst);
+    // `port` is the **console's** port: that is where the bootstrap page goes.
+    // `proxy_port` is reported separately so the page can say what the service
+    // will listen on, and so the two never get confused again.
+    let configured = ctx.settings.try_read().map(|s| s.port).unwrap_or(0);
+    let proxy_port = if bound != 0 {
+        bound
+    } else if configured != 0 {
+        configured
+    } else {
+        DEFAULT_PORT
+    };
     Ok(json!({
-        "running": running,
-        "port": ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst),
+        // The console is up as soon as this answers, even when the proxy is not.
+        "running": console != 0,
+        "port": console,
+        "console_ready": console != 0,
+        "proxy_running": ctx.service_ctrl.is_running(),
+        "proxy_port": proxy_port,
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
@@ -478,35 +499,6 @@ fn run_proxy_server(
             ctx.credential_pool.clone(),
             ctx.client_auth.clone(),
         );
-        // The desktop now serves the SAME `/admin/` console the server binary
-        // does, and the webview loads it (see `ui/bootstrap.html`). The P1
-        // duplication — ~50 Tauri commands reimplementing `admin_rpc` arms —
-        // is the thing this deletes; the in-process console is what replaces
-        // it. `desktop: true` is what makes `desktop-boot` mint the webview's
-        // session (loopback only, see `console::desktop_boot`); the server
-        // build keeps `desktop: false` and its token login untouched.
-        let admin_state = Arc::new(proxy_rs::admin_routes::AdminState {
-            sessions: ctx.admin_sessions.clone(),
-            stats: ctx.stats.clone(),
-            logs: ctx.logs.clone(),
-            client_auth: ctx.client_auth.clone(),
-            pool: ctx.credential_pool.clone(),
-            process: proxy_rs::admin::ProcessInfo {
-                version: env!("CARGO_PKG_VERSION"),
-                // The live handle: the admin state is built before the port is
-                // bound, so a snapshot here would report the configured port
-                // instead of the one actually serving.
-                bound_port: ctx.bound_port.clone(),
-                started_at: ctx.started_at,
-                bind_addr: config_arc.bind.clone(),
-            },
-            client: ctx.client.clone(),
-            desktop: true,
-            growth_progress: ctx.growth_progress.clone(),
-        });
-        let admin_router = proxy_rs::admin_routes::build_admin_router(admin_state.clone())
-            .merge(proxy_rs::console::build_console_router(admin_state));
-        let app_router = router::with_admin(app_router, Some(admin_router));
 
         let bind_addr = config_arc.bind.clone();
         // No `+1` fallback: every client CLI is pointed at one fixed gateway
@@ -582,6 +574,110 @@ fn run_proxy_server(
 }
 
 /// Start (or restart) the proxy listener.
+/// Start the console listener on its own port, for the life of the process.
+///
+/// ## Why it is separate from the proxy
+///
+/// The console is where "启动服务 / 停止服务" live. When both shared one
+/// listener, stopping the proxy closed the port that served the console, so the
+/// page lost the very button needed to start it again — a dead end the user
+/// hit for real. (The data plane already answers 503 while stopped, so nothing
+/// about the proxy's own behaviour needed the port closed.)
+///
+/// ## Where the port comes from
+///
+/// `proxy port + 1`, falling back up to `+9` if those are taken. No setting:
+/// the console is an implementation detail of the app, and a second port in
+/// `gui-settings.json` would be one more thing to keep in step with `port`.
+/// The bootstrap page reads it from `get_bootstrap_info`.
+fn start_console_listener(ctx: Arc<AppContext>) {
+    let (bind, base_port) = {
+        let settings = settings::GuiSettings::load();
+        let bind = if settings.bind.trim().is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            settings.bind.trim().to_string()
+        };
+        let port = if settings.port == 0 {
+            DEFAULT_PORT
+        } else {
+            settings.port
+        };
+        (bind, port)
+    };
+
+    tauri::async_runtime::spawn(async move {
+        let admin_state = Arc::new(proxy_rs::admin_routes::AdminState {
+            sessions: ctx.admin_sessions.clone(),
+            stats: ctx.stats.clone(),
+            logs: ctx.logs.clone(),
+            client_auth: ctx.client_auth.clone(),
+            pool: ctx.credential_pool.clone(),
+            process: proxy_rs::admin::ProcessInfo {
+                version: env!("CARGO_PKG_VERSION"),
+                // The proxy's live port: the console reports the port clients
+                // should be pointed at, not the console's own.
+                bound_port: ctx.bound_port.clone(),
+                started_at: ctx.started_at,
+                bind_addr: bind.clone(),
+            },
+            client: ctx.client.clone(),
+            desktop: true,
+            growth_progress: ctx.growth_progress.clone(),
+        });
+        let router = proxy_rs::admin_routes::build_admin_router(admin_state.clone())
+            .merge(proxy_rs::console::build_console_router(admin_state));
+
+        let mut chosen = None;
+        for offset in 1..=9u16 {
+            let Some(port) = base_port.checked_add(offset) else {
+                break;
+            };
+            match tokio::net::TcpListener::bind(format!("{bind}:{port}")).await {
+                Ok(l) => {
+                    chosen = Some((l, port));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => {
+                    ctx.logs
+                        .push("ERROR", format!("控制台端口绑定失败 {bind}:{port}: {e}"))
+                        .await;
+                    return;
+                }
+            }
+        }
+        let Some((listener, port)) = chosen else {
+            ctx.logs
+                .push(
+                    "ERROR",
+                    format!("控制台端口绑定失败：{base_port} 之后的 9 个端口都不可用"),
+                )
+                .await;
+            return;
+        };
+
+        ctx.console_port
+            .store(port, std::sync::atomic::Ordering::SeqCst);
+        ctx.logs
+            .push(
+                "INFO",
+                format!("控制台已在 http://{bind}:{port}/admin/ 就绪"),
+            )
+            .await;
+
+        let server = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        );
+        if let Err(e) = server.await {
+            ctx.logs
+                .push("ERROR", format!("控制台服务异常退出: {e}"))
+                .await;
+        }
+    });
+}
+
 fn start_proxy_server(app: tauri::AppHandle, ctx: Arc<AppContext>) {
     // Already up: nothing to do.
     if ctx.service_ctrl.is_running() {
@@ -685,7 +781,11 @@ fn main() {
         logs: Arc::new(LogBuffer::new(1000)),
         service_ctrl,
         client,
-        bound_port: Arc::new(AtomicU16::new(DEFAULT_PORT)),
+        // 0 = "not listening". It must not start at the default port: the
+        // console and the bootstrap page use this as "is there a listener, and
+        // where", and a default here reported a port that was never bound —
+        // the bootstrap page then polled it and failed with "服务未在预期端口响应".
+        bound_port: Arc::new(AtomicU16::new(0)),
         started_at: std::time::Instant::now(),
         stats: StatsDb::open().unwrap_or_else(|e| {
             eprintln!(
@@ -709,10 +809,15 @@ fn main() {
         // the "no token → console disabled" rule must not apply to it.
         admin_sessions: Arc::new(proxy_rs::admin_auth::AdminSessions::desktop()),
         growth_progress: Arc::new(std::sync::Mutex::new(Vec::new())),
+        console_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
         client_auth: Arc::new(proxy_rs::client_accounts::ClientAuthState::new(
             client_auth_enabled,
         )),
     });
+
+    // The console gets its own listener, started now and never stopped: it
+    // carries the start/stop buttons, so it must outlive the proxy it controls.
+    start_console_listener(ctx.clone());
 
     let ctx_for_setup = ctx.clone();
     let ctx_for_tray = ctx.clone();
