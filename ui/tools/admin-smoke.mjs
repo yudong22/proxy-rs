@@ -186,26 +186,37 @@ try {
   );
 
   // ── The form is shaped so a password manager offers to save the token ───
-  // This is a functional requirement, not cosmetics: it is the criterion Chrome,
-  // Safari and Firefox use, and a fetch-based login silently fails it.
+  //
+  // Asserted as the "router login" shape: ONE password input and nothing to pair
+  // it with. That is deliberate, and it is the opposite of what this test used to
+  // require — a paired `autocomplete="username"` field. The paired version was
+  // the bug: with a fixed pre-filled value, Chrome stopped treating the form as a
+  // login form at all, so the same browser that offered to save a router password
+  // offered nothing here.
+  //
+  // Note what this can and cannot prove. It checks the *markup* a password manager
+  // keys on; it cannot check the save prompt itself, because Chrome suppresses
+  // that in automation profiles (`password_manager_enabled` is unset, so nothing
+  // is ever stored). The prompt was confirmed by hand in a normal browser.
   const formShape = await evaluate(`(() => {
     const f = document.querySelector('#form');
     const pw = f?.querySelector('input[type=password]');
-    const un = f?.querySelector('input[autocomplete=username]');
     return {
       method: (f?.getAttribute('method') || '').toLowerCase(),
       action: f?.getAttribute('action') || '',
+      passwordCount: f ? f.querySelectorAll('input[type=password]').length : 0,
+      usernameFields: f ? f.querySelectorAll('input[autocomplete=username]').length : 0,
       pwAutocomplete: pw?.getAttribute('autocomplete') || '',
-      hasUserField: !!un,
-      // Password managers ignore a hidden username field.
-      userVisible: un ? !!(un.offsetWidth || un.offsetHeight) : false,
+      pwName: pw?.getAttribute('name') || '',
     };
   })()`);
   check('the login form posts natively', formShape.method, 'post');
   check('the login form targets the page route', formShape.action, '/admin/login');
+  check('there is exactly one password field', formShape.passwordCount, 1);
   check('the password field is marked for password managers', formShape.pwAutocomplete, 'current-password');
-  check('a username field is paired with it', formShape.hasUserField, true);
-  check('the username field is visible', formShape.userVisible, true);
+  check('the password field has a name', formShape.pwName, 'password');
+  // No username input: pairing one is what broke the recognition.
+  check('no username field is paired with it', formShape.usernameFields, 0);
 
   // ── A wrong token is refused, via the redirect the form now uses ────────
   await evaluate('document.querySelector("#token").value = "definitely-wrong"');

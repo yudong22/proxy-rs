@@ -246,7 +246,6 @@ async fn account_request_authenticates_with_bearer_only() {
         metrics::install(),
         Arc::clone(&pool),
         Arc::new(proxy_rs::client_accounts::ClientAuthState::disabled()),
-        None,
     );
 
     let response = app.oneshot(chat_request()).await.expect("router responds");
@@ -320,7 +319,6 @@ async fn static_key_request_keeps_both_auth_headers() {
         metrics::install(),
         Arc::new(CredentialPool::empty()),
         Arc::new(proxy_rs::client_accounts::ClientAuthState::disabled()),
-        None,
     );
 
     let response = app.oneshot(chat_request()).await.expect("router responds");
@@ -394,7 +392,6 @@ async fn credits_request_sends_a_login_token_as_bearer_only() {
         metrics::install(),
         Arc::new(CredentialPool::new(vec![test_credential()])),
         Arc::new(proxy_rs::client_accounts::ClientAuthState::disabled()),
-        None,
     );
 
     let response = app
@@ -442,7 +439,6 @@ async fn credits_request_sends_a_login_token_as_bearer_only() {
         metrics::install(),
         Arc::new(CredentialPool::empty()),
         Arc::new(proxy_rs::client_accounts::ClientAuthState::disabled()),
-        None,
     );
     let response = app
         .oneshot(

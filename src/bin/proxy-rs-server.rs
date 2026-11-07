@@ -219,8 +219,10 @@ async fn main() -> Result<()> {
         metrics_handle,
         credential_pool,
         client_auth,
-        Some(admin_router),
     );
+    // Wrapped AFTER the data-plane router is built, so the admin surface sits
+    // outside the data plane's permissive CORS layer. See `router::with_admin`.
+    let app_router = router::with_admin(app_router, Some(admin_router));
 
     // Bind before starting the loops: a busy port is a hard failure the operator
     // must see immediately, and there is no fallback port — every client CLI is

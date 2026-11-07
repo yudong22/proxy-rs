@@ -83,7 +83,6 @@ fn router_with(state: Arc<ClientAuthState>, config: Config) -> axum::Router {
         metrics::install(),
         Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
         state,
-        None,
     )
 }
 
@@ -491,7 +490,6 @@ async fn a_gateway_key_authenticates_here_while_the_pool_authenticates_upstream(
         metrics::install(),
         Arc::new(pool),
         state.clone(),
-        None,
     );
 
     // Only the gateway key, in a standard header — the "paste key + host" setup.

@@ -77,24 +77,14 @@
     <h1>Proxy RS 管理台</h1>
     <p class="sub">服务器模式 · 需要管理令牌</p>
 
-    <!-- A username field is what makes the browser offer to save the password,
-         and it must be a REAL, VISIBLE, EDITABLE `autocomplete="username"` input
-         paired with `autocomplete="current-password"`. Each of these has been
-         fatal to the save prompt on its own:
-
-           · no username partner at all   — no pair to record;
-           · `hidden` / `display: none`    — the field is skipped;
-           · `readonly`                    — Chrome reads it as a value the page
-                                             invented, and the form stops being
-                                             classified as a login form.
-
-         The value is only the label the password manager stores; the server
-         authenticates on the token alone and ignores this field, so editing it
-         cannot affect whether you can log in. -->
-    <label for="username">账号</label>
-    <input type="text" name="username" id="username" value="admin"
-           autocomplete="username" spellcheck="false">
-
+    <!-- No username field, deliberately.
+         Password managers are perfectly happy with a lone password input — that is
+         the "router login" shape — and Chrome treats it as a login form without
+         needing a partner field. Adding a username input did *not* help here: with
+         a pre-filled fixed value the form stopped being recognised at all, which is
+         why no save prompt appeared while the same browser offered one for a
+         router page. Fewer moving parts is the fix.
+         The gateway authenticates on the token alone, so there is nothing to pair. -->
     <label for="token">管理令牌</label>
     <input id="token" name="password" type="password" autocomplete="current-password"
            placeholder="PROXY_API_TOKEN" required autofocus>

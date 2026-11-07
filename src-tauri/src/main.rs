@@ -2349,11 +2349,11 @@ fn run_proxy_server(
             metrics_handle,
             ctx.credential_pool.clone(),
             ctx.client_auth.clone(),
-            // No admin console on the desktop: it drives the same capabilities
-            // through Tauri IPC, and serving a second browser-reachable surface
-            // from the desktop app would mean a second thing to authenticate.
-            None,
         );
+        // No admin console on the desktop: it drives the same capabilities
+        // through Tauri IPC, and serving a second browser-reachable surface from
+        // the desktop app would mean a second thing to authenticate.
+        let app_router = router::with_admin(app_router, None);
 
         let bind_addr = config_arc.bind.clone();
         // No `+1` fallback: every client CLI is pointed at one fixed gateway

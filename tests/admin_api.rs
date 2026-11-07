@@ -741,3 +741,109 @@ async fn the_attempts_map_is_bounded() {
     // documented at `ATTEMPTS_MAX_ENTRIES`.
     assert_eq!(sessions.active(), 0, "no sessions were created");
 }
+
+// ── CORS boundary ──────────────────────────────────────────────────────────
+
+/// The admin console must not inherit the data plane's `allow_origin(Any)`.
+///
+/// `/api/*` deliberately answers `Access-Control-Allow-Origin: *` so the desktop
+/// webview can read it — a documented, accepted trade-off for a loopback tool.
+/// The admin console is same-origin by construction and carries a session cookie,
+/// so emitting `*` there is simply wrong: any page a user visits could read the
+/// reply to a request the browser made with that cookie. (`SameSite=Strict` keeps
+/// the cookie itself unreadable, which is why this is a correctness bug and not an
+/// open door — but the header has no business being on these routes.)
+///
+/// This pins the boundary so a future change to the data-plane CORS story cannot
+/// silently widen the admin one.
+#[tokio::test]
+async fn the_admin_surface_does_not_advertise_cross_origin_access() {
+    let _iso = isolate("cors-admin", Some("tok")).await;
+
+    let state = Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("in-memory sqlite"),
+        logs: Arc::new(LogBuffer::new(50)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "t",
+            bound_port: 3456,
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".into(),
+        },
+        client: reqwest::Client::new(),
+    });
+
+    // Built the way the server binary builds it: data plane, then admin merged
+    // *outside* its CORS layer.
+    let data_plane = proxy_rs::router::build_app_router(
+        proxy_rs::service::ServiceController::new(false),
+        Arc::new(LogBuffer::new(50)),
+        Arc::new(unreachable_config()),
+        reqwest::Client::new(),
+        StatsDb::in_memory().expect("sqlite"),
+        proxy_rs::metrics::install(),
+        Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        Arc::new(ClientAuthState::disabled()),
+    );
+    let app = proxy_rs::router::with_admin(
+        data_plane,
+        Some(build_admin_router(state).merge(build_console_router_for_cors_test())),
+    );
+
+    // Admin: no cross-origin permission.
+    let req = Request::builder()
+        .uri("/admin/login")
+        .header("origin", "https://evil.example")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "the admin console must not advertise CORS"
+    );
+
+    // Data plane: unchanged, the desktop GUI depends on it.
+    let req = Request::builder()
+        .uri("/api/stats/today")
+        .header("origin", "https://evil.example")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "the observation API must keep its permissive CORS for the desktop webview"
+    );
+}
+
+fn unreachable_config() -> proxy_rs::Config {
+    proxy_rs::Config {
+        upstream_urls: vec!["http://127.0.0.1:1".to_string()],
+        models_flavor: proxy_rs::config::ModelsFlavor::OpenAI,
+        ..Default::default()
+    }
+}
+
+fn build_console_router_for_cors_test() -> axum::Router {
+    // The console router shares the admin state in production; here only its
+    // routes matter, and `/admin/login` lives on it.
+    let state = Arc::new(AdminState {
+        sessions: Arc::new(AdminSessions::new()),
+        stats: StatsDb::in_memory().expect("sqlite"),
+        logs: Arc::new(LogBuffer::new(50)),
+        client_auth: Arc::new(ClientAuthState::disabled()),
+        pool: Arc::new(proxy_rs::session_pool::CredentialPool::empty()),
+        process: ProcessInfo {
+            version: "t",
+            bound_port: 3456,
+            started_at: std::time::Instant::now(),
+            bind_addr: "127.0.0.1".into(),
+        },
+        client: reqwest::Client::new(),
+    });
+    build_console_router(state)
+}
