@@ -33,13 +33,23 @@ const TOKEN_ENV: &str = "PROXY_API_TOKEN";
 struct Isolated {
     _guard: tokio::sync::MutexGuard<'static, ()>,
     dir: std::path::PathBuf,
-    /// Set only for tests that relocate `$HOME`, with the value to restore.
+    /// Set only for tests that relocate `$HOME`.
     ///
     /// The Claude Code writer resolves `~/.claude/settings.json` through
     /// [`settings::home_dir`], so a test of it must point `HOME` at a temp
-    /// directory — and must put the real one back, or every later test in the
-    /// binary would read the developer's own settings.
-    saved_home: Option<std::ffi::OsString>,
+    /// directory — and must put the real value back, or every later test in the
+    /// binary would read the wrong home.
+    ///
+    /// `Some(None)` means "`HOME` was unset when the test started", which is a
+    /// different thing from `Some(Some(""))` and must be restored differently.
+    /// Collapsing the two (an earlier version used `saved.unwrap_or_default()`)
+    /// left `HOME=""` behind: [`settings::home_dir`] treats an empty `HOME` as
+    /// absent and falls through to `USERPROFILE`/`HOMEDRIVE`, which on Linux CI
+    /// are unset too, so `home_dir()` becomes `None` for every test that runs
+    /// afterwards in the same binary. That is a nondeterministic failure that
+    /// depends on test order — it passed on macOS, where the developer's
+    /// `USERPROFILE` happened to mask it.
+    saved_home: Option<Option<std::ffi::OsString>>,
 }
 
 impl Drop for Isolated {
@@ -47,8 +57,13 @@ impl Drop for Isolated {
         std::env::remove_var(TOKEN_ENV);
         std::env::remove_var("PROXY_DATA_DIR");
         std::env::remove_var("CLAUDE_PROJECTS_DIR");
-        if let Some(home) = self.saved_home.take() {
-            std::env::set_var("HOME", home);
+        if let Some(saved) = self.saved_home.take() {
+            match saved {
+                Some(home) => std::env::set_var("HOME", home),
+                // Was unset: put it back unset. Setting it to "" is not the same
+                // thing — see the field's documentation.
+                None => std::env::remove_var("HOME"),
+            }
         }
         if !std::thread::panicking() {
             let _ = std::fs::remove_dir_all(&self.dir);
@@ -78,9 +93,10 @@ async fn isolate_with_home(name: &str, token: Option<&str>, relocate_home: bool)
         None => std::env::remove_var(TOKEN_ENV),
     }
     let saved_home = if relocate_home {
+        // Capture first, then move: the whole point is to restore what was there.
         let saved = std::env::var_os("HOME");
         std::env::set_var("HOME", &dir);
-        Some(saved.unwrap_or_default())
+        Some(saved)
     } else {
         None
     };
@@ -1703,6 +1719,18 @@ async fn the_desktop_registers_its_host_process_capabilities() {
     use proxy_rs::desktop_hooks::{self, DesktopHooks};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    // This test reads `PROXY_API_TOKEN` through the admin gate, so it must hold
+    // the same lock every other test in this file holds — and it must set the
+    // token rather than inheriting whatever a neighbour left behind.
+    //
+    // It previously did neither: it ran lock-free and assumed a token was
+    // present. Under `cargo test`'s default parallelism a neighbouring test's
+    // `Drop` would `remove_var("PROXY_API_TOKEN")` in the middle of this one, the
+    // gate answered 503 `admin_disabled`, and the assertion failed. It passed on
+    // a developer machine (fewer/slower threads interleaved differently) and
+    // failed intermittently on CI — the same shape as 2122fa9.
+    let _iso = isolate("desktop-capabilities", Some("tok")).await;
 
     // The hook table is process-global, so this test owns it: register, assert,
     // and unregister before anything else can observe it.
