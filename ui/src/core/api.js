@@ -93,6 +93,15 @@ function apiBase() {
   // Unset in the app, where the port from `get_status` is the only correct base.
   const override = window.__PROXY_API_BASE__;
   if (typeof override === 'string' && override) return override.replace(/\/+$/, '');
+  // The `ui-dev` loop (`task ui-dev`): the page comes from Vite, not from a
+  // gateway listener. `null` here would mean "no HTTP transport", which is
+  // wrong — Vite proxies `/api/*` — and returning `http://127.0.0.1:<port>`
+  // would be worse: it bypasses the proxy, and with it the 测试/生产 switch,
+  // so the page would always read whichever port `get_status` last reported
+  // regardless of the backend chosen in the badge. The empty base is
+  // same-origin, so the proxy picks the backend per request like every other
+  // console call.
+  if (import.meta.env.DEV) return '';
   // Legacy desktop path (page loaded from frontendDist): absolute loopback.
   return `http://127.0.0.1:${appState.port || 3456}`;
 }

@@ -34,13 +34,17 @@
  *   1. Start the gateway:   task dev-server        (builds once, then runs)
  *   2. Start the UI loop:   task ui-dev
  *
- * `task dev-server` and `task ui-dev` set the same `PROXY_PORT`, so the two
- * always agree. To point at a gateway started some other way:
+ * `task ui-dev` passes the gateway's port explicitly; run on its own, this file
+ * derives it the same way the task does — the installed app's port plus
+ * `DEV_PORT_OFFSET` (1000), which keeps the test gateway clear of the app and
+ * its console. Point at a gateway started some other way with:
  *
- *   DEV_PROXY_PORT=3477 task ui-dev
+ *   DEV_PROXY_PORT=4557 task ui-dev
  *
- * (The console is assumed to be one port above it; override with
- * `DEV_CONSOLE_PORT` when the app had to walk past a busy +1.)
+ * The test gateway serves `/admin/*` and `/api/*` on one listener
+ * (`router::with_admin`). The installed app is two: `PROD_PROXY_PORT` is its
+ * data plane, and its console is `PROD_PROXY_PORT + 1` unless
+ * `PROD_CONSOLE_PORT` says otherwise.
  *
  * The console needs a login session. The gateway's login page is proxied too,
  * so the first visit lands there and sets the cookie on this origin; every
@@ -54,11 +58,15 @@
 import { createServer } from 'vite';
 import baseConfig from '../../vite.config.js';
 
-// `vite.config.js` reads these for the proxy table; set before create.
-const proxyPort = Number(process.env.DEV_PROXY_PORT) || 3457;
-const consolePort = Number(process.env.DEV_CONSOLE_PORT) || proxyPort;
+// The banner only. `vite.config.js` derives the same numbers itself (it reads
+// the same env), so a mistake here misprints the banner, it does not misroute.
+// `DEV_CONSOLE_PORT` exists only for a gateway whose console is a separate
+// listener; the headless one serves both on `proxyPort`.
 const prodPort = Number(process.env.PROD_PROXY_PORT) || 3457;
 const prodConsolePort = Number(process.env.PROD_CONSOLE_PORT) || prodPort + 1;
+const proxyPort = Number(process.env.DEV_PROXY_PORT)
+  || prodPort + (Number(process.env.DEV_PORT_OFFSET) || 1000);
+const consolePort = Number(process.env.DEV_CONSOLE_PORT) || proxyPort;
 
 const server = await createServer(baseConfig);
 
@@ -66,8 +74,8 @@ await server.listen();
 server.printUrls();
 console.log(`  test backend : 127.0.0.1:${proxyPort}  (/api/*)`);
 console.log(`                 console → ${consolePort === proxyPort ? 'same listener' : `127.0.0.1:${consolePort}`}`);
-console.log(`  prod backend : 127.0.0.1:${prodPort}  (/api/*)`);
-console.log(`                 console → 127.0.0.1:${prodConsolePort}  (installed app)`);
+console.log(`  prod backend : 127.0.0.1:${prodPort}  (/api/*)  (installed app)`);
+console.log(`                 console → 127.0.0.1:${prodConsolePort}`);
 console.log('  switch them with the DEV badge in the bottom-right corner.');
 console.log('  (if a panel is empty, open /admin/login on this origin, or run `task dev-server`)');
 console.log('  edit files under ui/ — modules hot-reload, CSS updates without a page reload.');

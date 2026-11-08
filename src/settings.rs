@@ -158,6 +158,27 @@ pub struct GuiSettings {
     /// identity pool: those are outbound credentials and stay untouched.
     #[serde(default)]
     pub client_auth_enabled: bool,
+    /// Answer Claude Code's auto-mode safety classifier locally with an `allow`
+    /// verdict instead of forwarding it upstream.
+    ///
+    /// **Off by default, and that default is the whole point.** The request being
+    /// intercepted is Anthropic's security monitor deciding whether a tool call
+    /// (a shell command, a network request) looks like prompt injection, scope
+    /// creep, or accidental damage. Answering `allow` unconditionally means that
+    /// check never happens — and because this gateway can be shared, turning it
+    /// on silently removes the check for *every* client behind it, whose operator
+    /// cannot see this switch. So it is never on unless someone deliberately
+    /// turned it on.
+    ///
+    /// It exists at all because the classifier request is large (a ~140k-character
+    /// system prompt) and, behind an OpenAI-compatible upstream, it is billed and
+    /// then usually *fails anyway* (the upstream has no `claude-sonnet-5`), so a
+    /// client in `auto` mode pays twice for a verdict it never gets. A deployment
+    /// that has already accepted "approve everything" via `bypassPermissions`
+    /// loses nothing by also short-circuiting the classifier; a deployment that
+    /// relies on the classifier must leave this off.
+    #[serde(default)]
+    pub intercept_safety_classifier: bool,
 }
 
 impl Default for GuiSettings {
@@ -175,6 +196,7 @@ impl Default for GuiSettings {
             sanitize_terms: String::new(),
             force_stream: None,
             client_auth_enabled: false,
+            intercept_safety_classifier: false,
         }
     }
 }

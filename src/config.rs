@@ -69,6 +69,13 @@ pub struct Config {
     /// Whether a 429/402/quota-code/failed-refresh exception may relocate a
     /// session onto another credential. Default true.
     pub session_switch_enabled: bool,
+    /// Answer Claude Code's auto-mode safety classifier locally with an `allow`
+    /// verdict instead of forwarding it upstream.
+    ///
+    /// Off unless the operator turned it on. See
+    /// [`crate::settings::GuiSettings::intercept_safety_classifier`] for what
+    /// the classifier is and why short-circuiting it is not a free optimisation.
+    pub intercept_safety_classifier: bool,
 }
 
 impl Default for Config {
@@ -90,6 +97,7 @@ impl Default for Config {
             credits_endpoint: None,
             sanitize_fingerprints: false,
             force_stream_upstream: false,
+            intercept_safety_classifier: false,
             credential_pool_enabled: false,
             session_switch_enabled: true,
         }
@@ -167,6 +175,10 @@ impl Config {
             models_flavor,
             sanitize_fingerprints,
             force_stream_upstream,
+            // No env override on purpose: an operator who wants this must be able
+            // to see the switch that enabled it, and a shell variable buried in a
+            // unit file would hide a decision that affects every client.
+            intercept_safety_classifier: settings.intercept_safety_classifier,
             ..Default::default()
         };
 

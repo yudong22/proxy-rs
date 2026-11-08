@@ -45,7 +45,7 @@
 ### 4. 极致桌面与原生体验
 - **系统托盘常驻**：原生托盘图标实时展示服务运行状态，支持一键启停，关闭主窗口后台静默运行。
 - **三栏现代化控制台**：运行状态总览 / 实时交互日志 / 服务配置面板，支持快捷键呼出 `⌘K` 快捷命令。
-- **生态一键联动**：一键将代理地址与模型映射写入 `~/.claude/settings.json`；DSH 则写入活动 profile 的 `cordis.patch.yml`（并顺带开启会话头，使日志按**会话**而非客户端版本归类），即开即用。
+- **生态一键联动**：一键将代理地址、模型映射与 **Claude Code 权限模式**写入 `~/.claude/settings.json`（选 `bypassPermissions` 即零判定请求地全放行工具，详见[排障文档第 7 节](docs/troubleshooting-claude-code.md)）；DSH 则写入活动 profile 的 `cordis.patch.yml`（并顺带开启会话头，使日志按**会话**而非客户端版本归类），即开即用。
 - **macOS LaunchAgent**：原生支持开机自启无缝守护，优雅重启与单一实例防冲突。
 
 ---
@@ -236,6 +236,8 @@ ANTHROPIC_BASE_URL=http://localhost:3456 claude
 ```
 或者在 `Proxy RS` 桌面端「服务设置」中点击 **“写入 Claude 配置”**，自动将 `~/.claude/settings.json` 指向本地代理。
 
+同一个按钮也能顺带选定 Claude Code 的 **权限模式**（`permissions.defaultMode`）。想在网关后面完全不被逐条确认，选 `bypassPermissions` —— 它会同时写入 `skipDangerousModePermissionPrompt: true`；`bypassPermissions` 在 CLI 侧被一个同意记录门控，缺这个键时后台会话会被静默降级回 `default`，表现为「点了没生效、还是在问」。**不要选 `auto`**：`auto` 依赖上游返回 `safeguard_results`，而 OpenAI 兼容上游不认识它，Claude Code 只能自己补发判定请求，等于给每次工具调用多加一次往返。各模式的实测请求数与取舍见 [`docs/troubleshooting-claude-code.md`](docs/troubleshooting-claude-code.md) 第 7 节。
+
 #### 2. Codex CLI
 在 `~/.codex/config.toml` 中配置：
 ```toml
@@ -303,6 +305,11 @@ curl -X POST http://localhost:3456/v1/messages \
 | `PROXY_CLIENT_AUTH` | 否 | 跟随 GUI 开关 | **入站访问密钥**总开关，覆盖 `gui-settings.json`（`=0`/`false` 强制关闭）。开启后 `/v1/*` 必须带访问 key（`x-proxy-rs-key`，或标准头 `Authorization: Bearer` / `x-api-key`）。无 GUI 的服务器部署用它显式开启 |
 
 \* 上游需要鉴权时必填。当启用 `UPSTREAM_API_KEY_PASSTHROUGH=true` 时，不得同时指定 `UPSTREAM_API_KEY`。
+
+> **`intercept_safety_classifier` 刻意没有环境变量。** 它只存在于 `gui-settings.json` 与设置页开关里：
+> 这个开关会替**所有**经过本网关的客户端关掉 Claude Code auto 模式的安全判定，所以必须留在一个
+> 看得见、点得到的地方，而不是藏进某个 unit file 的 `Environment=` 行。详见
+> [`docs/troubleshooting-claude-code.md`](docs/troubleshooting-claude-code.md) 第 7 节。
 
 ### 数据持久化目录
 

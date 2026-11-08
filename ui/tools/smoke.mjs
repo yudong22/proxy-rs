@@ -67,6 +67,7 @@ import {
 import { checkOverviewLayout } from './smoke/scenarios-overview.mjs';
 import { checkBootstrapPage } from './smoke/scenarios-bootstrap.mjs';
 import { checkEveryPaneRenders } from './smoke/scenarios-pages.mjs';
+import { checkClaudePermissionMode } from './smoke/scenarios-claude-permission.mjs';
 import { checkEmptyStates, checkEmptySessionList } from './smoke/scenarios-states.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -328,6 +329,10 @@ try {
   // Every page and pane, loaded fresh at the end so the swapped bridge state
   // above cannot leak into it (a fresh document, default bridge).
   await scenario('every pane', () => checkEveryPaneRenders({ send, check, origin: `http://127.0.0.1:${PORT}` }));
+
+  // After "every pane", which leaves the console on a freshly loaded document
+  // with the default bridge — the state this scenario edits the settings form in.
+  await scenario('claude permission mode', () => checkClaudePermissionMode({ send, check }));
 
   if (runtimeErrors.length) {
     failures.push(`runtime console errors:\n      ${runtimeErrors.join('\n      ')}`);

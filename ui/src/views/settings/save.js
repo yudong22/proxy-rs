@@ -6,7 +6,7 @@
 import { $, html, raw } from '../../core/dom.js';
 import { invoke } from '../../core/ipc.js';
 import { refreshStatus } from '../overview.js';
-import { captureBaseline, refreshSectionBadges } from './badges.js';
+import { captureBaseline, captureSectionBaseline, refreshSectionBadges } from './badges.js';
 import { loadClaudeConfig } from './load.js';
 
 /** Persist the form. */
@@ -29,6 +29,7 @@ export async function saveSettings() {
     launch_at_login: $('#setting-launch-at-login').checked,
     sanitize_terms: $('#setting-sanitize-terms').value,
     force_stream: $('#setting-force-stream').checked,
+    intercept_safety_classifier: $('#setting-intercept-classifier').checked,
     // Inbound authentication is a stored setting like any other, so it rides
     // along with the same save. It is *not* a per-account fact — the accounts
     // themselves are managed by their own commands and are untouched here.
@@ -97,19 +98,59 @@ export async function fetchModels() {
 /** Write the model slots into ~/.claude/settings.json. */
 export async function applyClaudeConfig() {
   const status = $('#claude-config-status');
+  // A disabled row is what `loadClaudeConfig` adds for a mode the file contains
+  // but the list does not offer. It is displayed for honesty, not chosen, so it
+  // must not travel back: the writer rejects an unknown mode, which would make a
+  // model-only write fail for a reason the user did not cause.
+  const modeEl = $('#setting-claude-permission-mode');
+  const picked = modeEl?.selectedOptions?.[0];
+  const mode = picked && !picked.disabled ? picked.value : '';
+  const models = {
+    model: $('#setting-claude-model').value.trim(),
+    sonnet: $('#setting-claude-sonnet').value.trim(),
+    opus: $('#setting-claude-opus').value.trim(),
+    haiku: $('#setting-claude-haiku').value.trim(),
+  };
+
+  // The backend refuses a body that carries neither a model nor a mode, and it
+  // is right to: an empty apply would still rewrite the gateway wiring and take
+  // a backup, so "you filled in nothing" is better said before the request than
+  // as a failure of one. Choosing only a mode is a complete request — that is
+  // the whole point of this selector — so only *both* being empty is refused.
+  if (!mode && !Object.values(models).some(Boolean)) {
+    status.className = 'hint err';
+    status.textContent = '请至少填写一个模型或选择一个权限模式';
+    return;
+  }
+
+  status.className = 'hint';
   status.textContent = '正在写入...';
   try {
     const body = {
-      model: $('#setting-claude-model').value.trim() || undefined,
-      sonnet: $('#setting-claude-sonnet').value.trim() || undefined,
-      opus: $('#setting-claude-opus').value.trim() || undefined,
-      haiku: $('#setting-claude-haiku').value.trim() || undefined,
+      model: models.model || undefined,
+      sonnet: models.sonnet || undefined,
+      opus: models.opus || undefined,
+      haiku: models.haiku || undefined,
+      // The mode rides on the same write because both live in the same file and
+      // the user expects one click to mean "this is the config I want". An empty
+      // value is dropped here rather than sent as "": absent means "leave
+      // whatever the CLI has", while "" would ask for the same no-op and only
+      // makes the body look as if a choice was made.
+      permission_mode: mode || undefined,
     };
     await invoke('apply_claude_config', { body });
     status.className = 'hint ok';
     status.textContent = '✓ 写入 ~/.claude/settings.json 成功';
     setTimeout(() => { status.textContent = ''; }, 3000);
     await loadClaudeConfig();
+    // Re-baseline *this group only*: the values on screen are now what is on
+    // disk, so the group must stop reading as 已修改. Without it the badge
+    // stayed on after a successful write — the re-read sets the fields to the
+    // values just written, which still differ from the page-load baseline.
+    // `captureBaseline` would also clear unsaved edits elsewhere on the form,
+    // which this button never saved.
+    captureSectionBaseline('claude');
+    refreshSectionBadges();
   } catch (err) {
     status.className = 'hint err';
     status.textContent = '✗ 写入失败: ' + err;

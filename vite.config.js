@@ -4,6 +4,77 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
+// ── Backend targets for `ui-dev` ────────────────────────────────────────────
+// The installed desktop app listens on PROD_PORT for its data plane and
+// PROD_PORT + 1 for its console (`start_console_listener`).
+//
+// The test gateway sits `DEV_PORT_OFFSET` above the app, not beside it: the app
+// also owns `+ 1`, and a test instance one port away made the two pairs
+// indistinguishable in `lsof` output. `Taskfile.yaml` computes the same number
+// from the same offset; this file only needs it when Vite is started by hand.
+const PROD_PORT = Number(process.env.PROD_PROXY_PORT) || 3457;
+const PROD_CONSOLE_PORT = Number(process.env.PROD_CONSOLE_PORT) || PROD_PORT + 1;
+const DEV_PORT_OFFSET = Number(process.env.DEV_PORT_OFFSET) || 1000;
+const DEV_PORT = Number(process.env.DEV_PROXY_PORT) || PROD_PORT + DEV_PORT_OFFSET;
+const BACKEND_HOST = (process.env.BACKEND || 'http://127.0.0.1').replace(/\/+$/, '').replace(/:\d+$/, '');
+
+/**
+ * Target a proxy entry carries until the first request retargets it.
+ *
+ * Only reached if a proxied request somehow arrives without the plugin's
+ * `request` wrapper having run; the dev gateway is the safe choice.
+ */
+const PLACEHOLDER = `${BACKEND_HOST}:${DEV_PORT}`;
+
+/** The installed app's listener for one prefix. */
+const prodTarget = (kind) => `${BACKEND_HOST}:${kind === 'admin' ? PROD_CONSOLE_PORT : PROD_PORT}`;
+
+/** `proxy_rs_backend=prod` in the cookie jar means the installed app. */
+const wantsProd = (req) =>
+  /(?:^|;\s*)proxy_rs_backend=prod(?:;|$)/.test(req.headers?.cookie || '');
+
+/**
+ * Retarget the two proxy entries per request, from the `proxy_rs_backend`
+ * cookie.
+ *
+ * **Serve only** — this is the `ui-dev` switch; a build has no proxy to
+ * retarget. It runs as a plugin (not a middleware in `configureServer`) so its
+ * `request` wrapper is registered after Vite has mounted its own middleware
+ * stack, and therefore runs first.
+ *
+ * It wraps the first `request` listener — Vite's connect stack — rather than
+ * adding a listener of its own: a second listener would race the stack, and
+ * whether it won would depend on registration order. Wrapping keeps the whole
+ * decision inside one listener, before the proxy middleware reads `target`.
+ *
+ * What it must **not** do is retarget via http-proxy's `proxyReq` hook: that
+ * fires after http-proxy's `stream` pass has already parsed `target` and
+ * opened the socket, so it would change the next request's target, not this
+ * one's. See the comment on `server.proxy` for the two hooks that don't work.
+ */
+function backendSwitch() {
+  return {
+    name: 'proxy-rs:proxy-target',
+    apply: 'serve',
+    configureServer(server) {
+      const httpServer = server.httpServer;
+      if (!httpServer) return; // middleware mode: nothing is listening to fix
+      const [connectStack] = httpServer.listeners('request');
+      if (typeof connectStack !== 'function') return;
+
+      httpServer.removeListener('request', connectStack);
+      httpServer.on('request', (req, res) => {
+        const proxy = server.config.server.proxy;
+        const backend = wantsProd(req) ? 'prod' : 'dev';
+        // Two keys only; `proxy` is a literal in this file, not user config.
+        proxy['/admin'].target = backend === 'prod' ? prodTarget('admin') : `${BACKEND_HOST}:${DEV_PORT}`;
+        proxy['/api'].target = backend === 'prod' ? prodTarget('api') : `${BACKEND_HOST}:${DEV_PORT}`;
+        connectStack(req, res);
+      });
+    },
+  };
+}
+
 /**
  * The `ui-dev`-only header control, injected by the `proxy-rs:backend-switch`
  * plugin and never part of a build.
@@ -120,6 +191,7 @@ export default defineConfig({
   },
 
   plugins: [
+    backendSwitch(),
     {
       name: 'proxy-rs:console-script-tag',
       // Build only. In dev there is no hashed entry to restore, and the source
@@ -196,39 +268,42 @@ export default defineConfig({
      *   prod — the installed desktop app. Its console is a separate listener on
      *     `port + 1` (`start_console_listener`), so `/admin/*` goes one port up.
      *
-     * Getting this wrong is silent rather than loud: the proxy 404s, the page
-     * falls back to IPC, and the console looks fine while reading a different
-     * backend than the one on screen. Hence the cookie: switching is a visible,
-     * per-tab choice rather than an environment variable someone forgot.
-     *
      * Ports come from the environment so `task` can keep `dev-server` and
      * `ui-dev` in step; the defaults are the documented ones.
+     *
+     * ## How a request picks its upstream
+     *
+     * `/api` and `/admin` are two proxy entries, each with a **placeholder**
+     * target. The `proxy-rs:proxy-target` plugin below rewrites that entry's
+     * `target` in place before each proxied request, per the cookie.
+     *
+     * The placeholder is not cosmetic: http-proxy reads `target` *before* it
+     * emits `proxyReq` (its `stream` pass starts the request), so retargeting
+     * from `configure`/`proxyReq` is already too late. Vite builds the proxy
+     * once and passes http-proxy the same options object on every request, so
+     * mutating `target` still has effect — and is safe because the wrapper
+     * sets all four targets and then hands the request straight on, in the
+     * same synchronous turn, with no `await` in between (which is also why the
+     * wrapper must not become async later).
+     *
+     * Two earlier attempts are worth remembering, because both failed silently:
+     *
+     *  - `router: (req) => target` on the entry. **Vite 5 has no `router`**:
+     *    the option is accepted and ignored, so every request went to `target`
+     *    (the dev port) and the switch did nothing.
+     *  - One entry per (backend, prefix) with `bypass` hopping between them.
+     *    `bypass` returning a string means *"a middleware rewrote the URL"* —
+     *    Vite calls `next()` and its own middleware answers — not "try the next
+     *    proxy entry". The hop rewrote the URL to a proxy key, nothing matched
+     *    it, and the SPA fallback served `index.html` as a 200.
+     *
+     * A proxy key is a plain `startsWith` test, so the two must not overlap:
+     * `/api/*` and `/admin/*` are disjoint, and `/admin` (no trailing slash)
+     * still matches `POST /admin/api/rpc/<cmd>`.
      */
-    proxy: (() => {
-      const host = (process.env.BACKEND || 'http://127.0.0.1').replace(/\/+$/, '').replace(/:\d+$/, '');
-      const devPort = Number(process.env.DEV_PROXY_PORT) || 3457;
-      const prodPort = Number(process.env.PROD_PROXY_PORT) || 3457;
-      const prodConsolePort = Number(process.env.PROD_CONSOLE_PORT) || prodPort + 1;
-
-      /** Upstream port for one prefix, per the switch cookie. */
-      const portFor = (req, kind) => {
-        const wantsProd = /(?:^|;\s*)proxy_rs_backend=prod(?:;|$)/.test(req.headers.cookie || '');
-        if (!wantsProd) return devPort;
-        return kind === 'admin' ? prodConsolePort : prodPort;
-      };
-
-      return {
-        '/admin': {
-          target: `${host}:${devPort}`,
-          changeOrigin: false,
-          router: (req) => `${host}:${portFor(req, 'admin')}`,
-        },
-        '/api': {
-          target: `${host}:${devPort}`,
-          changeOrigin: false,
-          router: (req) => `${host}:${portFor(req, 'api')}`,
-        },
-      };
-    })(),
+    proxy: {
+      '/api': { target: PLACEHOLDER, changeOrigin: false },
+      '/admin': { target: PLACEHOLDER, changeOrigin: false },
+    },
   },
 });

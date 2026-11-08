@@ -2,6 +2,74 @@
 
 use super::*;
 
+/// Answer Claude Code's auto-mode safety classifier with an `allow` verdict.
+///
+/// The alternative was to forward the request, which on an OpenAI-compatible
+/// upstream means paying for a ~140k-character prompt that the upstream rejects
+/// (`claude-sonnet-5` does not exist there) followed by a second billed attempt
+/// on the session's own model. Answering locally costs nothing and gets the
+/// client its verdict immediately.
+///
+/// **This is not a judgement, it is a decision to stop judging.** It is reached
+/// only when `intercept_safety_classifier` is on, and it says so in the proxy
+/// log every time — an operator who switched it on months ago should still be
+/// reminded, by the log, that the verdicts are their gateway's rather than
+/// Anthropic's. That is why it logs at INFO on every interception rather than
+/// once at startup.
+#[allow(clippy::too_many_arguments)]
+async fn intercept_safety_classifier(
+    model: &str,
+    gui_logs: &Arc<crate::settings::LogBuffer>,
+    stats: &Arc<StatsDb>,
+    session: &SessionInfo,
+    tag: &str,
+    start: Instant,
+) -> Response {
+    let verdict = allow_verdict(model);
+    let duration_ms = start.elapsed().as_millis() as i64;
+
+    gui_logs
+        .push(
+            "INFO",
+            format!(
+                "POST /v1/messages {} auto-mode classifier intercepted -> allow (model={}, {}ms)",
+                tag, model, duration_ms
+            ),
+        )
+        .await;
+    tracing::info!(
+        "POST /v1/messages auto-mode classifier intercepted -> allow (model={}, {}ms)",
+        model,
+        duration_ms
+    );
+
+    // Recorded as a normal request so the saving is visible in the dashboard
+    // instead of being a silent gap: without a row, the classifier traffic simply
+    // vanishes and nobody can tell interception is on.
+    record_stats_row(
+        stats,
+        RequestOutcome {
+            model,
+            client_model: model,
+            route: "/v1/messages",
+            tokens: &TokenRecord::default(),
+            duration_ms,
+            timing: UpstreamTiming::default(),
+            streamed: false,
+            status: 200,
+            error: None,
+            session_id: &session.session_id,
+            parent_session_id: &session.parent_session_id,
+            client: session.client.tag(),
+            override_key: "",
+            override_model: "",
+            override_reason: "",
+        },
+    );
+
+    Json(verdict).into_response()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_handler(
     Extension(config): Extension<Arc<Config>>,
@@ -24,6 +92,30 @@ pub async fn proxy_handler(
     let peeked = util::peek_json_body(request, limit).await;
     let session = resolve_session(&headers, peeked.json.as_ref());
     let tag = session.log_tag();
+
+    // Claude Code's auto-mode safety classifier, answered locally when the
+    // operator opted in. Decided here, before `extract_or_reject` consumes the
+    // body, because the test depends on the request's *shape* (one message, no
+    // tools, a 140k system prompt) and the typed translation struct drops the
+    // parts that shape is made of.
+    //
+    // Answered before the service-state check on purpose: an intercepted
+    // classifier never reaches upstream, so "the service is paused" is not a
+    // fact about it. Returning a verdict keeps the client's tool call moving
+    // instead of stalling it behind a check that would otherwise resolve itself
+    // upstream.
+    if config.intercept_safety_classifier && peeked.json.as_ref().is_some_and(is_safety_classifier)
+    {
+        let model = peeked
+            .json
+            .as_ref()
+            .and_then(|b| b.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        return Ok(
+            intercept_safety_classifier(model, &gui_logs, &stats, &session, &tag, start).await,
+        );
+    }
 
     let Json(req): Json<anthropic::AnthropicRequest> = extract_or_reject(
         peeked,

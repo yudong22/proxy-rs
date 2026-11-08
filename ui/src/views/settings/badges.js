@@ -24,7 +24,17 @@ const SECTION_FIELDS = {
   // state managed by its own commands, so it has nothing to compare against and
   // must not make the section read as "已修改".
   'client-accounts': ['client-auth-enabled'],
-  claude: ['setting-claude-model', 'setting-claude-sonnet', 'setting-claude-opus', 'setting-claude-haiku'],
+  // The permission mode is tracked with the model ids because it is written by
+  // the same button, into the same file. Leaving it out would let "pick
+  // bypassPermissions" — a change with far more consequence than a model id —
+  // show no 已修改 badge at all.
+  claude: [
+    'setting-claude-model',
+    'setting-claude-sonnet',
+    'setting-claude-opus',
+    'setting-claude-haiku',
+    'setting-claude-permission-mode',
+  ],
   codex: [],
   advanced: [
     'setting-reasoning-model',
@@ -32,6 +42,7 @@ const SECTION_FIELDS = {
     'setting-model-map',
     'setting-sanitize-terms',
     'setting-force-stream',
+    'setting-intercept-classifier',
   ],
 };
 
@@ -44,6 +55,21 @@ function fieldValue(el) {
 export function captureBaseline() {
   baseline.clear();
   for (const id of Object.values(SECTION_FIELDS).flat()) {
+    const el = document.getElementById(id);
+    if (el) baseline.set(id, fieldValue(el));
+  }
+}
+
+/**
+ * Re-baseline one group, leaving every other group's badge alone.
+ *
+ * Needed by the writers that save *one* group rather than the whole form: the
+ * Claude Code button writes only `~/.claude/settings.json`, so calling
+ * [`captureBaseline`] there would also swallow unsaved edits in 网络与自启 and
+ * 模型重定向 — their badges would clear without the change having been saved.
+ */
+export function captureSectionBaseline(section) {
+  for (const id of SECTION_FIELDS[section] ?? []) {
     const el = document.getElementById(id);
     if (el) baseline.set(id, fieldValue(el));
   }

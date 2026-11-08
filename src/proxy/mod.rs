@@ -13,6 +13,7 @@
 //! | [`request`] | request-side plumbing: body extraction, rejection, session resolution, stats, credential refresh |
 //! | [`forward`] | the upstream send/retry path — one long function, see its own note |
 //! | [`response`] | buffering the stream, non-streaming aggregation, streaming passthrough |
+//! | [`safety_classifier`] | recognising Claude Code's auto-mode classifier, and the local `allow` verdict |
 //! | [`models`] | `GET /v1/models` and its config-driven variants |
 //! | [`auth_resolvers`] | which API key the caller presented |
 //! | [`auth_headers`] | upstream identity + CLI fingerprint headers |
@@ -33,6 +34,7 @@ mod handlers;
 mod models;
 mod request;
 mod response;
+mod safety_classifier;
 mod sse;
 mod upstream_errors;
 
@@ -53,6 +55,7 @@ pub(crate) use handlers::*;
 pub(crate) use models::*;
 pub(crate) use request::*;
 pub(crate) use response::*;
+pub(crate) use safety_classifier::*;
 pub(crate) use sse::*;
 pub(crate) use upstream_errors::*;
 

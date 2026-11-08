@@ -2615,3 +2615,125 @@ async fn a_stalled_stream_is_described_as_a_timeout_not_a_truncation() {
         "a stall is not a truncation, got: {summary}"
     );
 }
+
+// ── Auto-mode safety classifier interception ───────────────────────────────
+
+/// A request shaped like Claude Code's auto-mode classifier, as captured from
+/// 2.1.311: one message (the transcript under judgement), no `tools`, and a
+/// ~140k-character system prompt.
+fn classifier_request() -> Value {
+    json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 64,
+        "messages": [{ "role": "user", "content": "…transcript…" }],
+        "system": [{ "type": "text", "text": "x".repeat(140_000) }],
+    })
+}
+
+/// A normal agent turn, used as the control: it must never be intercepted.
+fn agent_turn_request() -> Value {
+    json!({
+        "model": "deepseek-v4.1-flash",
+        "max_tokens": 32000,
+        "messages": [
+            { "role": "user", "content": "fix the bug" },
+            { "role": "assistant", "content": "…" },
+        ],
+        "system": [{ "type": "text", "text": "You are Claude Code. ".repeat(300) }],
+        "tools": [{ "name": "Bash", "input_schema": { "type": "object" } }],
+    })
+}
+
+/// Drive `proxy_handler` with a given body and config flag.
+///
+/// Returns `Ok((status, body))` when the handler produced a response of its own,
+/// and `Err(message)` when it gave up — which, with the upstream pointed at a
+/// dead port, is exactly the signature of "it was forwarded".
+async fn call_proxy_handler(
+    body: &Value,
+    intercept: bool,
+) -> Result<(axum::http::StatusCode, Value), String> {
+    let config = std::sync::Arc::new(Config {
+        intercept_safety_classifier: intercept,
+        // Deliberately unreachable: an intercepted request must not try to go
+        // upstream, so a test that lets it through fails on connection instead
+        // of silently passing.
+        upstream_urls: vec!["http://127.0.0.1:1".to_string()],
+        ..Default::default()
+    });
+    let client = reqwest::Client::new();
+    let logs = std::sync::Arc::new(crate::settings::LogBuffer::new(50));
+    let service = crate::service::ServiceController::new(false);
+    service.mark_running();
+    let stats_db = mock_stats();
+
+    let response = super::proxy_handler(
+        axum::Extension(config),
+        axum::Extension(client),
+        axum::Extension(logs),
+        axum::Extension(service),
+        axum::Extension(stats_db),
+        axum::Extension(std::sync::Arc::new(
+            crate::session_pool::CredentialPool::empty(),
+        )),
+        HeaderMap::new(),
+        json_request(body),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    Ok((
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    ))
+}
+
+/// The switch on: the classifier gets an `allow` locally, and never reaches
+/// upstream (the config points at a dead port, so a forwarded request fails).
+#[tokio::test]
+async fn the_classifier_is_answered_locally_when_the_switch_is_on() {
+    let (status, body) = call_proxy_handler(&classifier_request(), true)
+        .await
+        .expect("an intercepted classifier must be answered, never forwarded");
+
+    assert_eq!(status, 200, "should be answered, not an error: {body}");
+    assert_eq!(body["type"], "message");
+    // The format Claude Code parses: `<block>no</block>` is the allow verdict.
+    let text = body["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("<block>no</block>"), "got {text}");
+    // The model is echoed rather than replaced, so the client's own accounting
+    // still attributes the turn where it expected.
+    assert_eq!(body["model"], "claude-sonnet-5");
+}
+
+/// The switch off: the very same request is forwarded as usual, i.e. it fails
+/// on the dead upstream port instead of being answered. That difference is what
+/// proves the switch is what intercepts, not the request shape alone.
+#[tokio::test]
+async fn the_classifier_is_forwarded_when_the_switch_is_off() {
+    let result = call_proxy_handler(&classifier_request(), false).await;
+    assert!(
+        result.is_err(),
+        "with interception off the request must be forwarded and fail on the dead \
+         upstream, but the handler answered it: {result:?}"
+    );
+}
+
+/// A real agent turn must never be intercepted, switch or no switch — otherwise
+/// enabling the switch would silently change every conversation instead of only
+/// the classifier.
+#[tokio::test]
+async fn a_normal_turn_is_never_intercepted() {
+    for intercept in [false, true] {
+        let result = call_proxy_handler(&agent_turn_request(), intercept).await;
+        assert!(
+            result.is_err(),
+            "a normal turn must be forwarded even with interception on \
+             (intercept={intercept}), but the handler answered it: {result:?}"
+        );
+    }
+}

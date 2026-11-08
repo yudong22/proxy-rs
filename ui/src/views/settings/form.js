@@ -64,6 +64,27 @@ export function renderSettings() {
       ${raw(input('setting-claude-opus', 'Opus 槽位模型', '例如 deepseek-reasoner', { group: 'half' }))}
       ${raw(input('setting-claude-haiku', 'Haiku 槽位模型', '例如 deepseek-chat', { group: 'half' }))}
     </div>
+    <!-- The mode is a closed list, not a free-text field: the CLI silently
+         ignores an unrecognised value and falls back to its own default, so a
+         typo would look like a successful write that changed nothing. The empty
+         option is the "write nothing" choice and is first, because leaving the
+         mode alone is what most model-slot updates want. -->
+    <div class="form-group">
+      <label for="setting-claude-permission-mode">权限模式 (permissions.defaultMode)</label>
+      <select id="setting-claude-permission-mode">
+        <option value="">跟随 Claude Code 默认</option>
+        <option value="default">default — 每次都询问</option>
+        <option value="acceptEdits">acceptEdits — 自动接受文件编辑</option>
+        <option value="plan">plan — 只读规划</option>
+        <option value="auto">auto — 分类器逐条判定（会产生额外请求）</option>
+        <option value="dontAsk">dontAsk — 会询问的一律拒绝</option>
+        <option value="bypassPermissions">bypassPermissions — 全部自动通过（不再询问）</option>
+      </select>
+      <p class="hint">
+        bypassPermissions 会取消文件写入与系统命令的<b>全部</b>确认，写入后 Claude Code
+        不再就任何操作征求同意；只在对当前目录完全信任时使用。
+      </p>
+    </div>
     <div class="actions-row">
       <button type="button" class="btn btn-small btn-primary" id="btn-apply-claude-config">写入 Claude Code 配置</button>
       <span class="hint" id="claude-config-status"></span>
@@ -129,6 +150,21 @@ export function renderSettings() {
       '该服务商不支持非流式时开启：所有请求都以流式发送，非流式客户端仍收到一次完整响应',
     ))}
     <div class="hint" id="force-stream-hint"></div>
+    ${raw(toggle(
+      'setting-intercept-classifier',
+      '拦截 Claude Code 自动模式的安全分类器（直接放行）',
+      'auto 权限模式下 Claude Code 会把待执行的命令交给一个分类器判定是否安全；开启后本网关直接返回「允许」，不再转发。',
+    ))}
+    <!-- The warning is not decoration. This switch turns off a safety check, and
+         the gateway can be shared: everyone behind it loses the check at once,
+         and they cannot see this page. It is off by default for that reason, and
+         the text says so rather than letting the default speak for itself. -->
+    <p class="hint" id="intercept-classifier-hint">
+      <b>默认关闭。</b>开启后：<b>所有</b>经过本网关的 Claude Code 客户端的
+      auto 模式判定都会得到「允许」，无论请求的是 <code>claude-sonnet-5</code> 还是其他模型 ——
+      如果网关不只有你本机在用，别人会在不知情的情况下失去这道安全检查。
+      仅在客户端已经用 <code>bypassPermissions</code> 全放行、只是想省掉那一次无用的分类器请求时才打开。
+    </p>
   `);
 
   const identityPool = section('identity-pool', '身份池 (账号 / 密钥)', html`

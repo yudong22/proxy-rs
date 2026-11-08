@@ -28,11 +28,52 @@ pub struct SlotUpdate {
     pub name: Option<String>,
 }
 
+/// `permissions.defaultMode` values Claude Code accepts, in the order the GUI
+/// offers them, each with the one-line behaviour the UI shows.
+///
+/// This list is the whole surface of "how often does Claude ask before it
+/// acts". It is deliberately explicit rather than a free-text field: the CLI
+/// silently ignores an unrecognised mode and falls back to its built-in
+/// default, so a typo here would read as "the setting did nothing".
+///
+/// `auto` and `bypassPermissions` only take effect from *user* settings
+/// (`~/.claude/settings.json`, which is the file this module writes) — since
+/// v2.1.257 the CLI ignores both in project/local settings.
+///
+/// `manual` is a real CLI alias for `default`, but it is deliberately not
+/// offered and not accepted here: two spellings of one behaviour would make the
+/// form show a mode it then could not round-trip, and `default` is the spelling
+/// the settings reference documents as the canonical one.
+pub const PERMISSION_MODES: &[(&str, &str)] = &[
+    ("", "跟随 Claude Code 默认（不写入）"),
+    ("default", "每次都询问（Manual）"),
+    ("acceptEdits", "自动接受文件编辑，其余仍询问"),
+    ("plan", "只读规划，不改文件（Plan）"),
+    ("auto", "分类器逐条判定（Auto，会产生额外请求）"),
+    ("dontAsk", "不会询问：会弹窗的一律直接拒绝"),
+    (
+        "bypassPermissions",
+        "全部自动通过（Bypass，不再有任何询问）",
+    ),
+];
+
+/// True for a value [`PERMISSION_MODES`] lists, so the writer and the reader
+/// cannot disagree about what is legal.
+fn is_known_mode(mode: &str) -> bool {
+    mode.is_empty() || PERMISSION_MODES.iter().any(|(m, _)| *m == mode)
+}
+
 /// Read the current env map (and top-level `model`) for display.
 pub fn read_current() -> Result<Value> {
     let path = settings_path().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
     if !path.exists() {
-        return Ok(json!({ "exists": false, "env": {}, "model": null }));
+        return Ok(json!({
+            "exists": false,
+            "env": {},
+            "model": null,
+            "permission_mode": Value::Null,
+            "skip_dangerous_prompt": false,
+        }));
     }
     let text = std::fs::read_to_string(&path)?;
     let doc: Value =
@@ -41,16 +82,44 @@ pub fn read_current() -> Result<Value> {
     let env = doc.get("env").cloned().unwrap_or_else(|| json!({}));
     let model = doc.get("model").cloned().unwrap_or(Value::Null);
 
+    // `permissions.defaultMode` and `skipDangerousModePermissionPrompt` are read
+    // straight out of the same document the writer edits, so the form shows what
+    // is really on disk rather than what the last click asked for.
+    let permission_mode = doc
+        .pointer("/permissions/defaultMode")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let skip_dangerous_prompt = doc
+        .get("skipDangerousModePermissionPrompt")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     Ok(json!({
         "exists": true,
         "path": path.display().to_string(),
         "env": env,
         "model": model,
+        "permission_mode": permission_mode,
+        "skip_dangerous_prompt": skip_dangerous_prompt,
     }))
 }
 
 /// Apply model slots, preserving every unrelated key.
 pub fn apply_slots(updates: &[SlotUpdate], base_url: &str) -> Result<Value> {
+    apply_slots_with_permission(updates, base_url, None)
+}
+
+/// As [`apply_slots`], plus an optional `permissions.defaultMode` to write.
+///
+/// `permission_mode` is `None` when the form means "leave the CLI's own default
+/// alone" — which is not the same as writing `"default"`, because an operator
+/// may have chosen `auto` in the CLI itself and a bare apply of the model slots
+/// must not silently reset that.
+pub fn apply_slots_with_permission(
+    updates: &[SlotUpdate],
+    base_url: &str,
+    permission_mode: Option<&str>,
+) -> Result<Value> {
     let path = settings_path().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
 
     let mut doc: Value = if path.exists() {
@@ -62,6 +131,13 @@ pub fn apply_slots(updates: &[SlotUpdate], base_url: &str) -> Result<Value> {
 
     if !doc.is_object() {
         bail!("settings.json must be a JSON object");
+    }
+
+    // The permission keys live outside `env`, so they are applied to the whole
+    // document; borrowing it once here keeps the two writers from disagreeing
+    // about the shape of the file.
+    if let Some(mode) = permission_mode {
+        apply_permission_update(&mut doc, mode)?;
     }
 
     let env = doc
@@ -82,7 +158,76 @@ pub fn apply_slots(updates: &[SlotUpdate], base_url: &str) -> Result<Value> {
     }
     std::fs::write(&path, serde_json::to_string_pretty(&doc)?)?;
 
-    Ok(json!({ "ok": true, "path": path.display().to_string() }))
+    Ok(json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "permission_mode": doc
+            .pointer("/permissions/defaultMode")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "skip_dangerous_prompt": doc
+            .get("skipDangerousModePermissionPrompt")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }))
+}
+
+/// Write `permissions.defaultMode` (and the consent key it depends on).
+///
+/// Two things here are not obvious and both were verified against Claude Code
+/// 2.1.311 rather than inferred from the docs' prose:
+///
+///   * `bypassPermissions` is gated on a *consent record*, not just on the mode.
+///     Without `skipDangerousModePermissionPrompt: true` in user settings the CLI
+///     shows a warning dialog before entering the mode, and a background/`--bg`
+///     session is silently downgraded to `default` — which is exactly the
+///     "nothing happens" failure a one-click write must not produce. Writing the
+///     key is what makes the mode survive an unattended start. Accepting the
+///     dialog by hand writes the same key, so this is not a bypass of the
+///     consent record; it *is* the consent record.
+///   * the mode is written to the *user* file, which is the only scope where
+///     `auto` and `bypassPermissions` take effect at all (the CLI ignores both
+///     from project/local settings since v2.1.257).
+///
+/// Every other `permissions.*` key the user set — `allow`, `deny`, `ask`,
+/// `additionalDirectories`, and any `defaultMode` we are not asked to change —
+/// is left exactly as it was.
+fn apply_permission_update(doc: &mut Value, mode: &str) -> Result<()> {
+    if !is_known_mode(mode) {
+        bail!("unknown permission mode: {}", mode);
+    }
+    if mode.is_empty() {
+        // "Follow the CLI's own default" means write nothing: the caller
+        // explicitly did not choose a mode.
+        return Ok(());
+    }
+
+    let root = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings.json must be a JSON object"))?;
+
+    // `permissions` is normally absent on a fresh install. If it is present but
+    // not an object, refuse rather than replace someone's hand-written value
+    // with an object: silently discarding it is not recoverable from the .bak
+    // once the user has closed the window.
+    let permissions = match root.get_mut("permissions") {
+        None => {
+            root.insert("permissions".into(), json!({}));
+            root.get_mut("permissions").expect("just inserted")
+        }
+        Some(value) if value.is_object() => value,
+        Some(_) => bail!("settings.json 的 `permissions` 不是对象，未做改动"),
+    };
+    permissions
+        .as_object_mut()
+        .expect("checked object above")
+        .insert("defaultMode".into(), json!(mode));
+
+    if mode == "bypassPermissions" {
+        root.insert("skipDangerousModePermissionPrompt".into(), json!(true));
+    }
+
+    Ok(())
 }
 
 /// Write the model slots and gateway wiring into Claude Code's `env` map.
@@ -241,5 +386,139 @@ mod tests {
         let mut env = env_with(&[]);
         let err = apply_env_updates(&mut env, &[slot("bogus", "m")], "http://127.0.0.1:3457");
         assert!(err.is_err(), "an unknown slot must not be silently ignored");
+    }
+
+    // ── permission mode ────────────────────────────────────────────────────
+
+    fn doc_with_permissions(permissions: Value) -> Value {
+        json!({
+            "env": { "ANTHROPIC_MODEL": "keep-me", "ANTHROPIC_BASE_URL": "http://old:1" },
+            "permissions": permissions,
+            "model": "sonnet",
+        })
+    }
+
+    #[test]
+    fn bypass_writes_the_mode_and_the_consent_key() {
+        // Both keys are required: the mode alone leaves the CLI showing the
+        // dialog in a terminal and silently downgrading in a `--bg` session,
+        // which reads to the user as "the setting did nothing".
+        let mut doc = json!({ "env": {} });
+        apply_permission_update(&mut doc, "bypassPermissions").unwrap();
+
+        assert_eq!(doc["permissions"]["defaultMode"], "bypassPermissions");
+        assert_eq!(doc["skipDangerousModePermissionPrompt"], true);
+    }
+
+    #[test]
+    fn every_mode_but_bypass_leaves_the_consent_key_alone() {
+        // Writing it for `auto` would record a consent the user never gave, and
+        // would then let a later `--dangerously-skip-permissions` start without
+        // its dialog.
+        for mode in ["default", "acceptEdits", "plan", "auto", "dontAsk"] {
+            let mut doc = json!({ "env": {} });
+            apply_permission_update(&mut doc, mode).unwrap();
+            assert_eq!(doc["permissions"]["defaultMode"], mode);
+        }
+    }
+
+    #[test]
+    fn an_existing_consent_key_is_never_removed() {
+        // The user accepted the dialog once; changing the mode away from bypass
+        // must not erase that record (the CLI would show the dialog again).
+        let mut doc = json!({ "skipDangerousModePermissionPrompt": true, "env": {} });
+        apply_permission_update(&mut doc, "acceptEdits").unwrap();
+        assert_eq!(doc["skipDangerousModePermissionPrompt"], true);
+    }
+
+    #[test]
+    fn unrelated_permission_keys_are_preserved() {
+        // `allow`/`deny`/`ask` are hand-tuned by the user; a mode change must
+        // not reset them.
+        let mut doc = doc_with_permissions(json!({
+            "allow": ["Bash(git *)"],
+            "deny": ["Bash(rm *)"],
+            "additionalDirectories": ["/tmp"],
+        }));
+        apply_permission_update(&mut doc, "auto").unwrap();
+
+        assert_eq!(doc["permissions"]["defaultMode"], "auto");
+        assert_eq!(doc["permissions"]["allow"][0], "Bash(git *)");
+        assert_eq!(doc["permissions"]["deny"][0], "Bash(rm *)");
+        assert_eq!(doc["permissions"]["additionalDirectories"][0], "/tmp");
+    }
+
+    #[test]
+    fn a_missing_permissions_object_is_created() {
+        // A fresh `~/.claude/settings.json` usually has no `permissions` at all.
+        let mut doc = json!({ "env": { "ANTHROPIC_MODEL": "m" } });
+        apply_permission_update(&mut doc, "plan").unwrap();
+        assert_eq!(doc["permissions"]["defaultMode"], "plan");
+        assert_eq!(doc["env"]["ANTHROPIC_MODEL"], "m");
+    }
+
+    #[test]
+    fn a_non_object_permissions_value_is_refused_not_overwritten() {
+        // Replacing someone's hand-written value would be unrecoverable once
+        // they closed the window, so refuse and let them fix it.
+        let mut doc = doc_with_permissions(json!("oops"));
+        let err = apply_permission_update(&mut doc, "auto");
+        assert!(
+            err.is_err(),
+            "a non-object `permissions` must not be replaced"
+        );
+        assert_eq!(
+            doc["permissions"], "oops",
+            "the original value must survive"
+        );
+    }
+
+    #[test]
+    fn an_unknown_mode_is_rejected() {
+        // The CLI silently ignores an unknown mode and falls back to its
+        // default, so accepting one here would look like a successful write
+        // that changed nothing.
+        let mut doc = json!({ "env": {} });
+        let err = apply_permission_update(&mut doc, "bypass");
+        assert!(err.is_err(), "a misspelled mode must not be written");
+    }
+
+    #[test]
+    fn an_empty_mode_is_the_no_write_choice() {
+        // The form's first option means "follow the CLI's own default", which
+        // must leave no `defaultMode` behind — not write `""`.
+        let mut doc = json!({ "env": {}, "permissions": { "allow": ["Bash(ls)"] } });
+        apply_permission_update(&mut doc, "").unwrap();
+        assert!(doc.pointer("/permissions/defaultMode").is_none());
+        assert_eq!(doc["permissions"]["allow"][0], "Bash(ls)");
+    }
+
+    #[test]
+    fn the_offered_modes_are_exactly_the_ones_claude_code_accepts() {
+        // Guards the list the UI renders against the writer's validation: a
+        // value only one of them knows about is either a dead option or a
+        // rejected write.
+        let modes: Vec<&str> = PERMISSION_MODES.iter().map(|(m, _)| *m).collect();
+        assert_eq!(
+            modes,
+            vec![
+                "",
+                "default",
+                "acceptEdits",
+                "plan",
+                "auto",
+                "dontAsk",
+                "bypassPermissions"
+            ],
+            "offered modes must stay in sync with Claude Code's accepted values"
+        );
+        // Every non-empty offered mode must pass validation…
+        for mode in modes.iter().filter(|m| !m.is_empty()) {
+            let mut doc = json!({ "env": {} });
+            apply_permission_update(&mut doc, mode).expect("every offered mode must be writable");
+        }
+        // …and a plausible-not-real value must not.
+        let mut doc = json!({ "env": {} });
+        assert!(apply_permission_update(&mut doc, "manual").is_err());
     }
 }

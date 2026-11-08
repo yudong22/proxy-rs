@@ -33,6 +33,13 @@ const TOKEN_ENV: &str = "PROXY_API_TOKEN";
 struct Isolated {
     _guard: tokio::sync::MutexGuard<'static, ()>,
     dir: std::path::PathBuf,
+    /// Set only for tests that relocate `$HOME`, with the value to restore.
+    ///
+    /// The Claude Code writer resolves `~/.claude/settings.json` through
+    /// [`settings::home_dir`], so a test of it must point `HOME` at a temp
+    /// directory — and must put the real one back, or every later test in the
+    /// binary would read the developer's own settings.
+    saved_home: Option<std::ffi::OsString>,
 }
 
 impl Drop for Isolated {
@@ -40,6 +47,9 @@ impl Drop for Isolated {
         std::env::remove_var(TOKEN_ENV);
         std::env::remove_var("PROXY_DATA_DIR");
         std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        if let Some(home) = self.saved_home.take() {
+            std::env::set_var("HOME", home);
+        }
         if !std::thread::panicking() {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -47,6 +57,14 @@ impl Drop for Isolated {
 }
 
 async fn isolate(name: &str, token: Option<&str>) -> Isolated {
+    isolate_with_home(name, token, false).await
+}
+
+/// [`isolate`], optionally moving `$HOME` into the temp directory.
+///
+/// Only the Claude Code config writer needs this; the rest of the admin
+/// surface works entirely through `PROXY_DATA_DIR`.
+async fn isolate_with_home(name: &str, token: Option<&str>, relocate_home: bool) -> Isolated {
     let guard = GLOBAL_LOCK.lock().await;
     let dir = std::env::temp_dir().join(format!("proxy-rs-it-admin-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -59,7 +77,18 @@ async fn isolate(name: &str, token: Option<&str>) -> Isolated {
         Some(t) => std::env::set_var(TOKEN_ENV, t),
         None => std::env::remove_var(TOKEN_ENV),
     }
-    Isolated { _guard: guard, dir }
+    let saved_home = if relocate_home {
+        let saved = std::env::var_os("HOME");
+        std::env::set_var("HOME", &dir);
+        Some(saved.unwrap_or_default())
+    } else {
+        None
+    };
+    Isolated {
+        _guard: guard,
+        dir,
+        saved_home,
+    }
 }
 
 /// A router plus the session map it uses, so a login cookie stays valid for
@@ -2008,4 +2037,188 @@ async fn the_desktop_console_accepts_the_webviews_cross_site_navigation() {
         resp.headers().get("set-cookie").is_none(),
         "a cross-site subresource must not mint a session"
     );
+}
+
+// ── Claude Code permission mode ────────────────────────────────────────────
+
+/// Read the settings file the writer just wrote, from the relocated `$HOME`.
+fn read_claude_settings(dir: &std::path::Path) -> Value {
+    let path = dir.join(".claude/settings.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} must exist: {e}", path.display()));
+    serde_json::from_str(&text).expect("written settings must be valid JSON")
+}
+
+/// Seed `~/.claude/settings.json` with a realistic user file.
+fn seed_claude_settings(dir: &std::path::Path, doc: &Value) {
+    let claude = dir.join(".claude");
+    std::fs::create_dir_all(&claude).expect("create .claude");
+    std::fs::write(
+        claude.join("settings.json"),
+        serde_json::to_string_pretty(doc).unwrap(),
+    )
+    .expect("seed settings.json");
+}
+
+/// The whole point of the feature, end to end over the real RPC the console
+/// calls: choosing "approve everything" must write *both* keys.
+///
+/// The mode alone is not enough. Claude Code gates `bypassPermissions` on a
+/// consent record — `skipDangerousModePermissionPrompt: true` in user settings —
+/// and silently downgrades to `default` without it. A write that produced only
+/// `defaultMode` would look successful in the UI and leave the user still being
+/// prompted, which is the exact failure this test exists to prevent.
+#[tokio::test]
+async fn choosing_bypass_writes_the_mode_and_its_consent_key() {
+    let iso = isolate_with_home("claude-bypass", Some("tok"), true).await;
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, body) = post_rpc(
+        app,
+        "apply_claude_config",
+        &json!({ "body": { "permission_mode": "bypassPermissions" } }).to_string(),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let doc = read_claude_settings(&iso.dir);
+    assert_eq!(doc["permissions"]["defaultMode"], "bypassPermissions");
+    assert_eq!(
+        doc["skipDangerousModePermissionPrompt"], true,
+        "the consent key is what keeps the mode from being downgraded"
+    );
+    // The gateway wiring is written even on a mode-only apply: the file has to
+    // be usable afterwards, and the user did not ask to unset the base URL.
+    assert!(
+        doc["env"]["ANTHROPIC_BASE_URL"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("http://127.0.0.1:"),
+        "base URL must still be written: {doc}"
+    );
+}
+
+/// A model-only apply must not silently reset a permission mode the operator
+/// chose in the CLI. Only the four model ids were sent, so the mode is not ours
+/// to touch — writing one would rewrite a setting the user never mentioned in
+/// this click.
+#[tokio::test]
+async fn a_model_only_apply_leaves_the_permission_mode_alone() {
+    let iso = isolate_with_home("claude-model-only", Some("tok"), true).await;
+    seed_claude_settings(
+        &iso.dir,
+        &json!({
+            "permissions": { "defaultMode": "plan", "allow": ["Bash(git *)"] },
+            "env": { "ANTHROPIC_MODEL": "old" },
+        }),
+    );
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, body) = post_rpc(
+        app,
+        "apply_claude_config",
+        &json!({ "body": { "model": "deepseek-v4.1-flash" } }).to_string(),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let doc = read_claude_settings(&iso.dir);
+    assert_eq!(doc["env"]["ANTHROPIC_MODEL"], "deepseek-v4.1-flash");
+    assert_eq!(
+        doc["permissions"]["defaultMode"], "plan",
+        "a model-only apply must not touch the mode"
+    );
+    assert_eq!(
+        doc["permissions"]["allow"][0], "Bash(git *)",
+        "hand-written allow rules must survive"
+    );
+}
+
+/// A body with neither models nor a mode is still rejected, with the message
+/// the UI shows. This used to be the only arm; it must keep working now that a
+/// mode is a second way to have something to write.
+#[tokio::test]
+async fn an_empty_apply_is_still_rejected() {
+    let iso = isolate_with_home("claude-empty-apply", Some("tok"), true).await;
+    let _ = &iso.dir;
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    for body in [
+        json!({ "body": {} }),
+        json!({ "body": { "model": "  " } }),
+        json!({ "body": { "permission_mode": "" } }),
+    ] {
+        let (status, resp) = post_rpc(
+            app.clone(),
+            "apply_claude_config",
+            &body.to_string(),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {resp}");
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("未指定"),
+            "the rejection must name the problem: {resp}"
+        );
+    }
+}
+
+/// An unknown mode is refused rather than written. Claude Code ignores a value
+/// it does not recognise and falls back to its built-in default, so accepting
+/// one here would be a "successful" write that changed nothing.
+#[tokio::test]
+async fn an_unknown_permission_mode_is_refused_and_writes_nothing() {
+    let iso = isolate_with_home("claude-bad-mode", Some("tok"), true).await;
+    let before = json!({
+        "permissions": { "defaultMode": "auto" },
+        "env": { "ANTHROPIC_MODEL": "keep-me" },
+    });
+    seed_claude_settings(&iso.dir, &before);
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, resp) = post_rpc(
+        app,
+        "apply_claude_config",
+        &json!({ "body": { "permission_mode": "bypass" } }).to_string(),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(
+        read_claude_settings(&iso.dir),
+        before,
+        "a rejected write must leave the file byte-identical in meaning"
+    );
+}
+
+/// `get_claude_config` reports the mode it reads, so the form can show the
+/// file's real state instead of the last click.
+#[tokio::test]
+async fn get_claude_config_reports_the_permission_mode() {
+    let iso = isolate_with_home("claude-read-mode", Some("tok"), true).await;
+    seed_claude_settings(
+        &iso.dir,
+        &json!({
+            "permissions": { "defaultMode": "bypassPermissions" },
+            "skipDangerousModePermissionPrompt": true,
+            "env": { "ANTHROPIC_MODEL": "m" },
+        }),
+    );
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, body) = post_rpc(app, "get_claude_config", "{}", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["permission_mode"], "bypassPermissions");
+    assert_eq!(body["result"]["skip_dangerous_prompt"], true);
+    assert_eq!(body["result"]["env"]["ANTHROPIC_MODEL"], "m");
 }

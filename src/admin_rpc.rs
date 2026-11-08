@@ -693,6 +693,12 @@ async fn export_ack(state: &Arc<AdminState>, args: &Value) -> Result<Value> {
 }
 
 /// Write the Claude Code configuration, honouring the fields the form sent.
+///
+/// Two independent halves: the model slots (UI's four model fields) and the
+/// permission mode. Either alone is a valid apply — an operator who only wants
+/// to stop the permission prompts must not have to re-send the same model ids,
+/// and one who only wants to change the model must not be pushed into
+/// `bypassPermissions`.
 fn apply_claude_config(state: &Arc<AdminState>, body: Value) -> Result<Value> {
     let base_url = format!("http://127.0.0.1:{}", state.process.port());
     let mut updates = Vec::new();
@@ -715,11 +721,23 @@ fn apply_claude_config(state: &Arc<AdminState>, body: Value) -> Result<Value> {
             });
         }
     }
-    if updates.is_empty() {
-        bail!("未指定任何模型");
+
+    // Absent means "leave the mode alone"; `""` is the form's explicit
+    // "follow Claude Code's default" choice and is also a no-op on disk. The
+    // two are distinguished from a real mode so a model-only apply cannot
+    // reset a mode the operator chose in the CLI.
+    let permission_mode = body
+        .get("permission_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if updates.is_empty() && permission_mode.is_none() {
+        bail!("未指定任何模型或权限模式");
     }
-    let value = crate::claude_config::apply_slots(&updates, &base_url)
-        .map_err(|e| anyhow!("写入 Claude 配置失败: {e}"))?;
+    let value =
+        crate::claude_config::apply_slots_with_permission(&updates, &base_url, permission_mode)
+            .map_err(|e| anyhow!("写入 Claude 配置失败: {e}"))?;
     Ok(value)
 }
 

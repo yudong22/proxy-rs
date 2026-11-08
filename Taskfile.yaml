@@ -74,20 +74,32 @@ tasks:
   # spirit, not in `deps:` — it must stay in the foreground, so `deps:` would
   # block `ui-dev` from ever starting.)
   #
-  # ## The port lives here, in one place
+  # ## Ports
   #
-  # The desktop runs **two** listeners: the data plane (`port`, serves
-  # `/api/*`) and the console (`port + 1`, serves `/admin/*`). `ui-dev` has to
-  # proxy each prefix to its own port, so both sides must agree on the number.
+  #   生产 (prod) — the installed desktop app, on `PROD_PORT` (3457). It runs
+  #                  **two** listeners: the data plane (`port`, `/api/*`) and
+  #                  the console (`port + 1`, `/admin/*`), so `ui-dev` proxies
+  #                  each prefix to its own port.
+  #   测试 (dev)  — the gateway `dev-server` starts, at `PROD_PORT + 1000`
+  #                  (4457). Deliberately far from the app's number and from
+  #                  `port + 1`, so the two backend pairs stay easy to tell
+  #                  apart in a port listing. Its single listener serves both
+  #                  `/api/*` and `/admin/*` (`router::with_admin`).
+  #
+  # `DEV_PORT_OFFSET` is the one place the +1000 lives; `vite.config.js` uses
+  # the same offset from the same `PROD_PROXY_PORT`, so the two cannot drift.
+  # They did once — both sides were 3457 — and 测试 silently proxied to the
+  # installed app's data port: the page loaded, and every login 404'd.
   #
   # The gateway reads its port from `$PROXY_DATA_DIR/gui-settings.json`, which
   # is why this task writes that file before starting: otherwise a stale value
-  # in `~/.proxy-rs-dev` (or the default 3456) silently disagreed with what
-  # vite.config.js proxied to, and half the console 404'd.
+  # in `~/.proxy-rs-dev` would disagree with what vite.config.js proxies to.
   dev-server:
     desc: Run the headless gateway locally for `task ui-dev` (builds the server once)
     vars:
-      PROXY_PORT: '3457'
+      PROD_PORT: '3457'
+      DEV_PORT_OFFSET: '1000'
+      PROXY_PORT: '{{add .PROD_PORT .DEV_PORT_OFFSET}}'
     cmds:
       - cargo build --bin proxy-rs-server
       - |
@@ -104,17 +116,19 @@ tasks:
           fs.writeFileSync(p, JSON.stringify(s, null, 2) + "\n");
         ' "$DEV_DIR/gui-settings.json" {{.PROXY_PORT}}
         echo "🧪 proxy    : http://127.0.0.1:{{.PROXY_PORT}}  (/api/*)"
-        echo "🧪 console  : http://127.0.0.1:{{add .PROXY_PORT 1}}  (/admin/*)"
+        echo "🧪 console  : http://127.0.0.1:{{.PROXY_PORT}}  (/admin/*, same listener)"
+        echo "🚀 prod app : http://127.0.0.1:{{.PROD_PORT}}  (/api/*), console {{add .PROD_PORT 1}}"
         PROXY_DATA_DIR="$DEV_DIR" PROXY_API_TOKEN=dev ./target/debug/proxy-rs-server
 
   ui-dev:
     desc: UI hot-reload loop; switch 测试/生产 backend from the DEV badge in the page
     vars:
-      # Keep in step with dev-server's PROXY_PORT. `ui-dev` only proxies; it
-      # does not start the gateway, so the two tasks cannot share a var.
-      PROXY_PORT: '3457'
       # The installed desktop app's data plane. Its console is one port up.
       PROD_PORT: '3457'
+      # dev-server's port: `PROD_PORT + DEV_PORT_OFFSET`. Keep the offset in
+      # step with dev-server and with `vite.config.js`.
+      DEV_PORT_OFFSET: '1000'
+      PROXY_PORT: '{{add .PROD_PORT .DEV_PORT_OFFSET}}'
     cmds:
       - |
         DEV_PROXY_PORT={{.PROXY_PORT}} PROD_PROXY_PORT={{.PROD_PORT}} \

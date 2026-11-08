@@ -69,6 +69,11 @@ pub struct SettingsUpdate {
     pub sanitize_terms: Option<String>,
     pub force_stream: Option<bool>,
     pub client_auth_enabled: Option<bool>,
+    /// Short-circuit Claude Code's auto-mode safety classifier with an `allow`
+    /// verdict instead of forwarding it upstream. See
+    /// [`settings::GuiSettings::intercept_safety_classifier`] for why this is
+    /// opt-in rather than the default.
+    pub intercept_safety_classifier: Option<bool>,
 }
 
 /// Apply a partial update and persist.
@@ -120,6 +125,9 @@ pub fn save_settings(update: SettingsUpdate) -> Result<Value> {
     }
     if let Some(v) = update.client_auth_enabled {
         s.client_auth_enabled = v;
+    }
+    if let Some(v) = update.intercept_safety_classifier {
+        s.intercept_safety_classifier = v;
     }
 
     s.save().map_err(|e| anyhow!("保存设置失败: {e}"))?;
