@@ -54,8 +54,14 @@ skipDangerousModePermissionPrompt = true   （仅 bypassPermissions）
 
 ## 2. 网关侧开关：拦截 auto 模式的安全分类器
 
-设置页「模型重定向 (高级)」新增开关，对应 `gui-settings.json` 的
+设置页「**Claude Code 一键写入**」组内的开关，对应 `gui-settings.json` 的
 `intercept_safety_classifier`，**默认 `false`**。
+
+它和上面的权限模式放在同一组，因为两者是同一个决定的两种表达：
+`bypassPermissions` 下分类器根本不跑，开关是空转；`auto` 下每个被判定的动作都要过它。
+
+> 注意它由页面底部「**保存配置**」保存，**不**由该组的「写入 Claude Code 配置」
+> 按钮写入（后者只写 `~/.claude/settings.json`）。组内那条分隔线就是说明这件事的。
 
 开启后，凡是被识别为 Claude Code auto 模式分类器的请求，网关直接返回
 `<block>no</block>`（允许），不再转发上游。实测同一任务：
