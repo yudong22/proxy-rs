@@ -335,6 +335,17 @@ mod tests {
 
     #[test]
     fn plist_captures_process_output_outside_the_apps_own_log() {
+        // `process_log_path` / `log_file_path` resolve through
+        // `data_dir()` → `home_dir()`, which are process-global. Tests in
+        // `settings` mutate `HOME`/`USERPROFILE` (one deliberately sets both to
+        // "" to prove `home_dir()` returns `None`) while holding
+        // `data_dir_test_lock`, so a reader that does not take the same lock can
+        // observe `None` and panic on the `.expect()` below — a failure that
+        // depends on thread interleaving and therefore shows up on a fast CI
+        // runner, not on a developer machine. The three other readers of
+        // `data_dir()` in tests take this lock; this one did not.
+        let _guard = crate::settings::data_dir_test_lock();
+
         // launchd's stdout/stderr redirection does not take `LogBuffer`'s write
         // mutex, so sharing `proxy.log` lets the OS splice a write into the
         // middle of a line the app is writing. The two files must stay distinct.
