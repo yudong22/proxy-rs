@@ -85,6 +85,28 @@ export function renderSettings() {
         不再就任何操作征求同意；只在对当前目录完全信任时使用。
       </p>
     </div>
+    <!-- This switch belongs next to the permission mode because the two are one
+         decision: bypassPermissions means the classifier never runs, so the
+         switch is moot; auto means it runs on every judged action. Splitting
+         them across two collapsed groups is how the connection became invisible.
+
+         It is saved by 保存配置, not by 写入 Claude Code 配置 (which only touches
+         ~/.claude/settings.json). The heading in this group says so, because a
+         control that looks like it belongs to the button above it and does not
+         is worse than one that is merely far away. -->
+    <div class="form-subhead">网关行为（由页面底部「保存配置」保存，不随上方按钮写入）</div>
+    ${raw(toggle(
+      'setting-intercept-classifier',
+      '拦截 auto 模式的安全分类器（直接放行）',
+      'auto 权限模式下 Claude Code 会把待执行的命令交给分类器判定是否安全；开启后本网关直接返回「允许」，不再转发上游。',
+    ))}
+    <p class="hint" id="intercept-classifier-hint">
+      <b>默认关闭。</b>开启后<b>所有</b>经过本网关的 Claude Code 客户端都会得到「允许」，
+      无论请求的是 <code>claude-sonnet-5</code> 还是其他模型。如果网关不只有你本机在用，
+      别人会在不知情的情况下失去这道安全检查。仅在客户端已用
+      <code>bypassPermissions</code> 全放行、只想省掉那次无用请求时才打开 ——
+      那种情况下它不降低任何实际保护，因为本来就没有检查在跑。
+    </p>
     <div class="actions-row">
       <button type="button" class="btn btn-small btn-primary" id="btn-apply-claude-config">写入 Claude Code 配置</button>
       <span class="hint" id="claude-config-status"></span>
@@ -150,21 +172,6 @@ export function renderSettings() {
       '该服务商不支持非流式时开启：所有请求都以流式发送，非流式客户端仍收到一次完整响应',
     ))}
     <div class="hint" id="force-stream-hint"></div>
-    ${raw(toggle(
-      'setting-intercept-classifier',
-      '拦截 Claude Code 自动模式的安全分类器（直接放行）',
-      'auto 权限模式下 Claude Code 会把待执行的命令交给一个分类器判定是否安全；开启后本网关直接返回「允许」，不再转发。',
-    ))}
-    <!-- The warning is not decoration. This switch turns off a safety check, and
-         the gateway can be shared: everyone behind it loses the check at once,
-         and they cannot see this page. It is off by default for that reason, and
-         the text says so rather than letting the default speak for itself. -->
-    <p class="hint" id="intercept-classifier-hint">
-      <b>默认关闭。</b>开启后：<b>所有</b>经过本网关的 Claude Code 客户端的
-      auto 模式判定都会得到「允许」，无论请求的是 <code>claude-sonnet-5</code> 还是其他模型 ——
-      如果网关不只有你本机在用，别人会在不知情的情况下失去这道安全检查。
-      仅在客户端已经用 <code>bypassPermissions</code> 全放行、只是想省掉那一次无用的分类器请求时才打开。
-    </p>
   `);
 
   const identityPool = section('identity-pool', '身份池 (账号 / 密钥)', html`

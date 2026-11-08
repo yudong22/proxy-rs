@@ -67,7 +67,7 @@ import {
 import { checkOverviewLayout } from './smoke/scenarios-overview.mjs';
 import { checkBootstrapPage } from './smoke/scenarios-bootstrap.mjs';
 import { checkEveryPaneRenders } from './smoke/scenarios-pages.mjs';
-import { checkClaudePermissionMode } from './smoke/scenarios-claude-permission.mjs';
+import { checkClaudePermissionMode, checkClassifierSwitchPlacement } from './smoke/scenarios-claude-permission.mjs';
 import { checkEmptyStates, checkEmptySessionList } from './smoke/scenarios-states.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -333,6 +333,7 @@ try {
   // After "every pane", which leaves the console on a freshly loaded document
   // with the default bridge — the state this scenario edits the settings form in.
   await scenario('claude permission mode', () => checkClaudePermissionMode({ send, check }));
+  await scenario('classifier switch placement', () => checkClassifierSwitchPlacement({ send, check }));
 
   if (runtimeErrors.length) {
     failures.push(`runtime console errors:\n      ${runtimeErrors.join('\n      ')}`);

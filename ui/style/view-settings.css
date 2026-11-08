@@ -127,6 +127,21 @@ details.form-section[open] > summary {
   margin-bottom: 10px;
 }
 
+/* A sub-heading inside a group, separating controls that are saved by a
+   *different* button than the rest of that group. The Claude Code group's own
+   button writes `~/.claude/settings.json`; the switch under this heading is
+   gateway state saved by the page-level 保存配置 instead. Without a visible
+   divider, a control sitting right above one button reads as belonging to it —
+   which here would mean clicking the wrong one and seeing nothing happen. */
+.form-subhead {
+  margin: 14px 0 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, #d8d8dc);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted, #6e6e73);
+}
+
 .form-group:last-child {
   margin-bottom: 0;
 }

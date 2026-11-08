@@ -34,6 +34,10 @@ const SECTION_FIELDS = {
     'setting-claude-opus',
     'setting-claude-haiku',
     'setting-claude-permission-mode',
+    // Moved here with the control itself: the badge must follow the group the
+    // switch is rendered in, or toggling it would badge 高级 — a group whose
+    // save button does not save it.
+    'setting-intercept-classifier',
   ],
   codex: [],
   advanced: [
@@ -42,7 +46,6 @@ const SECTION_FIELDS = {
     'setting-model-map',
     'setting-sanitize-terms',
     'setting-force-stream',
-    'setting-intercept-classifier',
   ],
 };
 

@@ -89,3 +89,66 @@ export async function checkClaudePermissionMode(ctx) {
   check(`claude permission: success is reported on the page`,
     /写入/.test(after.status), true);
 }
+
+/**
+ * The classifier switch must live in the Claude Code group and be saved by the
+ * page-level 保存配置 button — not by the group's own 写入 button.
+ *
+ * Both halves are the point. The switch reads as "Claude Code behaviour", so it
+ * belongs beside the permission mode; but it writes gateway state, so a user who
+ * clicks 写入 Claude Code 配置 and sees nothing change has been misled by the
+ * layout. This pins the placement *and* the saving route, because moving the
+ * control without checking which button submits it is exactly the mistake that
+ * put it in the wrong group to begin with.
+ */
+export async function checkClassifierSwitchPlacement(ctx) {
+  const { send, check } = ctx;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const evaluate = async (expression) => {
+    const r = await send('Runtime.evaluate', { returnByValue: true, expression });
+    return r.result.value;
+  };
+
+  await send('Runtime.evaluate', { expression: `window.switchTab('settings')` });
+  await sleep(600);
+
+  const where = await evaluate(`(() => {
+    const sw = document.getElementById('setting-intercept-classifier');
+    if (!sw) return { found: false };
+    const group = sw.closest('.form-section');
+    return {
+      found: true,
+      group: group ? group.dataset.section : null,
+      // Is it below the divider that says which button saves it?
+      afterSubhead: Boolean(sw.closest('.form-section-body')?.querySelector('.form-subhead')),
+      // The Claude group's own button must NOT be the one that submits it.
+      claudeButtonExists: Boolean(document.getElementById('btn-apply-claude-config')),
+      hintPresent: Boolean(document.getElementById('intercept-classifier-hint')),
+    };
+  })()`);
+
+  check(`classifier switch: lives in the Claude group`, where.group, 'claude');
+  check(`classifier switch: sits under the "保存配置 saves this" divider`,
+    where.afterSubhead, true);
+  check(`classifier switch: keeps its warning text`, where.hintPresent, true);
+
+  // Drive the page-level save and prove the switch travels with it.
+  await evaluate(`(() => {
+    const sw = document.getElementById('setting-intercept-classifier');
+    sw.checked = true;
+    sw.dispatchEvent(new Event('change', { bubbles: true }));
+    document.getElementById('btn-save-settings').click();
+  })()`);
+  await sleep(800);
+
+  const sent = await evaluate(`window.__INVOKE_ARGS__['save_settings'] || null`);
+  check(`classifier switch: 保存配置 carries it`,
+    sent && sent.body ? sent.body.intercept_safety_classifier : '<no save call>', true);
+
+  // And the group's own button must not send it — it has no business writing it.
+  const claudeCall = await evaluate(`window.__INVOKE_ARGS__['apply_claude_config'] || null`);
+  check(`classifier switch: 写入 Claude 配置 does NOT carry it`,
+    claudeCall === null || claudeCall.body === undefined
+      ? true
+      : !('intercept_safety_classifier' in claudeCall.body), true);
+}
