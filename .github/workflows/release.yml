@@ -84,8 +84,44 @@ jobs:
       # directly (not through npm's `build`/`build:dmg` scripts) because those
       # bake in `-b app`, which only macOS understands. `--bundles` is passed
       # explicitly on both legs so neither depends on `tauri.conf.json`.
+      #
+      # ## Why this retries
+      #
+      # The Windows leg's last step is *not* compilation — it is the bundler
+      # downloading its WiX toolchain from a GitHub release asset
+      # (`wix314-binaries.zip`). That download is the only part of the job that
+      # depends on a third party being up, and on v3.5.3 it failed four times in
+      # a row with `failed to bundle project: http status: 502/503/504` while
+      # `cargo` had already printed `Finished release profile in 6m 52s`. The
+      # Rust build was complete and correct every time; only the download died.
+      #
+      # A transient 5xx from the asset CDN is not a defect in this repository, so
+      # failing the release on the first one is wrong — worse, it blocks the
+      # whole `release` job (it `needs` this matrix), so the macOS and Linux
+      # artifacts that *did* build are never published. Retrying the command is
+      # enough: cargo's own artifacts are cached, so an attempt after a failed
+      # download resumes near the bundling step rather than recompiling.
+      #
+      # `-b app`/`--bundles` make a re-run safe: the bundler overwrites its
+      # output directory, and `upload-artifact` runs only after a success.
       - name: Build desktop app and installer
-        run: npx tauri build --target ${{ matrix.target }} ${{ matrix.build_args }}
+        run: |
+          set -eu
+          attempt=1
+          max=4
+          while :; do
+            if npx tauri build --target ${{ matrix.target }} ${{ matrix.build_args }}; then
+              exit 0
+            fi
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::tauri build failed after $max attempts"
+              exit 1
+            fi
+            echo "::warning::tauri build attempt $attempt failed (bundler toolchain download); retrying in 30s"
+            attempt=$((attempt + 1))
+            sleep 30
+          done
+        shell: bash
 
       - uses: actions/upload-artifact@v4
         with:
