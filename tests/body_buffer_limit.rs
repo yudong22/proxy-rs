@@ -27,7 +27,7 @@ use proxy_rs::{
     metrics,
     router::build_app_router,
     service::ServiceController,
-    settings::LogBuffer,
+    settings::{self, LogBuffer},
     stats::{RequestLogFilter, StatsDb},
     util::MAX_BODY_ENV,
 };
@@ -41,6 +41,50 @@ use tower::ServiceExt;
 /// inherit that cap and fail for a reason that has nothing to do with what it
 /// asserts, so the whole file runs one test at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// One test's isolated view of the process-global state, held until it ends.
+///
+/// An integration test is its own crate, so the `cfg!(test)` redirects inside
+/// `src/settings.rs` — the per-process temp log file, the temp data dir — do
+/// **not** apply here: those branches are compiled out of the library this file
+/// links against. Without this guard the handlers under test append their
+/// synthetic `/v1/messages` traffic to the developer's real
+/// `~/.proxy-rs/logs/proxy.log` (measured: it grew on every run) and
+/// `data_dir()` happily `create_dir_all`s the real `~/.proxy-rs`. A test that
+/// writes into the user's live state directory is not isolated by any definition
+/// worth the word, so both are redirected here.
+struct Isolated {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for Isolated {
+    fn drop(&mut self) {
+        std::env::remove_var("PROXY_DATA_DIR");
+        // Leave the temp dir behind on failure, where it is useful; remove it on
+        // success so repeated runs do not accumulate directories.
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+async fn isolate(name: &str) -> Isolated {
+    let guard = SERIAL.lock().await;
+    let dir =
+        std::env::temp_dir().join(format!("proxy-rs-body-limit-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    // `data_dir()` re-reads this on every call, so the override also covers the
+    // `create_dir_all` inside it.
+    std::env::set_var("PROXY_DATA_DIR", &dir);
+    settings::set_log_file_override_for_tests(dir.join("proxy.log"));
+    // The repository's `.env` is the first candidate for every configuration
+    // lookup, and a developer's copy holds a real upstream URL and key. None of
+    // these tests may depend on it.
+    proxy_rs::env::set_dotenv_override_for_tests(None);
+    Isolated { _guard: guard, dir }
+}
 
 /// The router with the service deliberately stopped.
 ///
@@ -115,7 +159,7 @@ fn stored_rows(stats: &Arc<StatsDb>) -> i64 {
 /// This is the control: the route is otherwise healthy.
 #[tokio::test]
 async fn small_body_parses_and_reaches_the_service_check() {
-    let _guard = SERIAL.lock().await;
+    let _iso = isolate("small-body").await;
     let (app, _logs, _stats) = router();
     let response = app
         .oneshot(post_messages(Body::from(body_of_size(16))))
@@ -129,7 +173,7 @@ async fn small_body_parses_and_reaches_the_service_check() {
 /// configured cap, so it must parse rather than be rejected.
 #[tokio::test]
 async fn body_over_the_old_two_megabyte_default_is_accepted() {
-    let _guard = SERIAL.lock().await;
+    let _iso = isolate("old-default").await;
     let (app, _logs, _stats) = router();
     let response = app
         .oneshot(post_messages(Body::from(body_of_size(3 * 1024 * 1024))))
@@ -153,7 +197,7 @@ async fn body_over_the_configured_cap_is_a_413_that_explains_itself() {
     // pins a small one instead of moving 32 MiB through memory. Env vars are
     // process-wide, so the override is serialised and always removed again —
     // even if an assertion below fails.
-    let _guard = SERIAL.lock().await;
+    let _iso = isolate("configured-cap").await;
     std::env::set_var(MAX_BODY_ENV, "4096");
     let (app, logs, stats) = router();
 
@@ -204,7 +248,7 @@ async fn body_over_the_configured_cap_is_a_413_that_explains_itself() {
 /// "Failed to buffer the request body" with nothing recorded.
 #[tokio::test]
 async fn aborted_body_read_is_visible_and_distinct_from_a_parse_error() {
-    let _guard = SERIAL.lock().await;
+    let _iso = isolate("aborted-read").await;
     let (app, logs, stats) = router();
     let broken = stream::once(async {
         Err::<Bytes, std::io::Error>(std::io::Error::new(
@@ -238,7 +282,7 @@ async fn aborted_body_read_is_visible_and_distinct_from_a_parse_error() {
 /// and which field set it failed to satisfy.
 #[tokio::test]
 async fn malformed_json_is_a_bad_request_that_names_the_route() {
-    let _guard = SERIAL.lock().await;
+    let _iso = isolate("malformed-json").await;
     let (app, logs, stats) = router();
     let response = app
         .oneshot(post_messages(Body::from("{ not json")))
@@ -271,7 +315,7 @@ async fn malformed_json_is_a_bad_request_that_names_the_route() {
 /// axum's 422, and that must stay distinct from a syntax error's 400.
 #[tokio::test]
 async fn wrong_shape_is_a_422_not_a_400() {
-    let _guard = SERIAL.lock().await;
+    let _iso = isolate("wrong-shape").await;
     let (app, _logs, stats) = router();
     // Valid JSON, wrong types: `messages` is not an array of messages.
     let response = app
@@ -295,6 +339,7 @@ async fn wrong_shape_is_a_422_not_a_400() {
 /// being flattened to 400 by the `Transform` catch-all.
 #[tokio::test]
 async fn missing_json_content_type_keeps_its_415() {
+    let _iso = isolate("content-type").await;
     let (app, _logs, _stats) = router();
     let response = app
         .oneshot(

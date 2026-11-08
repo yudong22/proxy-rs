@@ -46,6 +46,32 @@ jobs:
       - name: Test
         run: cargo test
 
+      # Version consistency + lockfile self-consistency, as its own step so a
+      # bump that forgets a file is a *named* red step rather than a line buried
+      # in `cargo test` output.
+      #
+      # `release_consistency` is a **text-level** guard: it reads the version
+      # declarations out of `Cargo.toml`, `src-tauri/Cargo.toml`,
+      # `src-tauri/tauri.conf.json`, `package.json` and both lockfiles and
+      # asserts they agree. It has to work that way here — the desktop GUI crate
+      # (`src-tauri`) does not compile on this Linux runner because `webkit2gtk`
+      # and the other Tauri system libraries are not installed, so the guard
+      # cannot `use` it to read `CARGO_PKG_VERSION`. It is also not reachable via
+      # `--workspace` for the same reason: the workspace member would fail to
+      # build. That is precisely why the version drift behind v3.5.2 was
+      # invisible to CI — the dmg said 3.5.2 while the binary inside reported
+      # 3.5.1 and nothing failed. Reading the files as text is what closes that
+      # hole on every platform.
+      #
+      # `cargo metadata --locked` is the second half: it fails when a manifest
+      # was changed without committing the matching `Cargo.lock` (the "bump
+      # Cargo.toml, forget the lock" mistake, which `cargo test` alone tolerates
+      # by silently rewriting the lockfile in the working copy).
+      - name: Version declarations agree and Cargo.lock is in sync
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo test --test release_consistency -- --nocapture
+
       # The lib tests mutate process-global environment (`HOME`,
       # `PROXY_DATA_DIR`) and therefore rely on locks to serialise. A lock that
       # was accidentally split let two tests race for months: it passed locally

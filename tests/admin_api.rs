@@ -88,6 +88,20 @@ async fn isolate_with_home(name: &str, token: Option<&str>, relocate_home: bool)
     // The session browser must never read the real home in a test.
     std::env::set_var("CLAUDE_PROJECTS_DIR", dir.join("claude-projects"));
     settings::set_log_file_override_for_tests(dir.join("proxy.log"));
+    // Close the `.env` hole once, here, for the whole file.
+    //
+    // `settings::data_dir()` is redirected above, and `env::load_dotenv_file`
+    // asks it for the `.env` location — but that is not enough on its own. The
+    // *first* candidate is the repository's own `.env` in the working directory,
+    // and `dotenv_values()` caches whatever it found on the first lookup in the
+    // process. A developer with `PROXY_API_TOKEN` in either file therefore turns
+    // every "no token is configured" case in this file into a 401 instead of the
+    // expected 503/403. That reads as a logic bug in the gate, so it is closed
+    // explicitly rather than inferred from the data dir.
+    //
+    // `None` means "read no `.env` at all": the process environment remains the
+    // only source, which is exactly what these tests set per case.
+    proxy_rs::env::set_dotenv_override_for_tests(None);
     match token {
         Some(t) => std::env::set_var(TOKEN_ENV, t),
         None => std::env::remove_var(TOKEN_ENV),
@@ -1747,6 +1761,9 @@ async fn the_desktop_registers_its_host_process_capabilities() {
             stops_c.fetch_add(1, Ordering::SeqCst);
             Ok("stopped".into())
         })),
+        // A server build has no restartable listener, so the save-and-rebuild
+        // path reports the systemd wording instead of pretending to restart.
+        restart_service: None,
         open_logs_dir: None,
         reveal_path: None,
         status: None,

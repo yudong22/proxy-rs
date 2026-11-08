@@ -65,6 +65,11 @@ async fn isolate(name: &str) -> Isolated {
     std::fs::create_dir_all(&dir).expect("temp dir");
     std::env::set_var("PROXY_DATA_DIR", &dir);
     settings::set_log_file_override_for_tests(dir.join("proxy.log"));
+    // The inbound gate reads `PROXY_CLIENT_AUTH` through the `.env`-aware lookup,
+    // so a developer's `.env` could switch the very gate these tests configure
+    // explicitly — a failing assertion would then describe leaked file content,
+    // not the wiring under test.
+    proxy_rs::env::set_dotenv_override_for_tests(None);
     Isolated { _guard: guard, dir }
 }
 

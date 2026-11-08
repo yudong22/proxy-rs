@@ -74,6 +74,17 @@ async fn isolate(name: &str) -> Isolated {
     // redirects the scheduler state file too — including through the handler.
     std::env::set_var("PROXY_DATA_DIR", &dir);
     settings::set_log_file_override_for_tests(dir.join("proxy.log"));
+    // A `.env` is a second, undeclared input to the very thing under test.
+    //
+    // `PROXY_API_TOKEN` is read through `env::value`, which looks in `.env`
+    // *before* the process environment. The repository root has one on a
+    // developer machine, and the home directory has another, so
+    // `run_route_is_refused_when_no_token_is_configured` would authenticate
+    // against a token neither this test nor the assertion ever mentions — and
+    // would fail with 401 where it expects the "mutation disabled" 403. The
+    // override is process-global, so it is set once per test under this lock and
+    // never reverted: no test in this binary may read a real `.env`.
+    proxy_rs::env::set_dotenv_override_for_tests(None);
     Isolated { _guard: guard, dir }
 }
 

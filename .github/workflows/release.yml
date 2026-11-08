@@ -1,8 +1,13 @@
 name: Release
 
+# Only `v*` tags publish. The pattern used to be `*`, so *any* tag — a
+# throwaway marker, a date, a `test-...` tag someone pushed to see the workflow
+# run — created a public GitHub Release with installers attached. Version tags
+# are the only ones this repository uses for releasing (`v3.5.2`, ...), so the
+# trigger matches that and nothing else.
 on:
   push:
-    tags: ["*"]
+    tags: ["v*"]
 
 permissions:
   contents: write
@@ -320,6 +325,94 @@ jobs:
             echo "::error::没有收集到任何安装包，检查构建产物路径"
             exit 1
           fi
+
+      # The two version gates that v3.5.2 needed and did not have.
+      #
+      # v3.5.2 shipped a `.dmg` whose `Info.plist` said 3.5.2 while the binary
+      # inside reported 3.5.1 — the console header showed **v3.5.1**. Nothing
+      # failed anywhere: the bundle built from `tauri.conf.json`, the console
+      # label came from `src-tauri/Cargo.toml` via `env!("CARGO_PKG_VERSION")`,
+      # and the two files had silently drifted. This step runs *before* the
+      # release is created, so the run goes red instead of publishing a package
+      # that misreports itself.
+      #
+      #   1. `v$version` must equal the tag. A tag that does not match the code it
+      #      points at is the same class of lie one level up.
+      #   2. `tauri.conf.json` (what the installer is named/stamped) must equal
+      #      `src-tauri/Cargo.toml` (what the binary inside reports).
+      #
+      # `node` is on the runner (setup-node is not needed for this: the ubuntu
+      # image ships node, and the other jobs already rely on it). Reading JSON
+      # with node avoids `jq` assumptions.
+      #
+      # Note this gate is *this job's* last line of defence. The same equality is
+      # also asserted on every push by `tests/release_consistency.rs`, which is
+      # where the drift should be caught — this one exists because a release can
+      # be built from a commit that never ran CI.
+      - name: Verify the tag matches the version being packaged
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # The whole check is one node program, so there is no shell string
+          # handling between reading the files and comparing them: no command
+          # substitution, no `$(...)`-inside-heredoc parsing, nothing to quote.
+          # It exits non-zero on either mismatch, which fails the job before
+          # `Create release` runs.
+          node - <<'NODE'
+          const fs = require('fs');
+
+          const ref = process.env.REF_NAME || '';
+          const fail = (msg) => {
+            console.error(`::error::${msg}`);
+            process.exit(1);
+          };
+
+          const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+          if (!conf.version) {
+            fail('src-tauri/tauri.conf.json 没有 version 字段，无法校验发布版本');
+          }
+
+          // Only the `[package]` table carries the crate's own version; a
+          // dependency's `version = "1.0"` must not be mistaken for it.
+          const toml = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+          const pkgTable = toml.split(/^\[package\]$/m)[1];
+          if (!pkgTable) {
+            fail('src-tauri/Cargo.toml 没有 [package] 表，无法校验 GUI crate 版本');
+          }
+          const beforeNextTable = pkgTable.split(/^\[/m)[0];
+          const m = beforeNextTable.match(/^\s*version\s*=\s*"([^"]+)"/m);
+          if (!m) {
+            fail('src-tauri/Cargo.toml 的 [package] 表没有 version');
+          }
+
+          const packaged = conf.version;
+          const consoleVersion = m[1];
+
+          console.log(`tag              = ${ref}`);
+          console.log(`tauri.conf.json  = ${packaged}`);
+          console.log(`src-tauri crate  = ${consoleVersion}`);
+
+          // (2) The pair that drifted in v3.5.2: the installer version and the
+          // version the binary inside reports about itself.
+          if (consoleVersion !== packaged) {
+            fail(
+              `src-tauri/tauri.conf.json (${packaged}) 与 src-tauri/Cargo.toml ` +
+                `(${consoleVersion}) 版本不一致。安装包版本取前者，控制台显示的版本由后者经 ` +
+                `env!(CARGO_PKG_VERSION) 编进二进制 —— v3.5.2 就是这个事故：` +
+                `dmg 是 3.5.2，控制台显示 v3.5.1。`
+            );
+          }
+
+          // (1) The tag must name the version the artifacts carry.
+          if (`v${packaged}` !== ref) {
+            fail(
+              `tag ${ref} 与 src-tauri/tauri.conf.json 的 version ${packaged} 不匹配` +
+                `（期望 tag v${packaged}）。请先统一版本再打 tag。`
+            );
+          }
+
+          console.log(`版本闸门通过：tag、安装包版本、GUI crate 版本三者一致 (${ref})`);
+          NODE
 
       - name: Create release
         env:

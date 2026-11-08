@@ -18,11 +18,13 @@
 //!
 //! ## What is registered
 //!
-//! Exactly the four capabilities that are process/OS state rather than
+//! Exactly the five capabilities that are process/OS state rather than
 //! business logic:
 //!
 //! * start / stop the service (they control the very listener that serves the
 //!   console — a self-locking call over HTTP would need a separate channel)
+//! * restart the service, which is how a saved setting reaches the running
+//!   router (`Config` is a snapshot taken at listener build time)
 //! * open the log directory / reveal a path in the file manager
 //!
 //! Everything else (settings, credentials, sessions, growth, OAuth, …) is
@@ -47,6 +49,24 @@ pub struct DesktopHooks {
     pub start_service: Option<SimpleHook>,
     /// Stop the proxy listener.
     pub stop_service: Option<SimpleHook>,
+    /// Rebuild the **running** proxy listener from the settings just saved.
+    ///
+    /// `Config` is a snapshot taken when the listener is built
+    /// (`Config::from_settings`), so everything derived from settings — the
+    /// upstream URL, `model_map`, `sanitize_terms`, `force_stream`,
+    /// `intercept_safety_classifier` — only exists inside that snapshot. Saving
+    /// the file therefore changes nothing until the listener is rebuilt, and
+    /// this hook is what rebuilds it.
+    ///
+    /// Why a hook rather than something in this crate: only the desktop owns a
+    /// restartable listener. A headless server registers nothing, because
+    /// systemd is what restarts it (`systemctl restart proxy-rs`), and its
+    /// console says so.
+    ///
+    /// A `None` answer means "this build has no restartable listener", which the
+    /// caller reports with the systemd wording rather than as an error: the save
+    /// itself succeeded either way.
+    pub restart_service: Option<SimpleHook>,
     /// Open the log directory in the OS file manager.
     pub open_logs_dir: Option<SimpleHook>,
     /// Reveal a path in the OS file manager.

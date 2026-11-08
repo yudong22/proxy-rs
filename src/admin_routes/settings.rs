@@ -19,13 +19,18 @@ pub(crate) async fn settings_save(
     // Same shared hot-apply as the RPC arm and the desktop app: the switch must
     // affect the live gate, not just the settings file.
     admin::hot_apply_client_auth(&state.client_auth).await;
+    // And the same rebuild, for the same reason: `Config` is a snapshot, so a
+    // save that only writes the file leaves the data plane on the old values
+    // (`model_map`, `sanitize_terms`, `intercept_safety_classifier`, upstream
+    // URL). The desktop registers this hook; a server does not, and is told that
+    // systemd owns the restart.
+    let restart_note = match crate::desktop_hooks::call("restart", |h| h.restart_service.clone()) {
+        Ok(outcome) => format!("；{outcome}"),
+        Err(systemd_note) => format!("（{systemd_note}）"),
+    };
     state
         .logs
-        .push(
-            "INFO",
-            "设置已保存（服务器模式：端口/绑定的改动需 systemctl restart proxy-rs 才生效）"
-                .to_string(),
-        )
+        .push("INFO", format!("设置已保存{restart_note}"))
         .await;
     Ok(Json(saved))
 }

@@ -52,6 +52,10 @@ async fn isolate(name: &str, token: Option<&str>) -> Isolated {
     std::fs::create_dir_all(&dir).expect("temp dir");
     std::env::set_var("PROXY_DATA_DIR", &dir);
     settings::set_log_file_override_for_tests(dir.join("proxy.log"));
+    // `PROXY_API_TOKEN` is looked up in `.env` *before* the process environment,
+    // so clearing the variable below would still leave a developer's `.env`
+    // token in force and turn the "mutation disabled" cases into 401s.
+    proxy_rs::env::set_dotenv_override_for_tests(None);
     match token {
         Some(value) => std::env::set_var("PROXY_API_TOKEN", value),
         None => std::env::remove_var("PROXY_API_TOKEN"),

@@ -28,7 +28,16 @@ pub(crate) fn run_proxy_server(
             return;
         }
 
-        let initial_settings = ctx.settings.read().await.clone();
+        // Settings are re-read from disk on every (re)start, not taken from the
+        // cached `ctx.settings`. The cache is a snapshot of process start, and a
+        // restart triggered by "保存配置" exists precisely to pick up what the
+        // save just wrote — reading the cache here would rebuild the listener
+        // with the same stale values it is being restarted to replace.
+        let initial_settings = {
+            let fresh = settings::GuiSettings::load();
+            *ctx.settings.write().await = fresh.clone();
+            fresh
+        };
         let cfg = match Config::from_settings(&initial_settings) {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -118,8 +127,16 @@ pub(crate) fn run_proxy_server(
                 .await;
         }
 
-        // Only clear state if this is still the active server instance.
+        // The listener is gone at this point (`axum::serve` has returned and
+        // dropped it), so the port is free again — publish that *before* anything
+        // else. `restart_proxy_server` waits on exactly this going to zero, and
+        // leaving it set would make a settings save think the old listener was
+        // still holding the port.
+        //
+        // Skipped when a newer instance is already current, so a respawn cannot
+        // have its own `bound_port` cleared by the instance it replaced.
         if ctx.server_epoch.load(std::sync::atomic::Ordering::SeqCst) == server_id {
+            ctx.bound_port.store(0, std::sync::atomic::Ordering::SeqCst);
             ctx.service_ctrl.mark_stopped();
             update_tray_state(&app, &ctx);
             emit_service_state(&app);
@@ -234,7 +251,15 @@ pub(crate) fn start_console_listener(ctx: Arc<AppContext>) {
 
 pub(crate) fn start_proxy_server(app: tauri::AppHandle, ctx: Arc<AppContext>) {
     // Already up: nothing to do.
-    if ctx.service_ctrl.is_running() {
+    //
+    // Skipped when no listener is bound. `restart_proxy_server` cancels the old
+    // listener and then calls this, and the terminating task marks the service
+    // stopped on its way out — so "running" can briefly be true while no socket
+    // exists. Trusting the flag there would turn a settings-driven rebuild into
+    // a no-op and leave the app reporting a service that is not listening.
+    if ctx.service_ctrl.is_running()
+        && ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst) != 0
+    {
         return;
     }
     // The listener stays up while the service is stopped (it also serves the
@@ -280,4 +305,92 @@ pub(crate) fn stop_proxy_server(ctx: Arc<AppContext>) {
     // it is what tells a later "start" that it should *resume* rather than try
     // to bind a port we already hold.
     ctx.service_ctrl.mark_stopped();
+}
+
+/// Rebuild the **running** listener so a settings save takes effect.
+///
+/// ## Why this cannot be a plain stop + start
+///
+/// `stop_proxy_server` only marks the service stopped; the listener, its router
+/// and — crucially — the `Arc<Config>` inside it stay alive so the console keeps
+/// answering on the same port. `start_proxy_server` therefore sees
+/// `bound_port != 0`, treats the call as *resume*, and returns without rebuilding
+/// anything. That is correct for the start/stop button and wrong for a settings
+/// save, which is why this is a separate path: it cancels the live listener,
+/// waits for the port to be released, and only then starts a fresh one.
+///
+/// Waiting is the load-bearing part. `cancelled()` makes `axum::serve` begin a
+/// graceful shutdown, but the socket is not closed until the task actually
+/// returns; starting the replacement before that would fail to bind its own
+/// port ("address in use" for a port we ourselves are holding) and leave the
+/// app stopped — worse than not reloading at all.
+///
+/// A stopped service stays stopped: before this fix, saving settings while the
+/// service was stopped would silently *start* it, which is not what the save
+/// asked for.
+pub(crate) fn restart_proxy_server(app: tauri::AppHandle, ctx: Arc<AppContext>) {
+    let was_running = ctx.service_ctrl.is_running();
+    let had_listener = ctx.bound_port.load(std::sync::atomic::Ordering::SeqCst) != 0;
+
+    if had_listener {
+        // Cancel this instance's graceful shutdown and wait for it to let go of
+        // the port. `bound_port` is zeroed by the task itself once `axum::serve`
+        // has returned, so its going to zero is the signal that the socket is
+        // actually closed — and therefore that a rebind can succeed.
+        //
+        // The epoch is deliberately *not* bumped here. Bumping it would make the
+        // terminating task believe it had been superseded, and it would then skip
+        // the cleanup that zeroes `bound_port` — so the wait below could never
+        // finish. The bump happens in `start_proxy_server`, after the port is
+        // free.
+        if let Ok(guard) = ctx.server_shutdown.lock() {
+            guard.cancel();
+        }
+
+        let ctx_for_wait = ctx.clone();
+        let app_for_wait = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while ctx_for_wait
+                .bound_port
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != 0
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            if ctx_for_wait
+                .bound_port
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != 0
+            {
+                // The old listener never let go. Say so instead of rebinding into
+                // a port that is still held — and do not pretend the save applied.
+                ctx_for_wait
+                    .logs
+                    .push(
+                        "ERROR",
+                        "设置已保存，但旧监听器未能及时释放端口，未重启代理（请手动停止后启动服务）"
+                            .to_string(),
+                    )
+                    .await;
+                return;
+            }
+            ctx_for_wait
+                .logs
+                .push(
+                    "INFO",
+                    "设置已保存，正在按新配置重启代理服务...".to_string(),
+                )
+                .await;
+            start_proxy_server(app_for_wait, ctx_for_wait);
+        });
+        return;
+    }
+
+    // No listener yet: nothing to rebuild. Honour the state that was there, so a
+    // save made while stopped does not start the service behind the user's back.
+    if was_running {
+        start_proxy_server(app, ctx);
+    }
 }

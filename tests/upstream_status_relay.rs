@@ -83,6 +83,13 @@ async fn router_against(upstream_base: &str) -> axum::Router {
     let dir = std::env::temp_dir().join(format!("proxy-rs-relay-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     settings::set_log_file_override_for_tests(dir.join("relay.log"));
+    // The data dir and `.env` are global too: an unredirected run writes stats
+    // under the developer's real `~/.proxy-rs`, and a real `.env` could swap the
+    // upstream URL this test just pinned (the fixture `Config` wins today, but
+    // only because of the order of the fields below — not something a test
+    // should have to know).
+    std::env::set_var("PROXY_DATA_DIR", &dir);
+    proxy_rs::env::set_dotenv_override_for_tests(None);
 
     let config = Config {
         upstream_urls: vec![upstream_base.to_string()],

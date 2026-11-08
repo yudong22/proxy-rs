@@ -46,6 +46,11 @@ async fn isolate_log(name: &str) -> (std::path::PathBuf, tokio::sync::MutexGuard
     let path = dir.join(name);
     let _ = std::fs::remove_file(&path);
     settings::set_log_file_override_for_tests(path.clone());
+    // The log file is the point of these tests, but it is not the only global in
+    // play: the router also resolves the data dir and reads configuration. Left
+    // alone, both point at the developer's real `~/.proxy-rs` and its `.env`.
+    std::env::set_var("PROXY_DATA_DIR", &dir);
+    proxy_rs::env::set_dotenv_override_for_tests(None);
     (path, guard)
 }
 

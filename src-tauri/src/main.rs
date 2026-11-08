@@ -351,6 +351,8 @@ fn main() {
                 let app_stop = app.clone();
                 let ctx_stop = ctx_for_hooks.clone();
                 let ctx_status = ctx_for_hooks.clone();
+                let app_restart = app.clone();
+                let ctx_restart = ctx_for_hooks.clone();
                 proxy_rs::desktop_hooks::register(proxy_rs::desktop_hooks::DesktopHooks {
                     start_service: Some(std::sync::Arc::new(move || {
                         request_start(app_start.clone(), ctx_start.clone());
@@ -359,6 +361,14 @@ fn main() {
                     stop_service: Some(std::sync::Arc::new(move || {
                         request_stop(app_stop.clone(), ctx_stop.clone());
                         Ok("代理服务已停止".to_string())
+                    })),
+                    // Rebuild the listener so a settings save reaches the data
+                    // plane. Without this the save only wrote the file and the
+                    // running router kept its old `Config` snapshot — the bug
+                    // that made the classifier switch look broken in 3.5.2.
+                    restart_service: Some(std::sync::Arc::new(move || {
+                        restart_proxy_server(app_restart.clone(), ctx_restart.clone());
+                        Ok("代理服务已按新配置重启".to_string())
                     })),
                     open_logs_dir: Some(std::sync::Arc::new(|| match settings::log_dir() {
                         Some(dir) => {

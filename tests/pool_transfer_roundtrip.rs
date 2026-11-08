@@ -56,6 +56,10 @@ impl TempDataDir {
         std::fs::create_dir_all(&dir).expect("create temp data dir");
         std::env::remove_var(LEGACY_DATA_DIR_ENV);
         std::env::set_var(DATA_DIR_ENV, &dir);
+        // Export/import read the credential store and its `.env`-adjacent
+        // configuration; pin the `.env` search off so a developer's file cannot
+        // add credentials the fixture never wrote.
+        proxy_rs::env::set_dotenv_override_for_tests(None);
         Self {
             _guard: guard,
             previous,

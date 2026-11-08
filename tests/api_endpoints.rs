@@ -45,6 +45,12 @@ async fn isolate_log(name: &str) -> tokio::sync::MutexGuard<'static, ()> {
     let path = dir.join(name);
     let _ = std::fs::remove_file(&path);
     settings::set_log_file_override_for_tests(path);
+    // Redirecting only the log file still leaves the data dir and `.env` at
+    // their real locations. The handlers below persist stats and read
+    // configuration, so both are pointed into the same temp directory: a run
+    // must never create or consult anything under `~/.proxy-rs`.
+    std::env::set_var("PROXY_DATA_DIR", &dir);
+    proxy_rs::env::set_dotenv_override_for_tests(None);
     guard
 }
 

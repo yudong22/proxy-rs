@@ -108,13 +108,32 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
             // unrelated save (no client_auth_enabled in the body) still keeps
             // the live gate in sync with the file.
             admin::hot_apply_client_auth(&state.client_auth).await;
+            // Rebuild the running listener, because `Config` is a snapshot.
+            //
+            // Saving the file alone changes nothing that the data plane reads:
+            // `Config::from_settings` runs once when the listener is built, so
+            // `model_map`, `sanitize_terms`, `force_stream`,
+            // `intercept_safety_classifier` and the upstream URL all live inside
+            // that snapshot. That was invisible for a while because the desktop
+            // used to have its own `save_settings` that ended with
+            // `start_proxy_server(...)` — 3.4.0 A4 deleted that command body as a
+            // duplicate, and with it went the rebuild, so the switch reported
+            // success while the old router kept answering. Verified before this
+            // fix: turning `intercept_safety_classifier` on through the console
+            // left the classifier still forwarded upstream.
+            //
+            // A server build has no restartable listener (systemd owns it), and
+            // `call` says so with the `systemctl restart` wording — that is a
+            // fact about the deployment, not a failed save, so it is logged
+            // rather than returned as an error.
+            let restart_note =
+                match crate::desktop_hooks::call("restart", |h| h.restart_service.clone()) {
+                    Ok(outcome) => format!("；{outcome}"),
+                    Err(systemd_note) => format!("（{systemd_note}）"),
+                };
             state
                 .logs
-                .push(
-                    "INFO",
-                    "设置已保存（服务器模式：端口/绑定的改动需 systemctl restart proxy-rs 才生效）"
-                        .to_string(),
-                )
+                .push("INFO", format!("设置已保存{restart_note}"))
                 .await;
             Ok(saved)
         }
