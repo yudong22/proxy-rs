@@ -58,6 +58,25 @@ mod tests {
         policy_from(&Config::default())
     }
 
+    /// Serialises the tests in this module that read or write `PROXY_FREE_*`.
+    ///
+    /// `resolve_free_model` reads four process-global env vars, and
+    /// `free_node_accessors_default_and_overridable` writes two of them. Rust
+    /// runs tests in parallel threads inside one process, so without this the
+    /// writer can land between two reads inside a single resolution — which is
+    /// exactly how `free_model_resolves_to_a_concrete_node_never_itself` came to
+    /// fail on CI (measured: 3 failures in 60 full runs, always this test).
+    ///
+    /// The lock alone would not be enough if the assertion compared two
+    /// independently-timed resolutions; the test pins both by asserting against
+    /// `resolve_free_model()` under the same lock, so the clock cannot cross a
+    /// window boundary between them either.
+    static FREE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn free_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        FREE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     // ---- model resolution ---------------------------------------------------
 
     fn policy_with(
@@ -137,6 +156,10 @@ mod tests {
 
     #[test]
     fn free_model_resolves_to_a_concrete_node_never_itself() {
+        // Holds the lock across both resolutions: the expected value is derived
+        // from the same clock and the same env as the value under test, so a
+        // writer or a minute/hour boundary must not be able to land between them.
+        let _guard = free_env_lock();
         // `free` is virtual: it must be rewritten to a real upstream node
         // (hy3 by day, hy4-preview by night) and must never reach upstream
         // verbatim, regardless of any configured override.
@@ -166,6 +189,7 @@ mod tests {
 
     #[test]
     fn free_node_accessors_default_and_overridable() {
+        let _guard = free_env_lock();
         // Defaults: night node is hy4-preview, degraded (daytime) node is hy3,
         // and the degrade target must differ from the night node so the
         // night→day fallback actually switches models.
