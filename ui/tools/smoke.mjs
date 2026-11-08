@@ -65,6 +65,7 @@ import {
   checkLoginRecovery,
 } from './smoke/scenarios-integration.mjs';
 import { checkOverviewLayout } from './smoke/scenarios-overview.mjs';
+import { checkBootstrapPage } from './smoke/scenarios-bootstrap.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 // Source by default. `UI_DIR=ui-dist` runs the same assertions against the Vite
@@ -282,6 +283,10 @@ try {
   // Last, because it reloads the page and every scenario above worked against
   // the DOM that reloaded document replaces.
   await checkOverviewLayout({ send, check, origin: `http://127.0.0.1:${PORT}` });
+
+  // Loads a different document (the start page), so it goes after every
+  // scenario that works against the console.
+  await checkBootstrapPage({ send, check, origin: `http://127.0.0.1:${PORT}` });
 
   if (runtimeErrors.length) {
     failures.push(`runtime console errors:\n      ${runtimeErrors.join('\n      ')}`);

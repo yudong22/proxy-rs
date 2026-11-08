@@ -39,12 +39,23 @@ export default defineConfig({
     assetsInlineLimit: 0,
     modulePreload: { polyfill: false },
     rollupOptions: {
-      input: { main: resolve(here, 'ui/index.html') },
+      input: {
+        main: resolve(here, 'ui/index.html'),
+        // The Tauri window's start page. `tauri.conf.json` sets it as the
+        // window `url`, so it must exist in `frontendDist` — and `frontendDist`
+        // is `ui-dist/` now, not `ui/`. Without this entry Vite never emits it,
+        // and the window opens on a missing file: a blank app, with the console
+        // itself perfectly healthy on its own port. It has no imports, but it
+        // does reference `assets/logo.svg`, which the HTML pipeline rewrites.
+        bootstrap: resolve(here, 'ui/bootstrap.html'),
+      },
       output: {
         // Chunks: `src/` — the console's `/admin/src/*` route.
         entryFileNames: 'src/[name]-[hash].js',
         chunkFileNames: 'src/[name]-[hash].js',
         // Stylesheets: `style/`; everything else (images, fonts): `assets/`.
+        // HTML inputs keep their own name at the root: the window loads
+        // `bootstrap.html` by that exact path.
         assetFileNames: (info) => {
           const name = info.name || '';
           if (name.endsWith('.css')) return 'style/[name]-[hash][extname]';
@@ -69,7 +80,10 @@ export default defineConfig({
        */
       transformIndexHtml: {
         order: 'post',
-        handler(html) {
+        // `bootstrap.html` is also an HTML input now, and it has no module
+        // entry — only the console page is rewritten here.
+        handler(html, ctx) {
+          if (!/index\.html$/.test(ctx.filename || ctx.path || '')) return html;
           const m = /<script type="module" crossorigin src="\.\/(src\/main-[^"]+\.js)"><\/script>/.exec(html);
           if (!m) {
             throw new Error(

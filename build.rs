@@ -27,10 +27,13 @@
 //! here removes that class of bug: a file the build emits is served, and one
 //! deleted stops being served.
 //!
-//! `ui/bootstrap.html` (the Tauri start page) and `ui/server/` are not in
-//! `ui-dist/` and not console assets; `bootstrap.html` is read by Tauri
-//! directly, and `server/login.html` / `login.js` are `include_str!` by
-//! `console.rs` from `ui/server/`.
+//! `ui/server/` is not in `ui-dist/` and not a console asset — `login.html` /
+//! `login.js` are `include_str!` by `console.rs` from `ui/`.
+//!
+//! `bootstrap.html` **is** built into `ui-dist/` (Vite takes it as a second HTML
+//! input), but it is deliberately **not** in this manifest: it is the Tauri
+//! window's start page, loaded by Tauri from `frontendDist` on its own scheme,
+//! never requested from the console listener. Only `/index.html` is served here.
 //!
 //! The output is `${OUT_DIR}/ui_assets.rs`, included by `src/console.rs` as the
 //! `ASSETS` constant. `src/console.rs` carries a test that walks the same roots

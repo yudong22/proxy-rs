@@ -129,14 +129,27 @@ if (bundledCss.includes('border-style:solid') || bundledCss.includes('border-sty
 
 // ── 5. Nothing landed outside the three routes console.rs serves ─────────────
 // build.rs walks `src/`, `style/` and `assets/` and panics on an unknown
-// extension, so a stray top-level file would fail the Rust build — but only
+// extension, so a stray file outside them would fail the Rust build — but only
 // after this ran. Catch it here with a clearer message.
+//
+// `index.html` and `bootstrap.html` are the two HTML entry points. They are
+// served by special-cased routes / the Tauri window's own `src` attribute
+// rather than by a directory walk, so they are allowed at the root — and the
+// check that they exist is the point of the rule, not an exception to it.
 const roots = ['src/', 'style/', 'assets/'];
+const topLevelHtml = new Set(['index.html', 'bootstrap.html']);
 for (const f of files) {
-  if (f === 'index.html') continue;
+  if (topLevelHtml.has(f)) continue;
   if (!roots.some((r) => f.startsWith(r))) {
     fail(`${f} is outside the served roots (src/, style/, assets/) — console.rs cannot serve it`);
   }
+}
+
+// Both entry points must be present: the console route serves `index.html` and
+// `tauri.conf.json` points the window at `bootstrap.html`. A missing
+// `bootstrap.html` is a blank app window, not a 404 the user can diagnose.
+for (const f of topLevelHtml) {
+  if (!files.includes(f)) fail(`${f} is missing from the build — the app or console entry would 404`);
 }
 
 if (problems.length) {
