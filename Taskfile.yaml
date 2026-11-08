@@ -69,17 +69,53 @@ tasks:
         echo "✅ Installed to {{.INSTALL_APP}}"
 
   # ── Front-end dev loop ───────────────────────────────────────────────────
-  # `ui-dev` proxies /admin/* and /api/* to a real gateway, so it needs one
-  # running. `dev-server` is that gateway; run it in a second terminal.
-  # (It is a dependency in spirit, not in `deps:` — it must stay in the
-  # foreground, so `deps:` would block `ui-dev` from ever starting.)
+  # `ui-dev` proxies to a real gateway, so it needs one running. `dev-server`
+  # is that gateway; run it in a second terminal. (It is a dependency in
+  # spirit, not in `deps:` — it must stay in the foreground, so `deps:` would
+  # block `ui-dev` from ever starting.)
+  #
+  # ## The port lives here, in one place
+  #
+  # The desktop runs **two** listeners: the data plane (`port`, serves
+  # `/api/*`) and the console (`port + 1`, serves `/admin/*`). `ui-dev` has to
+  # proxy each prefix to its own port, so both sides must agree on the number.
+  #
+  # The gateway reads its port from `$PROXY_DATA_DIR/gui-settings.json`, which
+  # is why this task writes that file before starting: otherwise a stale value
+  # in `~/.proxy-rs-dev` (or the default 3456) silently disagreed with what
+  # vite.config.js proxied to, and half the console 404'd.
   dev-server:
     desc: Run the headless gateway locally for `task ui-dev` (builds the server once)
+    vars:
+      PROXY_PORT: '3457'
     cmds:
       - cargo build --bin proxy-rs-server
-      - PROXY_DATA_DIR=$HOME/.proxy-rs-dev PROXY_API_TOKEN=dev ./target/debug/proxy-rs-server
+      - |
+        DEV_DIR="$HOME/.proxy-rs-dev"
+        mkdir -p "$DEV_DIR"
+        # Always rewrite the port: a leftover file from an older run is exactly
+        # how the two sides drifted apart.
+        node -e '
+          const fs = require("fs");
+          const p = process.argv[1];
+          let s = {};
+          try { s = JSON.parse(fs.readFileSync(p, "utf8")); } catch {}
+          s.port = Number(process.argv[2]);
+          fs.writeFileSync(p, JSON.stringify(s, null, 2) + "\n");
+        ' "$DEV_DIR/gui-settings.json" {{.PROXY_PORT}}
+        echo "🧪 proxy    : http://127.0.0.1:{{.PROXY_PORT}}  (/api/*)"
+        echo "🧪 console  : http://127.0.0.1:{{add .PROXY_PORT 1}}  (/admin/*)"
+        PROXY_DATA_DIR="$DEV_DIR" PROXY_API_TOKEN=dev ./target/debug/proxy-rs-server
 
   ui-dev:
-    desc: UI hot-reload loop against a real gateway (run `task dev-server` first)
+    desc: UI hot-reload loop; switch 测试/生产 backend from the DEV badge in the page
+    vars:
+      # Keep in step with dev-server's PROXY_PORT. `ui-dev` only proxies; it
+      # does not start the gateway, so the two tasks cannot share a var.
+      PROXY_PORT: '3457'
+      # The installed desktop app's data plane. Its console is one port up.
+      PROD_PORT: '3457'
     cmds:
-      - node ui/tools/dev.mjs
+      - |
+        DEV_PROXY_PORT={{.PROXY_PORT}} PROD_PROXY_PORT={{.PROD_PORT}} \
+        node ui/tools/dev.mjs

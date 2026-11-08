@@ -5,6 +5,60 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 
 /**
+ * The `ui-dev`-only header control, injected by the `proxy-rs:backend-switch`
+ * plugin and never part of a build.
+ *
+ * Self-contained (inline style + script) on purpose: it is not a product
+ * feature, it has no design-token home, and giving it a stylesheet or a module
+ * in `ui/src/` would make it something the app has to keep working. It sits
+ * fixed in the corner, out of the layout's way.
+ */
+const DEV_BADGE_MARKUP = `
+<div id="dev-backend-bar" style="
+  position: fixed; right: 12px; bottom: 12px; z-index: 99999;
+  display: flex; align-items: center; gap: 8px;
+  font: 12px/1.4 -apple-system, 'PingFang SC', 'Segoe UI', sans-serif;
+  background: rgba(0,0,0,.82); color: #fff; padding: 6px 10px; border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.3);
+">
+  <span style="font-weight:700;letter-spacing:.06em;background:#f59e0b;color:#111;
+    padding:2px 6px;border-radius:4px;">DEV</span>
+  <span id="dev-backend-note" style="opacity:.75;"></span>
+  <button id="dev-backend-toggle" type="button" style="
+    font:inherit;padding:3px 10px;border-radius:5px;cursor:pointer;
+    border:1px solid rgba(255,255,255,.35);background:transparent;color:#fff;"></button>
+</div>
+<script>
+(function () {
+  var KEY = 'proxy_rs_backend';
+  function current() {
+    var m = document.cookie.match(/(?:^|;\\s*)proxy_rs_backend=(dev|prod)(?:;|$)/);
+    return m ? m[1] : 'dev';
+  }
+  var btn = document.getElementById('dev-backend-toggle');
+  var note = document.getElementById('dev-backend-note');
+  function paint() {
+    var isProd = current() === 'prod';
+    // The button offers the *other* backend, so the label says what a click does.
+    btn.textContent = isProd ? '切到测试' : '切到生产';
+    btn.title = isProd
+      ? '当前读取已安装的桌面 App（生产端口）'
+      : '当前读取 task dev-server 起的网关（测试端口）';
+    note.textContent = isProd ? '生产' : '测试';
+  }
+  btn.addEventListener('click', function () {
+    var next = current() === 'prod' ? 'dev' : 'prod';
+    document.cookie = KEY + '=' + next + '; path=/; max-age=31536000';
+    // Reload, not a soft refresh: the cookie changes which upstream the proxy
+    // talks to, so every in-flight panel must be re-read from the new backend.
+    location.reload();
+  });
+  paint();
+})();
+</script>
+`;
+
+/**
  * Vite build for the console front-end.
  *
  * The output layout is not a free choice. `src/console.rs` compiles `ui/` into
@@ -98,6 +152,27 @@ export default defineConfig({
         },
       },
     },
+    {
+      name: 'proxy-rs:backend-switch',
+      /**
+       * The `ui-dev` header control: a DEV badge and a 测试/生产 backend switch.
+       *
+       * **Serve only.** This must never reach a build: the desktop app and the
+       * server console both ship `ui-dist/`, and a "switch backend" button in
+       * production would either do nothing or, worse, claim to. Injecting it
+       * from the config — rather than writing it into `ui/index.html` — is what
+       * guarantees it exists only where it works.
+       *
+       * The switch writes the `proxy_rs_backend` cookie and reloads. The cookie
+       * is read by the proxy above, so the *whole* page (page, RPC, `/api/*`)
+       * moves to the other backend together — a per-request toggle that only
+       * changed one transport would show data from two backends at once.
+       */
+      apply: 'serve',
+      transformIndexHtml(html) {
+        return html.replace('</body>', `${DEV_BADGE_MARKUP}\n</body>`);
+      },
+    },
   ],
 
   server: {
@@ -107,15 +182,53 @@ export default defineConfig({
     host: '127.0.0.1',
     port: Number(process.env.PORT) || 4300,
     strictPort: true,
-    // Everything the gateway owns is proxied to a real `proxy-rs-server`; the
-    // page and its modules come from `ui/`. There is deliberately no mock
-    // bridge here: a panel broken against the real gateway must look broken in
-    // the dev loop too, which is the whole reason for reading the real backend.
-    proxy: Object.fromEntries(
-      ['/admin', '/api'].map((p) => [
-        p,
-        { target: (process.env.BACKEND || 'http://127.0.0.1:3456').replace(/\/+$/, ''), changeOrigin: false },
-      ]),
-    ),
+    /**
+     * Backend targets, and the switch between them.
+     *
+     * Two named targets, chosen per request by a cookie so the page can flip
+     * between them without restarting Vite. The cookie is set by the header
+     * control `ui-dev` injects (see `proxy-rs:backend-switch`).
+     *
+     *   dev (default) — the headless `proxy-rs-server` that `task dev-server`
+     *     starts. Its console is mounted on the data plane
+     *     (`router::with_admin`), so `/admin/*` and `/api/*` share one port.
+     *
+     *   prod — the installed desktop app. Its console is a separate listener on
+     *     `port + 1` (`start_console_listener`), so `/admin/*` goes one port up.
+     *
+     * Getting this wrong is silent rather than loud: the proxy 404s, the page
+     * falls back to IPC, and the console looks fine while reading a different
+     * backend than the one on screen. Hence the cookie: switching is a visible,
+     * per-tab choice rather than an environment variable someone forgot.
+     *
+     * Ports come from the environment so `task` can keep `dev-server` and
+     * `ui-dev` in step; the defaults are the documented ones.
+     */
+    proxy: (() => {
+      const host = (process.env.BACKEND || 'http://127.0.0.1').replace(/\/+$/, '').replace(/:\d+$/, '');
+      const devPort = Number(process.env.DEV_PROXY_PORT) || 3457;
+      const prodPort = Number(process.env.PROD_PROXY_PORT) || 3457;
+      const prodConsolePort = Number(process.env.PROD_CONSOLE_PORT) || prodPort + 1;
+
+      /** Upstream port for one prefix, per the switch cookie. */
+      const portFor = (req, kind) => {
+        const wantsProd = /(?:^|;\s*)proxy_rs_backend=prod(?:;|$)/.test(req.headers.cookie || '');
+        if (!wantsProd) return devPort;
+        return kind === 'admin' ? prodConsolePort : prodPort;
+      };
+
+      return {
+        '/admin': {
+          target: `${host}:${devPort}`,
+          changeOrigin: false,
+          router: (req) => `${host}:${portFor(req, 'admin')}`,
+        },
+        '/api': {
+          target: `${host}:${devPort}`,
+          changeOrigin: false,
+          router: (req) => `${host}:${portFor(req, 'api')}`,
+        },
+      };
+    })(),
   },
 });
