@@ -17,17 +17,29 @@
 
 export async function checkPaletteAndOAuth(ctx) {
   const { send, check, failures } = ctx;
-  // Cross-module integration 1: palette's dynamic import of the settings view.
+  // Cross-module integration 1: palette → settings, through the dynamic import.
+  //
+  // Driven through the palette's own search box and keyboard, not by importing
+  // `src/views/settings/index.js` from the test: that path only exists in the
+  // source tree. Against the Vite build (`UI_DIR=ui-dist`) the module has been
+  // bundled and the test's own import 404s, which is a test artefact rather
+  // than a product failure. This way the assertion is the user's path — open
+  // the palette, find the command, run it — and it holds for both trees.
   await send('Runtime.evaluate', { expression: 'window.__CALLS__.length = 0;' });
   await send('Runtime.evaluate', {
-    expression: `import('./src/views/settings/index.js').then(async (m) => {
-      window.__T_TYPE__ = typeof m.testUpstream;
-      await m.testUpstream(document.querySelector('#settings-test-result'));
-      window.__T_TEXT__ = document.querySelector('#settings-test-result')?.textContent;
-      window.__T_CLASS__ = document.querySelector('#settings-test-result')?.className;
-    });`,
+    expression: `(async () => {
+      document.querySelector('#btn-open-palette').click();
+      await new Promise((r) => requestAnimationFrame(r));
+      const input = document.querySelector('#palette-input');
+      input.value = '测试上游';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      const item = document.querySelector('.palette-item');
+      window.__T_LABEL__ = item ? item.textContent.trim() : null;
+      item?.click();
+    })();`,
   });
-  await new Promise((r) => setTimeout(r, 800));
+  // The dynamic import and the upstream round-trip both have to finish.
+  await new Promise((r) => setTimeout(r, 1200));
 
   // Cross-module integration 2: OAuth success must repaint the pool via the
   // callback the pool injected into the OAuth module.
@@ -37,9 +49,9 @@ export async function checkPaletteAndOAuth(ctx) {
   const integ = await send('Runtime.evaluate', {
     returnByValue: true,
     expression: `(() => ({
-      testUpstreamType: window.__T_TYPE__,
-      testUpstreamText: window.__T_TEXT__,
-      testUpstreamClass: window.__T_CLASS__,
+      paletteOnSettings: window.location.hash === '#settings',
+      testUpstreamText: document.querySelector('#settings-test-result')?.textContent,
+      testUpstreamClass: document.querySelector('#settings-test-result')?.className,
       qrModalActive: document.querySelector('#request-modal-overlay')?.classList.contains('active'),
       qrSvgInjected: Boolean(document.querySelector('#wb-qr-target svg')),
       pollStatus: document.querySelector('#wb-qr-poll-status')?.textContent?.trim(),
@@ -47,7 +59,7 @@ export async function checkPaletteAndOAuth(ctx) {
     }))()`,
   });
   const i = integ.result.value;
-  check('palette dynamic import exposes testUpstream', i.testUpstreamType, 'function');
+  check('palette ran the settings command', i.paletteOnSettings, true);
   check('testUpstream result', i.testUpstreamText, '✓ 连通性测试通过 (上游流式响应正常)');
   check('testUpstream class', i.testUpstreamClass, 'test-result ok');
   check('qr svg injected', i.qrSvgInjected, true);

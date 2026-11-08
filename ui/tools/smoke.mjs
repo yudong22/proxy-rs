@@ -64,9 +64,14 @@ import {
   checkPoolTransfer,
   checkLoginRecovery,
 } from './smoke/scenarios-integration.mjs';
+import { checkOverviewLayout } from './smoke/scenarios-overview.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const UI = path.join(REPO, 'ui');
+// Source by default. `UI_DIR=ui-dist` runs the same assertions against the Vite
+// build instead, which is the only way to know the *shipped* page behaves — a
+// build can drop a module, reorder the cascade, or rewrite the entry tag while
+// the source tree stays green.
+const UI = path.resolve(REPO, process.env.UI_DIR || 'ui');
 const PORT = 4197;
 const DEBUG = 9357;
 const CHROME = process.env.CHROME_PATH
@@ -174,6 +179,21 @@ try {
     window.__TAURI__ = {
       core: { invoke: (cmd, args) => { window.__CALLS__.push(cmd);
         window.__INVOKE_ARGS__[cmd] = args;
+        // A scenario can hold commands by name (window.__HOLD_NAMES__), releasing
+        // them with window.__RELEASE__(). Used by the overview-layout scenario,
+        // which has to measure the page *before* its values land; interception at
+        // the network layer cannot do that here, because every read may arrive
+        // over this bridge instead (that is the point of core/api.js's fallback).
+        // Read lazily on each call, not captured at boot: CDP runs injected
+        // scripts in an unspecified order, and a scenario's names may be
+        // registered after this one.
+        if ((window.__HOLD_NAMES__ || []).includes(cmd)) {
+          return new Promise((resolve) => {
+            window.__HELD__.push(() => resolve(
+              Object.prototype.hasOwnProperty.call(window.__MOCKDATA__, cmd)
+                ? window.__MOCKDATA__[cmd] : null));
+          });
+        }
         // get_growth_progress is take-and-clear on the real backend: the
         // console drains the buffer and the next poll sees nothing new. The
         // mock reproduces that, so a UI that kept re-reading the same lines
@@ -201,7 +221,12 @@ try {
     };
     window.__emitTestEvent = (name, payload) => {
       for (const h of window.__TAURI__.event.__handlers[name] || []) h({ payload });
-    };` });
+    };
+    // The resolvers waiting on a hold. The hold list lives in
+    // window.__HOLD_NAMES__, which a scenario sets before its navigation.
+    window.__HELD__ = [];
+    window.__RELEASE__ = () => { for (const f of window.__HELD__.splice(0)) f(); };
+    window.__heldCount__ = () => window.__HELD__.length;` });
 
   await send('Page.navigate', { url: `http://127.0.0.1:${PORT}/index.html` });
   await new Promise((r) => setTimeout(r, 2000));
@@ -228,6 +253,10 @@ try {
   const i = await checkPaletteAndOAuth(ctx);
   await checkPoolTransfer(ctx);
   await checkLoginRecovery(ctx);
+
+  // Last, because it reloads the page and every scenario above worked against
+  // the DOM that reloaded document replaces.
+  await checkOverviewLayout({ send, check, origin: `http://127.0.0.1:${PORT}` });
 
   if (runtimeErrors.length) {
     failures.push(`runtime console errors:\n      ${runtimeErrors.join('\n      ')}`);

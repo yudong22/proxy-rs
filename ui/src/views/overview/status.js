@@ -6,7 +6,7 @@
  * it only writes into the nodes `cards.js` created.
  */
 
-import { $, setText, setClass } from '../../core/dom.js';
+import { $, setText, setClass, setValue } from '../../core/dom.js';
 import { invoke } from '../../core/ipc.js';
 import { appState } from '../../core/state.js';
 import { formatPoints } from '../../lib/format.js';
@@ -42,11 +42,14 @@ export async function refreshStatus() {
   // 配置厂商: the backend reports the provider id, as before. An identity
   // label describes *who* is serving, this describes *where* — and only the
   // latter is known unconditionally (it survives a stopped pool).
-  setText('metric-provider', status.provider || '-');
-  setText('metric-points', formatPoints(identity.points));
+  setValue('metric-provider', status.provider || '-');
+  // Both the value and its sub-line start as skeletons (`cards.js` renders the
+  // sub-line empty), so each is filled through `setValue` to drop its
+  // placeholder at the same moment the text lands.
+  setValue('metric-points', formatPoints(identity.points));
   // The account name is shown as the 剩余积分 card's sub-line: the balance
   // belongs to that account, so reading them together is what the number means.
-  setText('metric-points-account', identity.label || '—');
+  setValue('metric-points-account', identity.label || '—');
 
   // Endpoint reference.
   //

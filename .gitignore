@@ -37,3 +37,6 @@ npm-debug.log*
 # Front-end check scratch (headless Chrome profiles)
 .chrome-profile/
 .chrome-smoke/
+
+# Vite build output (built into the binary by build.rs)
+ui-dist/

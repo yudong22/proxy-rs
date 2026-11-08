@@ -288,14 +288,34 @@ try {
   );
   ok('the desktop metric cards rendered', cards.includes('请求总数') && cards.includes('Token总量'), cards);
 
-  // The 剩余积分 card must carry the live identity, not an em dash. It was empty
-  // for a while because the server's status payload omitted `current_identity`
-  // while the desktop command had it — same front-end, a hole in the data.
-  const points = await evaluate('document.querySelector("#metric-points")?.textContent.trim()');
+  // The 剩余积分 card must reflect the live identity, not stay on its skeleton.
+  // It was empty for a while because the server's status payload omitted
+  // `current_identity` while the desktop command had it — same front-end, a
+  // hole in the data.
+  //
+  // An em dash is a *correct* value when the serving identity reports no
+  // balance: a fresh data directory with only an API key, or a WorkBuddy
+  // account whose `points` is null. So the assertion is that the card left its
+  // loading state (`.pending` cleared), and that what it shows agrees with the
+  // payload — not that the number happens to be non-empty, which made this fail
+  // on any data directory without a seeded account.
+  const points = await evaluate(`(() => {
+    const el = document.querySelector('#metric-points');
+    return { text: el?.textContent.trim(), pending: el?.classList.contains('pending') };
+  })()`);
+  // What the card *should* say, from the same payload the card is filled from,
+  // through the page's own bridge (so this also proves the bridge answers).
+  const expectedPoints = await evaluate(`window.__TAURI__.core.invoke('get_status').then((s) => {
+    const p = s?.current_identity?.points;
+    if (p === null || p === undefined) return '—';
+    const n = Number(p);
+    if (!Number.isFinite(n)) return '—';
+    return Number.isInteger(n) ? String(n) : n.toFixed(2);
+  })`);
   ok(
-    'the 剩余积分 card shows a value, not a placeholder',
-    points && points !== '—' && points !== '-',
-    `got ${JSON.stringify(points)}`
+    'the 剩余积分 card left its skeleton and matches the payload',
+    points && !points.pending && points.text === expectedPoints,
+    `card ${JSON.stringify(points?.text)} (pending=${points?.pending}), payload ${JSON.stringify(expectedPoints)}`
   );
 
   const endpoints = await evaluate(

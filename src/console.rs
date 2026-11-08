@@ -519,10 +519,20 @@ fn console_page(desktop: bool) -> Response {
     } else {
         "<script src=\"src/bridge.js\"></script>\n  "
     };
-    let html = index.replace(
-        "<script type=\"module\" src=\"src/main.js\"></script>",
-        &format!("{bridge_tag}<script type=\"module\" src=\"src/main.js\"></script>"),
-    );
+    // The source page says `src/main.js`; the Vite build renames it to
+    // `src/main-<hash>.js` (see the `console-script-tag` plugin in
+    // vite.config.js, which also keeps the tag free of `crossorigin` so this
+    // match is exact). The bridge goes immediately before it either way.
+    let html = match index.rfind("<script type=\"module\" src=\"src/main") {
+        Some(at) => {
+            let mut with_bridge = String::with_capacity(index.len() + bridge_tag.len());
+            with_bridge.push_str(&index[..at]);
+            with_bridge.push_str(bridge_tag);
+            with_bridge.push_str(&index[at..]);
+            with_bridge
+        }
+        None => index.to_string(),
+    };
 
     (
         StatusCode::OK,
@@ -629,22 +639,32 @@ mod tests {
     use super::ASSETS;
 
     /// The generated manifest must cover **every** file a browser could request
-    /// from `ui/`.
+    /// from the built UI.
     ///
     /// `build.rs` compiles the list in, which already means a present file is
     /// served. This test covers the other direction: a file of a served kind
     /// that the script skipped — a new extension it does not know, or a root it
-    /// does not walk. Without it, adding `ui/src/views/foo.ts` or a new
-    /// `ui/fonts/` root would ship a console whose asset 404s, and the failure
+    /// does not walk. Without it, a Vite plugin emitting `ui-dist/src/foo.wasm`
+    /// or a `fonts/` root would ship a console whose asset 404s, and the failure
     /// would appear in a browser, not in CI.
     ///
-    /// It walks the same roots `build.rs` documents, so the two must agree.
+    /// It walks the same roots `build.rs` documents, over `ui-dist/` — the built
+    /// output, which is what ships. A missing `ui-dist/` skips the test with an
+    /// explanation rather than failing: `cargo test` without a front-end build is
+    /// a normal thing to do while working on Rust, and `build.rs` already
+    /// refuses to compile the binary without it.
     #[test]
-    fn the_asset_manifest_covers_the_ui_tree() {
+    fn the_asset_manifest_covers_the_built_ui() {
         use std::collections::BTreeSet;
         use std::path::{Path, PathBuf};
 
-        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        let dist = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui-dist");
+        if !dist.is_dir() {
+            eprintln!(
+                "skipped: ui-dist/ not built. Run `npm run build:ui` (or `task ui-build`) first."
+            );
+            return;
+        }
 
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -671,7 +691,7 @@ mod tests {
         ];
         let mut expected: BTreeSet<String> = BTreeSet::new();
         for (dir, prefix) in roots {
-            let base = ui.join(dir);
+            let base = dist.join(dir);
             let mut files = Vec::new();
             walk(&base, &mut files);
             for f in files {
@@ -687,7 +707,9 @@ mod tests {
                 ));
             }
         }
-        // The two entries served from routes rather than a same-named directory.
+        // The shell document, served from a route rather than a same-named
+        // directory, and the server bridge, which lives in `ui/` (not the
+        // bundle) because `console_page` injects it as a classic script.
         expected.insert("/index.html".to_string());
         expected.insert("/src/bridge.js".to_string());
 
@@ -699,7 +721,7 @@ mod tests {
         let missing: Vec<&String> = expected.difference(&served).collect();
         assert!(
             missing.is_empty(),
-            "these ui/ files are not in the compiled-in asset manifest ({missing:?}). \
+            "these ui-dist/ files are not in the compiled-in asset manifest ({missing:?}). \
              Add their extension/root to `content_type`/`roots` in build.rs."
         );
 
@@ -730,9 +752,15 @@ mod tests {
         }
     }
 
-    /// The shell document must be present and mention the module entry point:
-    /// `console_page` rewrites exactly that `<script>` tag to inject the bridge,
-    /// and a silent miss there would ship a console that loads no JavaScript.
+    /// The shell document must carry the module entry point in the exact shape
+    /// `console_page` rewrites to inject the bridge.
+    ///
+    /// The source `ui/index.html` says `src/main.js`; the Vite build renames the
+    /// entry to `src/main-<hash>.js` and emits it without `crossorigin` (the
+    /// `proxy-rs:console-script-tag` plugin in vite.config.js restores that
+    /// shape on purpose). So the check is the *shape*, not the literal source
+    /// path — and a silent miss here would ship a console that loads no
+    /// JavaScript at all.
     #[test]
     fn the_index_html_carries_the_rewrite_target() {
         let index = ASSETS
@@ -740,10 +768,20 @@ mod tests {
             .find(|(url, _, _)| *url == "/index.html")
             .map(|(_, _, body)| *body)
             .expect("/index.html must be in the manifest");
-        let needle = "<script type=\"module\" src=\"src/main.js\"></script>";
+        // `console_page` searches for this prefix; the build fills in the hash.
+        let needle = "<script type=\"module\" src=\"src/main";
         assert!(
             index.contains(needle),
-            "console_page rewrites {needle:?}; changing index.html must change that too"
+            "console_page rewrites a tag starting with {needle:?}; \
+             the built index.html must carry exactly that (no crossorigin, no integrity) — \
+             see the console-script-tag plugin in vite.config.js"
+        );
+        // Nothing before the closing bracket that console_page's replacement
+        // would fail to carry over.
+        assert!(
+            !index.contains("<script type=\"module\" crossorigin"),
+            "the entry script regained a `crossorigin` attribute, so console_page's \
+             exact replacement will miss it"
         );
     }
 }

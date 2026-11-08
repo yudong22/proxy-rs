@@ -34,6 +34,25 @@ export function setClass(el, name, on) {
   if (el) el.classList.toggle(name, Boolean(on));
 }
 
+/**
+ * Write a value into an element that started as a skeleton and mark it loaded.
+ *
+ * The overview's cards render every value as a placeholder with class
+ * `pending` before any backend read has answered; the first read to land calls
+ * this, which writes the value and drops the placeholder in one step. Separating
+ * this from {@link setText} is what makes "this number is real" checkable: a
+ * test reads `.pending` on the page rather than trusting that the value is not
+ * `-` (a genuine value could be).
+ *
+ * A missing element is a no-op, like `setText`.
+ */
+export function setValue(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = value;
+  el.classList.remove('pending');
+}
+
 /** Show or hide an element via the `hidden` attribute. */
 export function setHidden(el, hidden) {
   if (!el) return;

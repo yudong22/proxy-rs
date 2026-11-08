@@ -4,7 +4,9 @@
   "version": "3.4.1",
   "identifier": "com.proxy-rs.desktop",
   "build": {
-    "frontendDist": "../ui"
+    "frontendDist": "../ui-dist",
+    "beforeBuildCommand": "npm run build:ui",
+    "beforeDevCommand": "npm run build:ui -- --watch"
   },
   "app": {
     "withGlobalTauri": true,

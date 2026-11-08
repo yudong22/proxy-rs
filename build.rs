@@ -1,4 +1,18 @@
-//! Generate the console's compiled-in asset manifest from `ui/` on disk.
+//! Generate the console's compiled-in asset manifest from the built UI on disk.
+//!
+//! ## Where the assets come from
+//!
+//! The front-end is built by Vite into `ui-dist/` (`npm run build:ui`, or
+//! `task ui-build`), and *that* is what ships: `tauri.conf.json`'s
+//! `frontendDist` points at it, and this script embeds it. `ui/` is the source
+//! tree and is never read here.
+//!
+//! The output layout is fixed by `vite.config.js` so the three served roots
+//! below keep working unchanged: chunks land in `ui-dist/src/`, stylesheets in
+//! `ui-dist/style/`, everything else in `ui-dist/assets/`. That is a contract
+//! between this file, `vite.config.js` and the routes in `src/console.rs`; a
+//! change to one that is not reflected in the others fails
+//! `ui/tools/check-dist.mjs` before it can become a 404 at runtime.
 //!
 //! ## Why a build script instead of a hand-maintained list
 //!
@@ -9,15 +23,14 @@
 //! What used to be hand-maintained is the *list*: 47 `(url, content-type,
 //! include_str!)` triples written out one by one. Splitting a UI module meant
 //! remembering to add a line for every new file, and forgetting one produced a
-//! 404 at runtime — not a compile error, not a failing test. The front-end has
-//! no bundler, so nothing else noticed either: `ui/src/x.js` would import fine
-//! in Tauri (which reads the directory) and 404 in the server console.
+//! 404 at runtime — not a compile error, not a failing test. Generating the list
+//! here removes that class of bug: a file the build emits is served, and one
+//! deleted stops being served.
 //!
-//! Generating the list here removes that class of bug: a file dropped into a
-//! served root is served, and one deleted stops being served. The served roots
-//! are enumerated explicitly below, because "everything under `ui/`" would be
-//! wrong — `ui/tools/` (dev scripts), `ui/bootstrap.html` (the Tauri start page)
-//! and `ui/README.md` are not console assets.
+//! `ui/bootstrap.html` (the Tauri start page) and `ui/server/` are not in
+//! `ui-dist/` and not console assets; `bootstrap.html` is read by Tauri
+//! directly, and `server/login.html` / `login.js` are `include_str!` by
+//! `console.rs` from `ui/server/`.
 //!
 //! The output is `${OUT_DIR}/ui_assets.rs`, included by `src/console.rs` as the
 //! `ASSETS` constant. `src/console.rs` carries a test that walks the same roots
@@ -28,40 +41,58 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    let ui = Path::new("ui");
+    // Rebuild when the built UI changes, including additions and deletions.
+    // Cargo scans a directory argument recursively for this purpose. This is
+    // checked before the existence test below so that creating `ui-dist/` for
+    // the first time also triggers a rerun.
+    println!("cargo:rerun-if-changed=ui-dist");
+    println!("cargo:rerun-if-changed=build.rs");
 
-    // (directory on disk, URL prefix). Order is irrelevant — `static_asset`
+    let dist = Path::new("ui-dist");
+    if !dist.is_dir() {
+        panic!(
+            "ui-dist/ not found. The console assets are built by Vite, not read from ui/ — \
+             run `npm install && npm run build:ui` (or `task ui-build`) before `cargo build`."
+        );
+    }
+
+    // (directory in ui-dist/, URL prefix). Order is irrelevant — `static_asset`
     // looks up by exact path — but output is sorted for a reproducible file.
-    let roots: &[(&str, &str, &str)] = &[
-        // (path relative to ui/, URL prefix, expected extension)
-        ("src", "/src/", "js"),
-        ("style", "/style/", "css"),
-        ("assets", "/assets/", ""),
+    let roots: &[(&str, &str)] = &[
+        ("src", "/src/"),
+        ("style", "/style/"),
+        ("assets", "/assets/"),
     ];
 
     let mut entries: Vec<(String, String, PathBuf)> = Vec::new();
 
-    // The shell document and the server bridge are served from routes that do
-    // not map onto a directory of the same name, so they are named explicitly.
-    // (`ui/server/login.html` / `login.js` are `include_str!` directly by
-    // `console.rs` and deliberately not part of this manifest.)
-    let singles: &[(&str, &str)] = &[
-        ("index.html", "/index.html"),
-        ("server/bridge.js", "/src/bridge.js"),
-    ];
-    for (rel, url) in singles {
-        let path = ui.join(rel);
-        if path.is_file() {
-            entries.push((
-                (*url).to_string(),
-                content_type(&path).unwrap_or_else(|| "application/octet-stream".to_string()),
-                absolute(&path),
-            ));
-        }
+    // The shell document is served from a route that does not map onto a
+    // directory, so it is named explicitly.
+    let index = dist.join("index.html");
+    if index.is_file() {
+        entries.push((
+            "/index.html".to_string(),
+            "text/html; charset=utf-8".to_string(),
+            absolute(&index),
+        ));
     }
 
-    for (root, prefix, _) in roots {
-        let dir = ui.join(root);
+    // The server bridge. It is **not** part of the bundle — `console.rs` injects
+    // it as a classic `<script>` before the module graph, and Vite has no reason
+    // to emit a file the page never imports. It still lives in `ui/`, so it is
+    // read from there and served under the `/src/` prefix the injected tag uses.
+    // The login page's files are `include_str!` directly by `console.rs`.
+    let bridge = Path::new("ui/server/bridge.js");
+    if bridge.is_file() {
+        entries.push((
+            "/src/bridge.js".to_string(),
+            "text/javascript; charset=utf-8".to_string(),
+            absolute(bridge),
+        ));
+    }
+
+    for (root, prefix) in roots {
+        let dir = dist.join(root);
         let mut files = Vec::new();
         walk(&dir, &mut files);
         for path in files {
@@ -71,16 +102,16 @@ fn main() {
             // `to_string_lossy` would paper over a non-UTF-8 file name; the URL
             // space is ASCII by construction, so such a file is not servable.
             let Some(rel) = rel.to_str() else {
-                println!("cargo:warning=skipping non-UTF-8 asset path in ui/{root}");
+                println!("cargo:warning=skipping non-UTF-8 asset path in ui-dist/{root}");
                 continue;
             };
             let url = format!("{prefix}{}", rel.replace('\\', "/"));
             let Some(ct) = content_type(&path) else {
                 // A file of an unknown kind is almost certainly a mistake (an
-                // editor backup, a `.ts` source, a `.map`). Fail the build
-                // loudly instead of shipping a manifest that silently omits it.
+                // editor backup, a `.map` left by a build tweak). Fail loudly
+                // instead of shipping a manifest that silently omits it.
                 panic!(
-                    "ui/{root}/{rel} has an extension this build script does not know. \
+                    "ui-dist/{root}/{rel} has an extension this build script does not know. \
                      Add it to `content_type()` in build.rs, or remove the file."
                 );
             };
@@ -113,11 +144,6 @@ fn main() {
 
     let dest = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("ui_assets.rs");
     std::fs::write(&dest, out).expect("write ui_assets.rs");
-
-    // Rebuild when anything in ui/ changes, including additions and deletions.
-    // Cargo scans a directory argument recursively for this purpose.
-    println!("cargo:rerun-if-changed=ui");
-    println!("cargo:rerun-if-changed=build.rs");
 }
 
 /// Recursively collect regular files, sorted, so the manifest is stable.

@@ -1,15 +1,25 @@
 # ui/ — 桌面端前端
 
-Tauri 2 桌面应用的前端：原生 ES 模块 + 原生 CSS，**没有打包器、没有框架、没有构建步骤**。
-`ui/` 目录整体即 `src-tauri/tauri.conf.json` 中的 `frontendDist`，改动后重新构建/刷新即生效。
+Tauri 2 桌面应用的前端：原生 ES 模块 + 原生 CSS + Tailwind utilities，**没有框架**。
+`ui/` 是**源码**目录；Vite 把它构建到 `ui-dist/`，后者才是 `tauri.conf.json` 的
+`frontendDist`，也是 `build.rs` 编进二进制的资产。改完 `ui/` 后运行 `npm run build:ui`
+（或 `task ui-build`）生成 `ui-dist/`。
 
 ```bash
 task dev                              # 启动 Tauri 开发窗口（端口 3477，独立数据目录）
-task ui-dev                           # 浏览器里调试 UI，读本机真实 Claude 会话，无需编译 Rust
+task dev-server                       # 起一个真实 proxy-rs-server（ui-dev 需要）
+task ui-dev                           # 浏览器热更新：Vite + 代理到真实后端
+task ui-build                         # 构建 ui/ → ui-dist/
 task ui-check                         # 静态一致性检查（级联顺序、模块图、id）
-task ui-smoke                         # 无头 Chrome 启动真实页面 + mock 后端，断言行为
-task ui-test                          # 上面两个一起跑；已并入 task check
+task ui-smoke                         # 无头 Chrome 启动源码页面 + mock 后端，断言行为
+task ui-dist-test                     # 构建后对 ui-dist/ 跑 check-dist + 同一套 smoke
+task ui-test                          # ui-check + ui-smoke（快，不构建）；已并入 task check
 ```
+
+> **`ui-dev` 连的是真实后端。** 它不再自带 mock：Vite 托管 `ui/`，把 `/admin/*` 与
+> `/api/*` 代理到 `task dev-server` 起的网关，登录、会话、RPC 全部是真实的。旧版
+> `ui/tools/dev.mjs` 里那份 JS 会话解析器已删除——它总会和 `src/claude_sessions.rs`
+> 差一个字段，且 mock 能通过、真实网关会失败的 bug 在这里永远复现不出来。
 
 ## 目录结构
 
@@ -17,13 +27,17 @@ task ui-test                          # 上面两个一起跑；已并入 task c
 ui/
   index.html           外壳：窗口 chrome + 每个视图一个空挂载点 + 样式表 <link>
   style/               样式，按「层次」拆分（见下）
-  src/
+  src/                 源码（Vite 的 root）
     core/              基础设施：dom（$ / html 模板 / 转义）、ipc（invoke/listen）、api（HTTP + IPC 回退）、state
     lib/               format 等纯函数（无 DOM）
     components/        可复用 UI 部件（modal / confirm / toast / overlay / table / pills）
     views/             每个标签页一个视图；settings/ 因规模较大拆成目录
-  tools/               检查脚本：check-ui.mjs（静态）、smoke.mjs（无头浏览器行为回归）
+  tools/               检查脚本：check-ui.mjs（静态）、check-dist.mjs（构建产物）、smoke.mjs（无头浏览器行为回归）、dev.mjs（ui-dev）
 ```
+
+构建产物 `ui-dist/`（gitignore）的布局是**契约**：`src/`、`style/`、`assets/` 三个前缀由
+`src/console.rs` 的路由和 `build.rs` 的 served roots 使用，`vite.config.js` 负责把产物放进
+这三个目录，`ui/tools/check-dist.mjs` 负责验证。
 
 ## 一、CSS 分层约定
 
@@ -51,6 +65,7 @@ ui/
 | 18 | `wb-pool.css` | 身份池表格、拖拽排序、自动化对话框 | 以上全部 |
 | 19 | `wb-qr.css` | 扫码登录二维码 | `wb-pool` |
 | 20 | `wb-report.css` | 打卡 / 成长报告 | `wb-pool` |
+| 21 | `tailwind.css` | Tailwind utilities（由 `npm run build:ui` 生成） | 以上全部 |
 
 > 层叠顺序是语义的一部分：`logs.css` 原来的位置展开成 8–11，`views.css`
 > 展开成 12–17，`workbuddy.css` 展开成 18–20。**拆文件时新文件名必须同时进
@@ -76,7 +91,13 @@ ui/
 ## 二、JS 约定
 
 1. **视图负责渲染，main.js 负责装配。** 每个视图导出 `render*()`（建 DOM）与 `init*()`（绑事件），由 `main.js` 在启动时各调用一次。视图不自行启动，也不互相 `init`。
-2. **不引入框架。** 渲染用 `core/dom.js` 的 `` html`` `` 模板标签——插值默认转义；需要嵌套标记时显式 `raw()`。不要用 `innerHTML` 拼字符串绕过它。
+2. **不引入 UI 框架。** 渲染用 `core/dom.js` 的 `` html`` `` 模板标签——插值默认转义；需要嵌套标记时显式 `raw()`。不要用 `innerHTML` 拼字符串绕过它。
+   **Tailwind 是一个例外，且只是 CSS 层**：`tailwind.css` 排在级联最后，`preflight` 在
+   `tailwind.config.js` 里**关闭**（它的 reset 会落在 `base.css` 之后，改变现有 20 层的盒模型）。
+   颜色、间距、圆角、阴影全部映射成 `var(--token)`，所以 `bg-surface` / `text-muted` 自动跟随
+   深色模式，**不需要 `dark:` 变体**，也不允许在这里复制十六进制值。新增样式仍优先复用既有
+   类；只有在写新组件且现有类不合适时才用 utility。`check-dist.mjs` 会在 preflight 被重新
+   打开时失败。
 3. **`appState` 只放跨模块共享的值。** 视图内部状态（选中项、定时器、已加载标记）留在该模块的闭包里。加字段前先确认真的有第二个模块要读。
 4. **数据源只走 `core/`，视图不碰传输层。** 不要在视图里直接访问 `window.__TAURI__`，也不要在视图里手写 `fetch`：`core/ipc.js` 负责 IPC（浏览器里降级为日志 no-op，这是 `ui/tools/smoke.mjs` 能脱离 Tauri 跑完整启动流程的原因），`core/api.js` 负责两个观测面板的数据源。**首页统计与请求日志表走 HTTP 优先**（`GET /api/stats/today`、`GET /api/request-logs`），监听器不可用时自动回退到同名 Tauri 命令；两条传输返回同一份形状（由 `src/api.rs` 单点定义），所以视图不需要知道是谁答的。判断新数据属于哪边：需要 `AppHandle`、窗口或系统面板等能力的走 Tauri 命令；只读、可持久化查询的观测数据走 `/api/*`。
 5. **打破循环依赖用注入，不用反向 import。** 已有两例：`palette.js` 接收 `switchTab`，`settings/oauth-qr.js` 接收 `repaint`。反向 import 会让模块初始化顺序变成隐式契约。
@@ -94,14 +115,17 @@ ui/
 ## 四、修改 UI 后的自检清单
 
 ```bash
-task ui-test          # = check-ui（静态）+ smoke（无头浏览器行为回归）
+task ui-test          # = check-ui（静态）+ smoke（无头浏览器行为回归，针对源码）
+task ui-dist-test     # = 构建 + check-dist + 同一套 smoke（针对真正发布的那份产物）
 ```
 
 - [ ] 级联顺序与文件清单未变（或已同步更新本文件与 `index.html`）
-- [ ] 新样式没写死颜色，或用的是既有令牌
+- [ ] 新样式没写死颜色，或用的是既有令牌（用 Tailwind 时也走 `var(--token)`）
 - [ ] 新 `id` 有归属前缀，且只创建一次
 - [ ] 页面无 console 报错，四个标签页均正常渲染（运行概览 / 实时日志 / 会话 / 服务设置）
 - [ ] 深色模式下目视确认（`prefers-color-scheme: dark`）
+- [ ] **改完 UI 跑过 `task ui-dist-test`**：源码绿不等于产物绿（模块拆分、级联顺序、
+      入口标签形状都只在构建后才可能出错）
 
 `smoke.mjs` 会在无头 Chrome 里对着 mock 后端把真实页面完整启动一遍，断言概览指标、设置表单与身份池的渲染值，并验证两个跨模块集成点（命令面板的动态导入、扫码成功后身份池重绘）。改动这些路径后它应当仍然全绿；若断言值确实需要变，请一并更新脚本里的 `EXPECTED`，让改动是显式的而不是被忽略的。
 
@@ -125,14 +149,24 @@ task ui-test          # = check-ui（静态）+ smoke（无头浏览器行为回
 - 登录页也一样：`/admin/login#sessions` 登录成功后回到 `#sessions`；会话过期被踢到登录页时也会带上当前 hash。
   登录表单里有一个隐藏的 `next` 字段，服务端**只接受四个已知标签名**——它是一个表单字段，绝不能变成开放重定向。
 
-## 六、本地调试页面（不编译 Rust）
+## 六、本地调试页面（连真实后端，不编译 Rust）
 
-改 UI（布局、CSS、会话页）时不必每次 `task dev` 起 Tauri。`task ui-dev` 会：
-- 静态托管 `ui/`（你改文件后刷新标签页即可）；
-- 注入 `window.__TAURI__` 的 mock 桥接；
-- 「会话」页读取**你本机**的 `~/.claude/projects` 真实记录（`CLAUDE_PROJECTS_DIR` 可覆盖）。
+改 UI（布局、CSS、会话页）时不必每次 `task dev` 起 Tauri。
 
-未实现的命令（除会话以外的设置/身份池操作）会**显式报错**而不是静默返回空，
-这样新接一条命令时一眼能看出「面板是空的」还是「命令没接上」。
+```bash
+task dev-server      # 终端一：起一个真实网关（$HOME/.proxy-rs-dev，token=dev）
+task ui-dev          # 终端二：Vite 热更新，端口 4300
+```
 
-它**不是**网关：没有请求统计、没有服务启停。验证这些或验证真实 IPC 时仍用 `task dev` 或 `task ui-smoke`。
+- Vite 托管 `ui/`，**热模块替换**——改 JS 模块即时生效，改 CSS 不刷新页面；
+- `/admin/*`、`/api/*` 代理到真实网关：登录、会话列表（`~/.claude/projects`）、
+  RPC 全部是真实数据；
+- 首次访问会落到网关的登录页，登录后 cookie 落在 4300 这个 origin 上，之后照常使用。
+
+换后端：`BACKEND=http://127.0.0.1:3456 task ui-dev`。
+
+**这里没有 mock。** 旧版 `dev.mjs` 自带一套 JS 会话解析器，它总会和
+`src/claude_sessions.rs` 差一个字段，而且「mock 能过、真实网关会失败」的 bug 在这里
+永远复现不出来——所以删掉了。命令失败就是失败，看到的和线上一致。
+
+`task ui-smoke` 仍然用 mock（它要在没有后端的环境里跑回归），那是**测试**，不是调试。

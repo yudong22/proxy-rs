@@ -8,9 +8,15 @@
     "tauri": "tauri",
     "dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
     "build": "tauri build -b app",
-    "build:dmg": "tauri build -b dmg"
+    "build:dmg": "tauri build -b dmg",
+    "build:ui": "vite build",
+    "check:dist": "node ui/tools/check-dist.mjs"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.5"
+    "@tauri-apps/cli": "^2.11.5",
+    "autoprefixer": "^10.6.2",
+    "postcss": "^8.5.32",
+    "tailwindcss": "^3.4.19",
+    "vite": "^5.4.21"
   }
 }

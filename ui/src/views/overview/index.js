@@ -77,7 +77,13 @@ export function initOverview() {
     const card = $('#stat-card-points');
     const value = $('#metric-points');
     refreshingPoints = true;
-    if (value) value.textContent = '⏳ 刷新中…';
+    // The in-flight text keeps the `pending` class so the skeleton bar stays
+    // behind it and the card's height does not move; the dim + pulse come from
+    // `.metric-card.loading` on the card itself.
+    if (value) {
+      value.textContent = '⏳ 刷新中…';
+      value.classList.add('pending');
+    }
     if (card) card.classList.add('loading');
     try {
       await invoke('wb_refresh_points');
@@ -95,6 +101,11 @@ export function initOverview() {
     } finally {
       refreshingPoints = false;
       if (card) card.classList.remove('loading');
+      // Repaints the card from `get_status`. This deliberately skips the
+      // session-metrics and stats reads: the speed card and the totals row are
+      // unchanged by a balance refresh, and on a slow link a combined refresh
+      // would leave the points card showing "⏳ 刷新中…" until all three
+      // answered. The 10 s pollers pick the other two up on their own.
       await refreshStatus();
     }
   });

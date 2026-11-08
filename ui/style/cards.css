@@ -34,14 +34,70 @@
 }
 
 /* Secondary line under a card's value: the account a balance belongs to.
-   Deliberately quiet — it names the value above it, it is not a second metric. */
+   Deliberately quiet — it names the value above it, it is not a second metric.
+   Rendered as an empty `div` from the start (`cards.js` passes `sub`), so the
+   card already has this line box before `refreshStatus` fills it and the card
+   does not grow when the value arrives. Cards that draw no value bar therefore
+   still leave room for this line — that is the cost of a card whose height
+   never changes, and it is what keeps the page from reflowing. */
 .metric-sub {
   margin-top: 4px;
+  min-height: 18px; /* the 12px/1.5 line box it will hold (measured; 17px left a 1px jump) */
   font-size: 12px;
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Skeleton: a value that has not arrived yet.
+   `cards.js` renders a placeholder and marks the slot `pending`; the first read
+   to land replaces the content and drops the class (`setValue` in `core/dom.js`).
+   Until then a grey bar the width of the coming text stands in — a slow link
+   shows "loading" instead of a dash that reads like a real figure.
+
+   The bar is the slot's own line, lifted into `::after` and coloured; the slot
+   keeps one transparent character so its line box is exactly the one the real
+   value will take. A separate pseudo-element would be a second line box and
+   would make the card 30px taller until data arrived — which is a reflow, the
+   thing this is meant to remove. `line-height` is left at the inherited 1.5
+   (30px at 20px), so both states agree by construction rather than by a
+   hard-coded pixel height that drifts with the font. */
+.metric-value {
+  position: relative;
+}
+
+.metric-value.pending {
+  color: transparent;
+}
+
+.metric-value.pending::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  translate: 0 -50%;
+  width: 42%;
+  height: 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface2);
+  animation: skeleton-shimmer 1.2s ease-in-out infinite;
+}
+
+/* The wide cards' values are strings (`42 tok/s`, `1.2M`), so their bar tracks
+   the typical string length rather than one width for all. */
+.metric-value.pending.metric-value--wide::after {
+  width: 62%;
+}
+
+@keyframes skeleton-shimmer {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .metric-value.pending::after { animation: none; }
+  .metric-card.loading .metric-value { animation: none; }
 }
 
 /* ── Session speed table (输出速度 drill-down) ────────────────── */

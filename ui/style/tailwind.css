@@ -1,0 +1,21 @@
+/**
+ * Tailwind entry.
+ *
+ * Empty on purpose: this file is the hook, not a stylesheet. Nothing here is
+ * imported by any view yet, so it contributes no rules to the page today — the
+ * first component that adopts utility classes imports it (or `index.html` links
+ * the built file). Keeping it separate from `style/` means `check-ui.mjs`'s
+ * cascade check does not see a 21st stylesheet until one actually applies.
+ *
+ * Why an entry at all: Tailwind needs somewhere to emit its utilities, and
+ * putting them in `style/` would mean either a `@tailwind` directive inside a
+ * cascade-managed file (mixing two systems in one file) or a new `<link>` whose
+ * position in the cascade is undefined. A standalone layer, appended after the
+ * existing cascade, keeps the rule "new appearance reads tokens" visible.
+ *
+ * Preflight is disabled in tailwind.config.js — see the comment there for why a
+ * reset on top of base.css is not safe.
+ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

@@ -75,6 +75,11 @@ const CASCADE = [
   'wb-pool.css',
   'wb-qr.css',
   'wb-report.css',
+  // Tailwind utilities. Last, so a utility on an element beats a component
+  // class it is decorating — the same rule that puts the WorkBuddy layer below.
+  // Emitted by `npm run build:ui`; preflight is off (tailwind.config.js), so it
+  // adds utilities only and changes nothing about the 20 layers above it.
+  'tailwind.css',
 ];
 
 const problems = [];

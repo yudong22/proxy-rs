@@ -88,6 +88,17 @@
   border-radius: 20px;
 }
 
+/* The text starts as 未启动 and becomes 运行中 · 端口 3456, which is 68px wider.
+   The pill is the rightmost thing in the header, so without this every element
+   to its left slid 68px on the first status read — a visible jump on a slow
+   link. `min-width` is the widest live string measured in the 12px UI font
+   (104px); the short label sits at the left edge instead of being centred in
+   the reserved space. `smoke.mjs`'s overview scenario fails if this drifts. */
+#status-text {
+  display: inline-block;
+  min-width: 104px;
+}
+
 .status-dot {
   width: 8px;
   height: 8px;

@@ -10,8 +10,9 @@
        later file reads, then reset/utilities, controls, badges, overlays, the
        shell layout, shared cards, the log pane + data table, the log console
        and request-detail table, the per-view rules (overview, settings, logs,
-       sessions), and finally the WorkBuddy-specific rules (pool, QR dialog,
-       check-in report) that are allowed to override everything above.
+       sessions), the WorkBuddy-specific rules (pool, QR dialog, check-in
+       report) that are allowed to override everything above, and last the
+       Tailwind utilities.
        The order of these <link> tags IS the cascade — it must match the
        CASCADE array in ui/tools/check-ui.mjs, which enforces it. -->
   <link rel="stylesheet" href="style/tokens.css">
@@ -34,6 +35,7 @@
   <link rel="stylesheet" href="style/wb-pool.css">
   <link rel="stylesheet" href="style/wb-qr.css">
   <link rel="stylesheet" href="style/wb-report.css">
+  <link rel="stylesheet" href="style/tailwind.css">
 </head>
 
 <!--

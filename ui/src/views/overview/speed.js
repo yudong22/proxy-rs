@@ -6,7 +6,7 @@
  * nothing with the rest of the page beyond the mount point.
  */
 
-import { $, setText, html, raw } from '../../core/dom.js';
+import { $, setValue, html, raw } from '../../core/dom.js';
 import { invoke } from '../../core/ipc.js';
 import { appState } from '../../core/state.js';
 import {
@@ -42,7 +42,7 @@ export async function refreshSessionMetrics() {
   if (!m) return;
   appState.sessionMetrics = m;
 
-  setText('metric-speed', formatTps(m.speed_tps));
+  setValue('metric-speed', formatTps(m.speed_tps));
   // The card's tooltip carries the context the small value cannot: which model,
   // how many turns, and how many tokens the rate was measured over.
   const card = $('#stat-card-speed');
