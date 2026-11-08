@@ -711,9 +711,20 @@ mod tests {
     }
 
     /// Serialises the tests above: they mutate process-global env vars.
+    ///
+    /// **Shares `data_dir_test_lock` on purpose.** `data_dir()` resolves through
+    /// `HOME`, so a test that rewrites `HOME` and a test that sets
+    /// `PROXY_DATA_DIR` and then reads the result are racing on the same global
+    /// state. They used to hold separate locks, which held locally by luck and
+    /// failed on CI:
+    ///
+    ///   left: "/tmp/home-definitely/.proxy-rs-test-settings"
+    ///   right: "/home/runner/.proxy-rs-test-settings"
+    ///
+    /// One lock over every test that touches either variable is what makes the
+    /// serialisation real.
     fn home_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        data_dir_test_lock()
     }
 
     /// `(key, previous value)` for every var [`home_dir`] consults.
