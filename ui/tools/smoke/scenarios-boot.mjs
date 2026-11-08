@@ -196,7 +196,11 @@ export async function checkAutomationDialog(ctx) {
   check('automation switches reflect stored preferences',
     [auto.checkinChecked, auto.growthChecked], [true, false]);
   check('check-in time seeds from stored preferences', auto.checkinTime, '08:30');
-  check('growth hint explains the off state', auto.growthHint.includes('关闭中'), true);
+  // `undefined` when the dialog did not render at all — which is what a broken
+  // module looks like. Reported as a failure rather than throwing, so the run
+  // finishes and the report names every broken assertion instead of dying on
+  // the first one with "cannot read properties of undefined".
+  check('growth hint explains the off state', String(auto.growthHint ?? '').includes('关闭中'), true);
   // Close it again so the rest of the run sees the resting page.
   await send('Runtime.evaluate', { expression: `document.querySelector('#wb-automation-overlay [data-close]')?.click()` });
   await new Promise((r) => setTimeout(r, 250));

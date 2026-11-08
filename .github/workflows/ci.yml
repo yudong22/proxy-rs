@@ -46,6 +46,23 @@ jobs:
       - name: Test
         run: cargo test
 
+      # The lib tests mutate process-global environment (`HOME`,
+      # `PROXY_DATA_DIR`) and therefore rely on locks to serialise. A lock that
+      # was accidentally split let two tests race for months: it passed locally
+      # because the scheduler happened to interleave them safely, and failed on
+      # every CI run the moment the machine got faster.
+      #
+      # This is the parallel configuration the race needs to appear, run
+      # repeatedly. `cargo test` already runs tests in parallel, so one pass is
+      # usually enough — the repetition is what turns "usually" into evidence.
+      # It is a few seconds of a job that has already compiled everything.
+      - name: Test (parallel, repeated — catches env-var races)
+        run: |
+          for i in 1 2 3; do
+            echo "--- lib tests, pass $i ---"
+            cargo test --lib -- --test-threads=16
+          done
+
       # The headless server is a separate bin from the desktop app and nothing
       # else on Linux compiles it — a change that breaks it would otherwise only
       # surface at release time (or, worse, on the operator's server).
@@ -98,4 +115,59 @@ jobs:
       - name: Smoke (built bundle)
         run: npm run smoke:dist
         env:
+          SMOKE_REQUIRED: '1'
+
+  # The server console, end to end: build the real `proxy-rs-server`, start it,
+  # log in through the actual login form, and drive the real front-end against
+  # it in headless Chrome.
+  #
+  # `admin-smoke.mjs` has existed for a long time and was never run by CI — the
+  # one test that exercises "the gateway serves the console it compiled in" was
+  # opt-in and manual. The gap it left is exactly where 3.5.0 broke: the console
+  # page was served, but the window's start page was not built.
+  admin-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install front-end deps
+        run: npm ci
+
+      - name: Build front-end (ui-dist/)
+        run: npm run build:ui
+
+      - name: Build headless server
+        run: cargo build --bin proxy-rs-server
+
+      - name: Start the gateway
+        run: |
+          set -eu
+          DATA="$(mktemp -d)"
+          PROXY_DATA_DIR="$DATA" PROXY_API_TOKEN=ci-smoke-token \
+          PROXY_BIND=127.0.0.1 ./target/debug/proxy-rs-server > "$DATA/server.log" 2>&1 &
+          echo $! > "$DATA/server.pid"
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:3456/health" >/dev/null 2>&1; then
+              echo "gateway is up"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::the gateway never answered /health"
+          cat "$DATA/server.log"
+          exit 1
+
+      - name: Server console smoke (real gateway, real login)
+        run: node ui/tools/admin-smoke.mjs
+        env:
+          BASE: http://127.0.0.1:3456
+          TOKEN: ci-smoke-token
           SMOKE_REQUIRED: '1'

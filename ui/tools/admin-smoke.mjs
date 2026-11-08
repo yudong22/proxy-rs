@@ -36,15 +36,41 @@ import { spawn } from 'node:child_process';
 
 const BASE = process.env.BASE || 'http://127.0.0.1:3456';
 const TOKEN = process.env.TOKEN || '';
-const CHROME =
-  process.env.CHROME_PATH ||
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+/**
+ * The Chrome binary, by platform — the same lookup `smoke.mjs` uses.
+ *
+ * Without it, CI on Linux finds nothing at the macOS path, prints SKIPPED and
+ * exits 0: a green tick over a suite that never ran. `SMOKE_REQUIRED=1` turns
+ * that skip into a failure, and `ci.yml` sets it.
+ */
+function chromePath() {
+  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+  if (process.platform === 'darwin') return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  for (const p of ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser']) {
+    if (fs.existsSync(p)) return p;
+  }
+  return '/usr/bin/google-chrome';
+}
+
+const CHROME = chromePath();
+
+/** True when a skip must be a failure (CI). */
+const REQUIRED = Boolean(process.env.SMOKE_REQUIRED);
 
 if (!TOKEN) {
+  if (REQUIRED) {
+    console.error('FAILED: TOKEN=<PROXY_API_TOKEN> is required (SMOKE_REQUIRED is set)');
+    process.exit(1);
+  }
   console.log('SKIPPED: set TOKEN=<PROXY_API_TOKEN> to run this harness.');
   process.exit(0);
 }
 if (!fs.existsSync(CHROME)) {
+  if (REQUIRED) {
+    console.error(`FAILED: no Chrome at ${CHROME} (SMOKE_REQUIRED is set, so skipping is not allowed)`);
+    process.exit(1);
+  }
   console.log(`SKIPPED: no Chrome at ${CHROME}`);
   console.log('Set CHROME_PATH to a Chrome/Chromium binary.');
   process.exit(0);

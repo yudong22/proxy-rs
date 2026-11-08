@@ -66,6 +66,8 @@ import {
 } from './smoke/scenarios-integration.mjs';
 import { checkOverviewLayout } from './smoke/scenarios-overview.mjs';
 import { checkBootstrapPage } from './smoke/scenarios-bootstrap.mjs';
+import { checkEveryPaneRenders } from './smoke/scenarios-pages.mjs';
+import { checkEmptyStates, checkEmptySessionList } from './smoke/scenarios-states.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 // Source by default. `UI_DIR=ui-dist` runs the same assertions against the Vite
@@ -154,6 +156,27 @@ const check = (label, actual, expected) => {
   if (a !== e) failures.push(`${label}\n      expected: ${e}\n      actual:   ${a}`);
 };
 
+/**
+ * Run one scenario, turning a thrown error into a failure.
+ *
+ * A scenario asserts against what the page produced. When the page is broken —
+ * a module that throws on entry, a pane that never rendered — the scenario's
+ * own expression often throws first (`undefined.includes`), and without this
+ * the whole harness died on the first one: `harness error: Cannot read
+ * properties of undefined`, with every other assertion in the run unreported.
+ *
+ * Reporting it as a failure keeps the run going and names the scenario, which
+ * is the difference between "something broke" and "this view is broken".
+ */
+const scenario = async (name, fn) => {
+  try {
+    return await fn();
+  } catch (err) {
+    failures.push(`${name} threw: ${err?.message || err}\n      ${String(err?.stack || '').split('\n').slice(0, 4).join('\n      ')}`);
+    return undefined;
+  }
+};
+
 let ws;
 try {
   let version = null;
@@ -220,6 +243,15 @@ try {
                 ? window.__MOCKDATA__[cmd] : null));
           });
         }
+        // State-matrix hooks, set by a scenario before it navigates:
+        //   __MOCK_ALL_NULL__  — every command answers null (no backend)
+        //   __MOCK_OVERRIDE__  — one command's answer is replaced, by name
+        // Both are read per call so the scenario can flip them between loads.
+        if (window.__MOCK_ALL_NULL__) return Promise.resolve(null);
+        const override = window.__MOCK_OVERRIDE__;
+        if (override && Object.prototype.hasOwnProperty.call(override, cmd)) {
+          return Promise.resolve(override[cmd]);
+        }
         // get_growth_progress is take-and-clear on the real backend: the
         // console drains the buffer and the next poll sees nothing new. The
         // mock reproduces that, so a UI that kept re-reading the same lines
@@ -267,26 +299,35 @@ try {
   // snapshot, so later scenarios cannot change it — but keeping the original
   // sequence means a regression still reports itself at the same point it used
   // to.
-  const b = await checkBoot(ctx);
-  await checkAutomationDialog(ctx);
-  await checkGrowthProgress(ctx);
-  await checkBootDerived(ctx, b);
-  await checkRequestLogs(ctx);
-  await checkSessions(ctx);
-  await checkHashRouting(ctx);
-  await returnToOverview(ctx);
+  const b = await scenario('boot', () => checkBoot(ctx));
+  await scenario('automation dialog', () => checkAutomationDialog(ctx));
+  await scenario('growth progress', () => checkGrowthProgress(ctx));
+  await scenario('boot (derived)', () => checkBootDerived(ctx, b));
+  await scenario('request logs', () => checkRequestLogs(ctx));
+  await scenario('sessions', () => checkSessions(ctx));
+  await scenario('hash routing', () => checkHashRouting(ctx));
+  await scenario('return to overview', () => returnToOverview(ctx));
 
-  const i = await checkPaletteAndOAuth(ctx);
-  await checkPoolTransfer(ctx);
-  await checkLoginRecovery(ctx);
+  const i = await scenario('palette + OAuth', () => checkPaletteAndOAuth(ctx));
+  await scenario('pool transfer', () => checkPoolTransfer(ctx));
+  await scenario('login recovery', () => checkLoginRecovery(ctx));
 
   // Last, because it reloads the page and every scenario above worked against
   // the DOM that reloaded document replaces.
-  await checkOverviewLayout({ send, check, origin: `http://127.0.0.1:${PORT}` });
+  await scenario('overview layout', () => checkOverviewLayout({ send, check, origin: `http://127.0.0.1:${PORT}` }));
 
   // Loads a different document (the start page), so it goes after every
   // scenario that works against the console.
-  await checkBootstrapPage({ send, check, origin: `http://127.0.0.1:${PORT}` });
+  await scenario('bootstrap page', () => checkBootstrapPage({ send, check, origin: `http://127.0.0.1:${PORT}` }));
+
+  // The non-happy states. Last of the page-replacing scenarios: each one
+  // navigates and swaps the bridge, so anything after it starts from its state.
+  await scenario('empty states', () => checkEmptyStates({ send, check, origin: `http://127.0.0.1:${PORT}` }));
+  await scenario('empty session list', () => checkEmptySessionList({ send, check, origin: `http://127.0.0.1:${PORT}` }));
+
+  // Every page and pane, loaded fresh at the end so the swapped bridge state
+  // above cannot leak into it (a fresh document, default bridge).
+  await scenario('every pane', () => checkEveryPaneRenders({ send, check, origin: `http://127.0.0.1:${PORT}` }));
 
   if (runtimeErrors.length) {
     failures.push(`runtime console errors:\n      ${runtimeErrors.join('\n      ')}`);
@@ -294,7 +335,8 @@ try {
 
   console.log(`boot assertions: counts, text, credential rows, default identity`);
   console.log(`integration: palette + OAuth repaint + pool import/export + login recovery`);
-  console.log(`mock commands exercised: ${i.called.length}`);
+  console.log(`pages + states: every pane, loading/empty, bootstrap start page`);
+  console.log(`mock commands exercised: ${i?.called?.length ?? 'n/a'}`);
   if (failures.length === 0) {
     console.log('\nall assertions passed');
     process.exitCode = 0;
