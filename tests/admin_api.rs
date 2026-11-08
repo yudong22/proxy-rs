@@ -544,7 +544,7 @@ async fn an_anonymous_visitor_gets_the_login_page() {
     );
     // The page that *creates* a session cannot require one.
     assert!(
-        !body.contains("type=\"module\" src=\"src/main.js\""),
+        !body.contains("type=\"module\" src=\"src/main-"),
         "not the console yet"
     );
 }
@@ -581,17 +581,51 @@ async fn the_console_assets_are_served_with_correct_types() {
     let _iso = isolate("console-assets", Some("tok")).await;
     let app = console_router();
 
-    for (uri, expected) in [
-        ("/admin/src/main.js", "text/javascript"),
-        ("/admin/src/bridge.js", "text/javascript"),
-        ("/admin/src/views/overview.js", "text/javascript"),
-        ("/admin/style/tokens.css", "text/css"),
-        ("/admin/assets/logo.svg", "image/svg+xml"),
-    ] {
-        let (status, ct, _) = get_raw(app.clone(), uri, None).await;
-        assert_eq!(status, StatusCode::OK, "{uri}");
-        assert!(ct.starts_with(expected), "{uri}: got {ct}, want {expected}");
+    // The names are hashed by the Vite build (`main-<hash>.js`, `main-<hash>.css`,
+    // `logo-<hash>.svg`), so they are discovered from the served page rather than
+    // hard-coded. Asserting the literal source paths (`src/main.js`,
+    // `style/tokens.css`, `assets/logo.svg`) passed before the bundle existed and
+    // would now fail for the right reason: those files are not what ships.
+    //
+    // With a cookie: without one `/admin/` is the login page (see
+    // `an_unauthenticated_visit_gets_the_login_page`), which references no
+    // assets at all.
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let (_, _, html) = get_raw(app.clone(), "/admin/", Some(&cookie)).await;
+    let references: Vec<String> = ["src/main-", "style/main-", "assets/logo-"]
+        .iter()
+        .map(|prefix| {
+            let at = html
+                .find(prefix)
+                .unwrap_or_else(|| panic!("the console page must reference {prefix}*: {html}"));
+            let rest = &html[at..];
+            let end = rest
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated reference to {prefix}*"));
+            rest[..end].to_string()
+        })
+        .collect();
+
+    let expected = [
+        ("src/main-", "text/javascript"),
+        ("style/main-", "text/css"),
+        ("assets/logo-", "image/svg+xml"),
+    ];
+    for (prefix, ct) in expected {
+        let uri = references
+            .iter()
+            .find(|r| r.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix}* reference in the page: {references:?}"));
+        let (status, got, _) = get_raw(app.clone(), &format!("/admin/{uri}"), None).await;
+        assert_eq!(status, StatusCode::OK, "/admin/{uri}");
+        assert!(got.starts_with(ct), "/admin/{uri}: got {got}, want {ct}");
     }
+
+    // The bridge is not part of the bundle (it is injected as a classic script),
+    // so it keeps its stable path.
+    let (status, ct, _) = get_raw(app.clone(), "/admin/src/bridge.js", None).await;
+    assert_eq!(status, StatusCode::OK, "/admin/src/bridge.js");
+    assert!(ct.starts_with("text/javascript"), "got {ct}");
 }
 
 #[tokio::test]
@@ -1545,7 +1579,12 @@ async fn the_desktop_console_does_not_load_the_server_bridge() {
         !html.contains("src/bridge.js"),
         "the desktop console must not load the server bridge"
     );
-    assert!(html.contains("src/main.js"), "the console must still load");
+    // The entry is hashed by the build (`src/main-<hash>.js`), so the check is
+    // the shape, not the source path: the console must load its module entry.
+    assert!(
+        html.contains("src/main-") && html.contains("type=\"module\""),
+        "the console must still load its module entry"
+    );
 }
 
 /// A server console still loads the bridge — it has no Tauri to fall back on.

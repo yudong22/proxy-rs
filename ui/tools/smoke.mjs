@@ -74,13 +74,38 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 const UI = path.resolve(REPO, process.env.UI_DIR || 'ui');
 const PORT = 4197;
 const DEBUG = 9357;
-const CHROME = process.env.CHROME_PATH
-  || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+/**
+ * The Chrome binary, by platform.
+ *
+ * `CHROME_PATH` wins. The defaults cover a macOS dev machine and the GitHub
+ * `ubuntu-latest` image, which ships Chrome as `/usr/bin/google-chrome` — so CI
+ * does not have to remember to export anything.
+ */
+function chromePath() {
+  const fromEnv = process.env.CHROME_PATH;
+  if (fromEnv) return fromEnv;
+  if (process.platform === 'darwin') return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  for (const p of ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser']) {
+    if (fs.existsSync(p)) return p;
+  }
+  return '/usr/bin/google-chrome';
+}
+
+const CHROME = chromePath();
 
 if (!fs.existsSync(CHROME)) {
   // An explicit, loud skip rather than a failure: this keeps `task check`
   // usable on a machine without Chrome. A smoke test that silently reported
   // success when it never ran would be worse than having none.
+  //
+  // CI must NOT rely on this: a skip is exit 0, i.e. a green tick over a suite
+  // that never ran. `ci.yml` sets `SMOKE_REQUIRED=1` so a missing browser there
+  // is a failure instead.
+  if (process.env.SMOKE_REQUIRED) {
+    console.error(`FAILED: no Chrome at ${CHROME} (SMOKE_REQUIRED is set, so skipping is not allowed)`);
+    process.exit(1);
+  }
   console.log(`SKIPPED: no Chrome at ${CHROME}`);
   console.log('Set CHROME_PATH to a Chrome/Chromium binary to run this harness.');
   process.exit(0);

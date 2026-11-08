@@ -1,5 +1,13 @@
 version: '3'
 
+# Deliberately small. Two things are used day to day — installing the desktop
+# app and the UI hot-reload loop — plus the tasks they cannot run without.
+#
+# Everything else (fmt / lint / test / check / watch / audit / doc / bench /
+# release …) was removed: each is a single cargo or npm command, and a task list
+# that mirrors the toolchain is one more place to keep in sync. Run the command
+# directly, or let CI (`ci.yml`) run the full gate on every push.
+
 vars:
   APP_NAME: Proxy RS
   APP_BIN: proxy-rs-gui
@@ -13,8 +21,11 @@ tasks:
       - task --list
 
   # ── Desktop app ──────────────────────────────────────────────────────────
+  # Dependency of `install` and `build`: the pinned Tauri CLI, plus Vite and
+  # Tailwind for the front-end. `npm ci` also drives `build.rs`, which compiles
+  # the console from `ui-dist/` and fails without it.
   setup:
-    desc: Install the pinned Tauri CLI (Node dev dependency)
+    desc: Install Node dev dependencies (Tauri CLI, Vite, Tailwind)
     sources:
       - package.json
       - package-lock.json
@@ -23,70 +34,12 @@ tasks:
     cmds:
       - npm ci
 
-  dev:
-    desc: Start the Tauri 2 GUI in development mode, isolated from the installed app (port 3477)
-    aliases: [gui-dev]
-    deps: [setup]
-    cmds:
-      # A dev run must not fight the installed app. Three things are separated:
-      #
-      #   1. Data dir — otherwise it loads the same ~/.proxy-rs/gui-settings.json
-      #      (and its port) and writes request stats into the same stats.db.
-      #      PROXY_DATA_DIR relocates settings, stats, logs and .env
-      #      together.
-      #   2. Single-instance socket — the plugin keys off the bundle identifier,
-      #      so npm run dev passes tauri.dev.conf.json to give this build its own
-      #      identifier. Without that, launching dev connects to the installed
-      #      app's socket, exits(0), and just focuses the installed window.
-      #   3. Window title / product name — so the two are told apart in the Dock
-      #      and menu bar.
-      #
-      # The settings file is written once and then left alone: edit
-      # ~/.proxy-rs-dev/gui-settings.json to change the port, or set
-      # PROXY_DEV_PORT for the first run only.
-      - |
-        DEV_DIR="${PROXY_DATA_DIR:-${ANTHROPIC_PROXY_DATA_DIR:-$HOME/.proxy-rs-dev}}"
-        DEV_SETTINGS="$DEV_DIR/gui-settings.json"
-        mkdir -p "$DEV_DIR"
-
-        if [ ! -f "$DEV_SETTINGS" ]; then
-          PORT="${PROXY_DEV_PORT:-${ANTHROPIC_PROXY_DEV_PORT:-3477}}"
-          printf '%s\n' \
-            '{' \
-            '  "provider_id": "workbuddy-cn",' \
-            '  "custom_url": "",' \
-            '  "api_key": "",' \
-            "  \"port\": $PORT," \
-            '  "bind": "127.0.0.1",' \
-            '  "reasoning_model": "",' \
-            '  "completion_model": "",' \
-            '  "model_map": "",' \
-            '  "launch_at_login": false,' \
-            '  "sanitize_terms": ""' \
-            '}' > "$DEV_SETTINGS"
-          echo "🧪 Created $DEV_SETTINGS (port $PORT)"
-        fi
-
-        DEV_PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$DEV_SETTINGS" | head -1)
-        echo "🧪 Dev data dir : $DEV_DIR"
-        echo "🧪 Dev console  : http://127.0.0.1:${DEV_PORT:-3477}"
-        echo "🧪 Installed app keeps $HOME/.proxy-rs untouched"
-        echo
-        PROXY_DATA_DIR="$DEV_DIR" npm run dev
-
   build:
     desc: Build the Tauri 2 GUI desktop app (.app)
     aliases: [gui-build]
     deps: [setup]
     cmds:
       - npm run build
-
-  build-dmg:
-    desc: Build the Tauri 2 GUI desktop installer (.dmg)
-    aliases: [gui-build-dmg]
-    deps: [setup]
-    cmds:
-      - npm run build:dmg
 
   install:
     desc: Build the .app and replace {{.INSTALL_APP}} (restarts it if running)
@@ -115,180 +68,18 @@ tasks:
         fi
         echo "✅ Installed to {{.INSTALL_APP}}"
 
-  uninstall:
-    desc: Remove the installed desktop app
-    cmds:
-      - rm -rf "{{.INSTALL_APP}}"
-      - echo "✅ Uninstalled {{.APP_NAME}}"
-
-  # ── Quality gate ─────────────────────────────────────────────────────────
-  fmt:
-    desc: Format code
-    cmds:
-      - cargo fmt
-
-  fmt-check:
-    desc: Check code formatting
-    cmds:
-      - cargo fmt -- --check
-
-  lint:
-    desc: Run clippy linter
-    cmds:
-      - cargo clippy --all-targets -- -D warnings
-
-  lint-fix:
-    desc: Run clippy with auto-fix
-    cmds:
-      - cargo clippy --fix --allow-dirty --allow-staged
-
-  test:
-    desc: Run all tests
-    cmds:
-      - cargo test
-
-  test-verbose:
-    desc: Run tests with verbose output
-    cmds:
-      - cargo test -- --nocapture --test-threads=1
-
-  # ── Front-end (ui/) ──────────────────────────────────────────────────────
-  # `ui/` is the source tree: no bundler runs over it for the checks below, so
-  # nothing else would catch a stylesheet that is not linked, an import that no
-  # module exports, or an id lookup that misses.
-  #
-  # `ui-dist/` is the Vite build the app actually ships (see vite.config.js).
-  # Its checks are separate because they test different things — the build's
-  # file layout and the behaviour of the built page, not the source.
-
-  ui-build:
-    desc: Build ui/ into ui-dist/ (Vite + Tailwind)
-    cmds:
-      - npx vite build
-
-  ui-dev:
-    desc: UI hot-reload loop against a real gateway (run `task dev-server` first)
-    cmds:
-      - node ui/tools/dev.mjs
-
+  # ── Front-end dev loop ───────────────────────────────────────────────────
+  # `ui-dev` proxies /admin/* and /api/* to a real gateway, so it needs one
+  # running. `dev-server` is that gateway; run it in a second terminal.
+  # (It is a dependency in spirit, not in `deps:` — it must stay in the
+  # foreground, so `deps:` would block `ui-dev` from ever starting.)
   dev-server:
     desc: Run the headless gateway locally for `task ui-dev` (builds the server once)
     cmds:
       - cargo build --bin proxy-rs-server
       - PROXY_DATA_DIR=$HOME/.proxy-rs-dev PROXY_API_TOKEN=dev ./target/debug/proxy-rs-server
 
-  ui-check:
-    desc: Check ui/ consistency (stylesheet cascade, imports, ids)
+  ui-dev:
+    desc: UI hot-reload loop against a real gateway (run `task dev-server` first)
     cmds:
-      - node ui/tools/check-ui.mjs
-
-  ui-smoke:
-    desc: Boot ui/ in headless Chrome against a mock backend and assert behaviour
-    cmds:
-      - node ui/tools/smoke.mjs
-
-  ui-test:
-    desc: Run the source-tree front-end checks (fast, no build)
-    cmds:
-      - task: ui-check
-      - task: ui-smoke
-
-  ui-dist-test:
-    desc: Build ui/ and run the same checks against the shipped bundle
-    cmds:
-      - task: ui-build
-      - node ui/tools/check-dist.mjs
-      # The same smoke suite against the build: proves the bundle behaves like
-      # the source (dynamic imports, cascade order, the entry tag console.rs
-      # injects into). This is the only place a build-only regression shows up.
-      - UI_DIR=ui-dist node ui/tools/smoke.mjs
-
-  admin-smoke:
-    desc: Boot the server-mode console in headless Chrome against a live gateway
-    cmds:
-      # Needs a running `proxy-rs-server` and its PROXY_API_TOKEN; skips cleanly
-      # when either is absent so this can sit in `task check` on any machine.
-      - node ui/tools/admin-smoke.mjs
-
-  check:
-    desc: Run all checks (fmt, lint, test, ui)
-    cmds:
-      - task: fmt-check
-      - task: lint
-      - task: test
-      # Source-tree checks only. The build and the bundle's behaviour
-      # (`ui-dist-test`) are run by whoever touches ui/, and always by the
-      # release build, which needs the bundle anyway — running a Vite build on
-      # every `task check` would add seconds for a tree that did not change.
-      - task: ui-test
-
-  clean:
-    desc: Clean build artifacts
-    cmds:
-      - cargo clean
-      - echo "✅ Cleaned build artifacts"
-
-  # ── Maintenance ──────────────────────────────────────────────────────────
-  watch:
-    desc: Watch and auto-restart the GUI on changes
-    cmds:
-      - cargo watch -x "run -p proxy-rs-gui"
-
-  audit:
-    desc: Check for security vulnerabilities
-    cmds:
-      - cargo audit
-
-  update:
-    desc: Update dependencies
-    cmds:
-      - cargo update
-
-  outdated:
-    desc: Check for outdated dependencies
-    cmds:
-      - cargo outdated
-
-  tree:
-    desc: Show dependency tree
-    cmds:
-      - cargo tree
-
-  doc:
-    desc: Generate and open documentation
-    cmds:
-      - cargo doc --open --no-deps
-
-  bench:
-    desc: Run benchmarks (if any)
-    cmds:
-      - cargo bench
-
-  size:
-    desc: Show the built binary size
-    deps: [build]
-    cmds:
-      - ls -lh {{.BUNDLE_DIR}}/{{.APP_NAME}}.app/Contents/MacOS/{{.APP_BIN}} | awk '{print "Binary size:", $5}'
-
-  release:
-    desc: Prepare a release (clean, check, build)
-    cmds:
-      - task: clean
-      - task: check
-      - task: build
-      - task: size
-      - echo "✅ Release app ready at {{.BUNDLE_DIR}}/{{.APP_NAME}}.app"
-
-  help:
-    desc: Show help information
-    cmds:
-      - echo "proxy-rs - High-performance AI protocol proxy (desktop app & core library)"
-      - echo ""
-      - echo "Common tasks:"
-      - echo "  task dev            - Start the GUI in development mode"
-      - echo "  task build          - Build the .app bundle"
-      - echo "  task build-dmg      - Build the .dmg installer"
-      - echo "  task install        - Build and install to /Applications"
-      - echo "  task test           - Run tests"
-      - echo "  task check          - Run all checks"
-      - echo "  task clean          - Clean build artifacts"
+      - node ui/tools/dev.mjs

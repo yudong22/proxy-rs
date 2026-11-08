@@ -94,10 +94,16 @@ jobs:
   # The headless Linux server binary.
   #
   # Separate from `build-tauri` because it needs none of the desktop toolchain:
-  # no Tauri CLI, no Node, no macOS/Windows SDK. It is a plain Rust build of the
+  # no Tauri CLI, no macOS/Windows SDK. It is a plain Rust build of the
   # `proxy-rs-server` bin, and it is what a Linux deployment actually installs —
   # before this job existed the release shipped only `.dmg`/`.msi`/`.exe`, so a
   # server operator had to install a Rust toolchain just to get the binary.
+  #
+  # It *does* need Node: `build.rs` compiles the admin console into the binary
+  # from `ui-dist/`, and panics without it. Skipping that here made this job —
+  # and therefore the whole release, since `release` needs it — fail inside a
+  # build script, with a message about missing UI assets and no hint that a
+  # front-end build was the missing step.
   #
   # **`x86_64-unknown-linux-musl`, statically linked.**
   #
@@ -125,6 +131,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The console is compiled into this binary; `build.rs` refuses to build
+      # without `ui-dist/`. See the job comment.
+      - name: Install front-end deps
+        run: npm ci
+
+      - name: Build front-end (ui-dist/)
+        run: npm run build:ui
 
       # musl needs a C toolchain that targets it: `rusqlite` (bundled SQLite) and
       # `ring` both compile C, and the default gcc does not emit musl binaries.
@@ -173,35 +192,29 @@ jobs:
 
       # Prove the artifact is *statically linked*, which is the actual fix.
       #
-      # v3.2.0 shipped `-gnu` and required GLIBC_2.34 — verified with `objdump -T`
-      # on the published binary — so it refused to start on Ubuntu 20.04, Debian
-      # 11, RHEL 8 and Alibaba Cloud Linux 3. A static musl build has no dynamic
-      # glibc dependency at all, which removes the question rather than testing one
-      # distribution's answer to it.
+      # v3.2.0 shipped `-gnu` and required GLIBC_2.34, so it refused to start on
+      # Ubuntu 20.04, Debian 11, RHEL 8 and Alibaba Cloud Linux 3.
       #
-      # The first version of this check ran the binary inside `debian:11` to prove
-      # it on an old glibc. That is strictly better evidence in principle, and it
-      # is what blocked this release twice: pulling an external image inside the
-      # release job adds a network dependency and a second way to fail, for a
-      # guarantee a static binary already provides by construction. The runtime
-      # check below still starts the process and waits for /health.
+      # **Which of the original three checks kept, and why not the others.**
+      # `file` was only logging (its output is reproduced by `ldd` below), so it
+      # is gone. The `objdump -T` check is the one that actually caught v3.2.0 —
+      # a *dynamic* binary that links glibc still lists `GLIBC_2.34` as a symbol
+      # requirement, and that is the precise defect, not "is it dynamic". `ldd`
+      # is kept as the fast, obvious signal; `objdump` is kept because it is the
+      # evidence the defect leaves behind, and dropping it would be trading the
+      # one check with a proven catch for nothing.
       - name: Verify the artifact is statically linked
         run: |
           set -eu
           BIN=proxy-rs-server-linux-x64/proxy-rs-server
-          file "$BIN"
-          if file "$BIN" | grep -q 'dynamically linked'; then
+          echo "--- ldd ---"
+          ldd "$BIN" || true
+          if ldd "$BIN" 2>&1 | grep -qE 'libc\.so|libpthread|GLIBC'; then
             echo "::error::the Linux artifact is dynamically linked; it must be static musl"
             exit 1
           fi
-          # `ldd` on a static binary reports "not a dynamic executable"; anything
-          # that lists libraries means a dynamic dependency slipped in.
-          if ldd "$BIN" 2>&1 | grep -qE 'libc\.so|libpthread|GLIBC'; then
-            echo "::error::dynamic glibc dependency detected"
-            ldd "$BIN" || true
-            exit 1
-          fi
-          # No GLIBC_* symbol version requirements may survive in the binary.
+          # The defect v3.2.0 shipped: glibc symbol-version requirements. A
+          # static musl binary has none.
           if objdump -T "$BIN" 2>/dev/null | grep -q 'GLIBC_[0-9]'; then
             echo "::error::the artifact carries GLIBC symbol-version requirements"
             objdump -T "$BIN" | grep 'GLIBC_' | head

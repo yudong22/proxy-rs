@@ -10,7 +10,10 @@
     "build": "tauri build -b app",
     "build:dmg": "tauri build -b dmg",
     "build:ui": "vite build",
-    "check:dist": "node ui/tools/check-dist.mjs"
+    "check:ui": "node ui/tools/check-ui.mjs",
+    "check:dist": "node ui/tools/check-dist.mjs",
+    "smoke": "node ui/tools/smoke.mjs",
+    "smoke:dist": "UI_DIR=ui-dist node ui/tools/smoke.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.5",

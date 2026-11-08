@@ -173,13 +173,13 @@ sequenceDiagram
 
 使用 Task：
 ```bash
-task setup       # 安装固定版本的 Tauri CLI (npm ci)
-task dev         # 启动本地开发桌面客户端 (端口 3477，数据隔离)
-task build       # 构建 macOS 应用程序 (.app)
-task build-dmg   # 打包生成 dmg 安装镜像
-task install     # 构建并安装到 /Applications (运行中自动热重启)
-task check       # 代码检查 (fmt + clippy + test)
+task install     # 构建并安装到 /Applications (运行中自动热重启；会自动 setup → build)
+task ui-dev      # 前端热更新循环，连真实网关（另开一个终端先跑 task dev-server）
+task dev-server  # 本地起一个 headless 网关，供 ui-dev 使用
 ```
+
+Taskfile 只保留这几个日常用的任务；`setup` / `build` 是 `install` 的依赖。
+其余检查请直接运行命令（见下）或交给 CI。
 
 使用 npm / cargo：
 ```bash

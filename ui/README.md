@@ -3,18 +3,21 @@
 Tauri 2 桌面应用的前端：原生 ES 模块 + 原生 CSS + Tailwind utilities，**没有框架**。
 `ui/` 是**源码**目录；Vite 把它构建到 `ui-dist/`，后者才是 `tauri.conf.json` 的
 `frontendDist`，也是 `build.rs` 编进二进制的资产。改完 `ui/` 后运行 `npm run build:ui`
-（或 `task ui-build`）生成 `ui-dist/`。
+生成 `ui-dist/`。
 
 ```bash
-task dev                              # 启动 Tauri 开发窗口（端口 3477，独立数据目录）
-task dev-server                       # 起一个真实 proxy-rs-server（ui-dev 需要）
-task ui-dev                           # 浏览器热更新：Vite + 代理到真实后端
-task ui-build                         # 构建 ui/ → ui-dist/
-task ui-check                         # 静态一致性检查（级联顺序、模块图、id）
-task ui-smoke                         # 无头 Chrome 启动源码页面 + mock 后端，断言行为
-task ui-dist-test                     # 构建后对 ui-dist/ 跑 check-dist + 同一套 smoke
-task ui-test                          # ui-check + ui-smoke（快，不构建）；已并入 task check
+task dev-server        # 起一个真实 proxy-rs-server（ui-dev 需要）
+task ui-dev            # 浏览器热更新：Vite + 代理到真实后端
+npm run build:ui       # 构建 ui/ → ui-dist/
+npm run check:ui       # 静态一致性检查（级联顺序、模块图、id）
+npm run check:dist     # 构建产物检查（路由前缀、入口标签形状、preflight）
+npm run smoke          # 无头 Chrome 启动源码页面 + mock 后端，断言行为
+npm run smoke:dist     # 同一套断言，对 ui-dist/ 产物跑
 ```
+
+> **Taskfile 只保留日常用的任务**（`install` / `ui-dev` / `dev-server`，以及
+> `install` 依赖的 `setup` / `build`）。前端检查走上面的 `npm run` 脚本，
+> 它们与 CI 用的是同一套命令。
 
 > **`ui-dev` 连的是真实后端。** 它不再自带 mock：Vite 托管 `ui/`，把 `/admin/*` 与
 > `/api/*` 代理到 `task dev-server` 起的网关，登录、会话、RPC 全部是真实的。旧版
@@ -70,7 +73,7 @@ ui/
 > 层叠顺序是语义的一部分：`logs.css` 原来的位置展开成 8–11，`views.css`
 > 展开成 12–17，`workbuddy.css` 展开成 18–20。**拆文件时新文件名必须同时进
 > `ui/index.html` 与 `ui/tools/check-ui.mjs` 的 `CASCADE` 数组**，否则
-> `task ui-check` 会失败。
+> `npm run check:ui` 会失败。
 
 ### 硬性规则
 
@@ -115,8 +118,9 @@ ui/
 ## 四、修改 UI 后的自检清单
 
 ```bash
-task ui-test          # = check-ui（静态）+ smoke（无头浏览器行为回归，针对源码）
-task ui-dist-test     # = 构建 + check-dist + 同一套 smoke（针对真正发布的那份产物）
+npm run check:ui      # 静态：级联顺序、模块图、id
+npm run smoke         # 无头浏览器行为回归（针对源码）
+npm run build:ui && npm run check:dist && npm run smoke:dist   # 针对真正发布的产物
 ```
 
 - [ ] 级联顺序与文件清单未变（或已同步更新本文件与 `index.html`）
@@ -124,7 +128,7 @@ task ui-dist-test     # = 构建 + check-dist + 同一套 smoke（针对真正�
 - [ ] 新 `id` 有归属前缀，且只创建一次
 - [ ] 页面无 console 报错，四个标签页均正常渲染（运行概览 / 实时日志 / 会话 / 服务设置）
 - [ ] 深色模式下目视确认（`prefers-color-scheme: dark`）
-- [ ] **改完 UI 跑过 `task ui-dist-test`**：源码绿不等于产物绿（模块拆分、级联顺序、
+- [ ] **改完 UI 跑过 `npm run build:ui` 后的 `check:dist` + `smoke:dist`**：源码绿不等于产物绿（模块拆分、级联顺序、
       入口标签形状都只在构建后才可能出错）
 
 `smoke.mjs` 会在无头 Chrome 里对着 mock 后端把真实页面完整启动一遍，断言概览指标、设置表单与身份池的渲染值，并验证两个跨模块集成点（命令面板的动态导入、扫码成功后身份池重绘）。改动这些路径后它应当仍然全绿；若断言值确实需要变，请一并更新脚本里的 `EXPECTED`，让改动是显式的而不是被忽略的。
@@ -151,7 +155,7 @@ task ui-dist-test     # = 构建 + check-dist + 同一套 smoke（针对真正�
 
 ## 六、本地调试页面（连真实后端，不编译 Rust）
 
-改 UI（布局、CSS、会话页）时不必每次 `task dev` 起 Tauri。
+改 UI（布局、CSS、会话页）时不必每次起 Tauri 窗口。
 
 ```bash
 task dev-server      # 终端一：起一个真实网关（$HOME/.proxy-rs-dev，token=dev）
@@ -169,4 +173,4 @@ task ui-dev          # 终端二：Vite 热更新，端口 4300
 `src/claude_sessions.rs` 差一个字段，而且「mock 能过、真实网关会失败」的 bug 在这里
 永远复现不出来——所以删掉了。命令失败就是失败，看到的和线上一致。
 
-`task ui-smoke` 仍然用 mock（它要在没有后端的环境里跑回归），那是**测试**，不是调试。
+`npm run smoke` 仍然用 mock（它要在没有后端的环境里跑回归），那是**测试**，不是调试。
