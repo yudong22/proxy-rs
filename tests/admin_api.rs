@@ -1767,6 +1767,11 @@ async fn the_desktop_registers_its_host_process_capabilities() {
         open_logs_dir: None,
         reveal_path: None,
         status: None,
+        // Not exercised by this test — it only drives start/stop. Both are
+        // `None` so the literal stays a desktop shape without claiming a
+        // console URL this test never serves.
+        console_port: None,
+        open_url: None,
     });
 
     let app = app_for(desktop_state());

@@ -189,6 +189,10 @@ async fn saving_settings_rebuilds_the_running_proxy_on_the_desktop() {
         open_logs_dir: None,
         reveal_path: None,
         status: None,
+        // The console-URL opener and the console port it needs are exercised by
+        // `tests/session_open_url.rs`; a settings save has no use for either.
+        console_port: None,
+        open_url: None,
     });
 
     let app = app_for(state_with(Arc::new(LogBuffer::new(100))));

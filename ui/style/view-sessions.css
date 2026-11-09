@@ -63,6 +63,94 @@
   background: var(--surface2);
 }
 
+/* One row occupies a wrapper so the row's own action can sit beside it.
+   HTML forbids a button inside a button, so `.sess-row` and `.sess-row-open`
+   are siblings and this wrapper is the positioning context. The row's height
+   stays child-owned (`.sess-row` keeps its 60px), so the list keeps the same
+   rhythm as before the wrapper existed. */
+.sess-row-wrap {
+  position: relative;
+}
+
+/* `.sess-row-open` is the *hook* class for "this control opens/copies this
+   session", shared by the row shortcut and the detail topbar's button (one
+   delegated handler serves both). Everything below is therefore scoped to the
+   wrapper: only the row variant floats over the row. */
+.sess-row-wrap:hover .sess-row-open {
+  /* Revealed on hover of the *row*, which is the whole width — hovering the
+     button's own corner before it is visible is impossible, so the trigger has
+     to be the wrapper. */
+  opacity: 1;
+}
+
+/* The row's shortcut: ↗ on the desktop console, ⧉ copy-link on the server
+   console (see `rowActionMarkup`). Invisible until wanted, so it never crowds
+   the title, but always focusable — opacity (not `display`/`visibility`) keeps
+   it in the tab order for keyboard users, whose reveal rule is below. */
+.sess-row-wrap .sess-row-open {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  /* Opaque, not transparent: the icon lands on top of the title's last
+     characters while it is fading in, and a see-through chip over text reads as
+     broken glyphs rather than as a button. */
+  background: var(--surface);
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+/* The title is clipped before it slides under the shortcut. Reserving the width
+   on the title alone (not on `.sess-row`, whose 60px two-line box must not
+   change) is what keeps the 60px row contract intact. */
+.sess-row-wrap .sess-row-title {
+  padding-right: 26px;
+}
+
+/* Keyboard users never hover: focus is the only signal they get, so it has to
+   reveal the button as well as outline it. */
+.sess-row-wrap .sess-row-open:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.sess-row-wrap .sess-row-open:hover {
+  background: var(--surface2);
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* A click in flight (the request is out) must look inert, not just be inert. */
+.sess-row-wrap .sess-row-open:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+/* Touch screens have no hover state at all: the affordance would be permanently
+   invisible there, so it is shown unprompted. */
+@media (hover: none) {
+  .sess-row-wrap .sess-row-open {
+    opacity: 0.75;
+  }
+}
+
+/* The wrapper must not gain a border of its own: the separator lives on
+   `.sess-row`, and doubling it would double every line in the list. */
+
 .sess-row-title {
   font-size: 13px;
   font-weight: 600;

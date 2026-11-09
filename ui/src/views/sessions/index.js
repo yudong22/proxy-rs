@@ -26,11 +26,28 @@
 import { $, html } from '../../core/dom.js';
 import { invoke } from '../../core/ipc.js';
 import { toast } from '../../components/toast.js';
-import { renderList, renderSources, rowFromEvent } from './list.js';
+import {
+  isBrowserHostedConsole,
+  renderList,
+  renderSources,
+  rowActionFromEvent,
+  rowFromEvent,
+  sessionDeepLink,
+} from './list.js';
 import { renderDetail, renderDetailMessage, renderTimelineBody } from './timeline.js';
 
 const LIST_PAGE = 50;
 const TIMELINE_PAGE = 200;
+
+/**
+ * The backend's session-id shape, checked here as well as in Rust.
+ *
+ * Defence in depth, not the boundary: the server validates every id it is given
+ * (see `is_valid_session_id` in the Rust side). Doing it here too means a
+ * malformed hash never reaches the backend at all — a deep link is untrusted
+ * input, and "don't ask" is cheaper than "ask and be refused".
+ */
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Everything this view remembers between paints. */
 const state = {
@@ -175,6 +192,106 @@ function closeDetailModal() {
   }
 }
 
+/**
+ * Open one session in the machine's real browser (desktop only).
+ *
+ * The URL is the backend's business, not ours: the console port lives in
+ * `ctx.console_port` in the Rust process, so any URL built here would be a guess
+ * that silently breaks the moment the port changes. The command takes only the
+ * id and returns the address it actually opened.
+ *
+ * The button is disabled for the duration so a double-click cannot spawn two
+ * browser tabs; the flag is per-invocation, not per-row state, because the row
+ * markup is re-rendered from the list on every selection change anyway.
+ */
+async function openInBrowser(id, trigger) {
+  const disabledBefore = trigger?.disabled;
+  if (trigger) trigger.disabled = true;
+  try {
+    await invoke('open_session_in_browser', { id });
+    toast('已在浏览器打开');
+  } catch (err) {
+    // The backend's message is the whole point for the server console: it says
+    // why this cannot work there and what to do instead. Rephrasing it here
+    // would lose that.
+    toast(String(err), 'error');
+  } finally {
+    if (trigger) trigger.disabled = disabledBefore ?? false;
+  }
+}
+
+/**
+ * Copy a session's deep link (server console only).
+ *
+ * `navigator.clipboard` needs a secure context; a console reached over plain
+ * HTTP on a LAN address is not one, so there is a fallback rather than a claim of
+ * success. The fallback is the deprecated `execCommand('copy')` path via a
+ * throwaway textarea — it still works in exactly the non-secure context where
+ * the modern API is unavailable. If even that is refused, the toast carries the
+ * link so the operator can copy it by hand; nothing is ever reported as copied
+ * when it was not.
+ *
+ * Returns whether the clipboard actually received the link, which makes the
+ * three outcomes distinguishable in the toast.
+ */
+async function copyDeepLink(id) {
+  const link = sessionDeepLink(id);
+  if (await writeClipboard(link)) {
+    toast('已复制会话链接');
+    return true;
+  }
+  toast(`复制失败，请手动复制：${link}`, 'error');
+  return false;
+}
+
+/** Put text on the clipboard, trying the modern API then the legacy command. */
+async function writeClipboard(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through to the legacy path */
+  }
+  const area = document.createElement('textarea');
+  area.value = text;
+  // Off-screen rather than `display: none`: a hidden element cannot be selected,
+  // so `execCommand('copy')` would copy nothing.
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.top = '-1000px';
+  area.style.opacity = '0';
+  document.body.appendChild(area);
+  try {
+    area.select();
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    area.remove();
+  }
+}
+
+/**
+ * Route a `.sess-row-open` click to the action that flavour of console offers.
+ *
+ * One place reads the flavour, so the markup and the handler cannot disagree
+ * about which action a click means. Both call sites (the sidebar rows and the
+ * detail topbar) go through here for the same reason: the topbar carries the
+ * same two flavours, and a second handler would be a second place to keep in
+ * sync.
+ */
+function handleRowAction(e) {
+  const btn = e.target.closest('.sess-row-open');
+  if (!btn) return false;
+  const hit = rowActionFromEvent(e);
+  if (!hit) return true; // a shortcut with neither dataset is inert, never a row click
+  if (hit.action === 'copy') copyDeepLink(hit.id);
+  else openInBrowser(hit.id, btn);
+  return true;
+}
+
 /** Helper: handle search or send action from input box. */
 function handleInputSubmit() {
   const input = $('#sess-input-field');
@@ -203,9 +320,22 @@ function handleInputSubmit() {
 /** Wire. Called once by main.js. */
 export function initSessions() {
   $('#sessions-rows')?.addEventListener('click', (e) => {
+    // The per-row shortcut is handled first and returns: the row itself is a
+    // sibling button, so without this a click on ↗ would fall through to the
+    // row lookup below and also select the session (`closest('.sess-row')` is
+    // null for it — but relying on that coincidence is how the next markup
+    // change reintroduces a double action).
+    if (handleRowAction(e)) return;
     const id = rowFromEvent(e);
     if (id) selectSession(id);
   });
+
+  // The detail header is re-rendered on every selection, so its shortcut cannot
+  // be bound at init time; delegation on the stable head element survives the
+  // repaint. Bound here (not at document level) so it cannot collide with the
+  // document-level `#btn-sess-topbar-stats` listener below, and routed through
+  // the same handler as the rows so both flavours behave identically.
+  $('#session-detail-head')?.addEventListener('click', handleRowAction);
   $('#btn-sessions-refresh')?.addEventListener('click', () => loadSessions({ force: true }));
   $('#btn-sessions-prev')?.addEventListener('click', () => {
     state.offset = Math.max(0, state.offset - LIST_PAGE);
@@ -308,6 +438,49 @@ export async function selectSession(id) {
     renderDetailMessage('打开会话失败：' + err);
     toast('打开会话失败: ' + err, 'error');
   }
+}
+
+/**
+ * The session id named by `#sessions/<id>`, or null.
+ *
+ * Parsed here rather than in `main.js` because the hash is the only thing this
+ * view needs from the URL: `main.js` already resolved the *tab*, and duplicating
+ * the id rule in two files is how the router and the view drift apart.
+ *
+ * A malformed id is treated exactly like no deep link — an unknown UUID shape is
+ * never sent to the backend (see `SESSION_ID_RE`).
+ */
+export function deepLinkSessionId() {
+  const hash = window.location.hash.replace(/^#/, '');
+  const [tab, id] = hash.split('/');
+  if (tab.toLowerCase() !== 'sessions' || !id) return null;
+  return SESSION_ID_RE.test(id) ? id : null;
+}
+
+/**
+ * Apply the session named by the hash, if any.
+ *
+ * Called after the list has painted (from `applyTab`/`hashchange` in `main.js`),
+ * because selecting before the rows exist would mark nothing and scroll nothing.
+ * Selecting is not enough on its own: the row may be off-screen in the sidebar,
+ * and a deep link that opens the right transcript while leaving the list
+ * scrolled elsewhere looks like it did nothing.
+ *
+ * The id is looked up in the rows the list actually rendered, so a link to a
+ * session outside the current page still selects it (the detail command reads by
+ * id, not by row), and the scroll is a no-op rather than an error. That is
+ * deliberate: paging the sidebar to chase a deep link would be a second,
+ * invisible navigation the user did not ask for.
+ */
+export function consumeDeepLink() {
+  const id = deepLinkSessionId();
+  if (!id) return;
+  if (id !== state.selected) selectSession(id);
+  // Scrolled even when the session was already selected: the hash can change
+  // (back/forward) without the selection changing, and the row may have been
+  // pushed out of view by paging.
+  const row = $(`#sessions-rows .sess-row[data-id="${id}"]`);
+  row?.scrollIntoView({ block: 'nearest' });
 }
 
 /** Prepend the next-older page of the current session's timeline. */

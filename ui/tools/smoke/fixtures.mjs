@@ -137,6 +137,15 @@ const MOCK = {
     gateway_error: null,
   },
   get_request_logs: { items: [], total: 0, models: [], clients: [], sessions: [] },
+  // Opening a session in the machine's browser is a desktop-only command: the
+  // backend builds the URL (it owns the console port) and shells out to the OS.
+  // The mock echoes the shape the UI reads — `url` is what actually got opened,
+  // so a scenario can prove the front-end asked by id and let Rust do the rest.
+  open_session_in_browser: {
+    ok: true,
+    url: 'http://127.0.0.1:3457/admin/#sessions/b9c3800a-311e-4c89-9a38-c533d8969b5d',
+    opened: true,
+  },
   get_logs: { entries: [] },
   wb_credentials_list: {
     credentials: [

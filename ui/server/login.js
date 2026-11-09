@@ -46,17 +46,41 @@ function showWarning(message) {
  * common mistake produces the inline message instead of a round trip.
  */
 /**
+ * The shape of a session id, for the deep-link form `sessions/<uuid>`.
+ *
+ * Duplicated from the console's own session view on purpose: this page is a
+ * separate document that loads before (and without) the console bundle, so it
+ * cannot import it. The server validates again — this only decides what to carry
+ * through a login round trip.
+ */
+const SESSION_ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+
+/**
+ * Landing targets this page will carry through a (re)login.
+ *
+ * A bare tab, or a deep link into one session. Both are closed shapes: neither
+ * can express a host, a scheme or a traversal, so accepting the longer one does
+ * not turn this into an open redirect — the server re-validates the same way
+ * (`landing_path`), and that is the real boundary.
+ *
+ * The deep link is here at all because otherwise the operator's whole reason for
+ * visiting this page ("log in, then show me that session") would be lost the
+ * moment the cookie had expired.
+ */
+const LANDING = new RegExp(`^(?:(?:overview|logs|sessions|settings)|sessions/${SESSION_ID})$`);
+
+/**
  * The tab to return to after (re)login.
  *
  * Order: a `?next=` on this URL (carried forward by a failed attempt) → the
- * hash this page was opened with. Only a bare tab name is accepted here; the
- * server re-validates, so this is convenience, not the security boundary.
+ * hash this page was opened with. The server re-validates, so this is
+ * convenience, not the security boundary.
  */
 function landingTab() {
   const fromQuery = new URLSearchParams(window.location.search).get('next');
   const fromHash = window.location.hash.replace(/^#/, '');
   const candidate = fromQuery || fromHash;
-  return /^(overview|logs|sessions|settings)$/.test(candidate) ? candidate : '';
+  return LANDING.test(candidate) ? candidate : '';
 }
 
 const nextInput = document.getElementById('next');
@@ -92,9 +116,11 @@ form.addEventListener('submit', (event) => {
 (function reportFormError() {
   const params = new URLSearchParams(window.location.search);
   const code = params.get('e');
-  // Carry the landing tab forward so a retry still returns to it.
+  // Carry the landing tab forward so a retry still returns to it. Same shape as
+  // `landingTab` — a deep link must survive a wrong-token retry too, or the
+  // second attempt lands on the overview and the session is lost.
   const carried = params.get('next');
-  if (carried && /^(overview|logs|sessions|settings)$/.test(carried)) {
+  if (carried && LANDING.test(carried)) {
     if (nextInput) nextInput.value = carried;
     window.history.replaceState(null, '', `${window.location.pathname}?${params.toString()}#${carried}`);
   }

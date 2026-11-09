@@ -50,18 +50,14 @@ pub(crate) fn parse_form_login(body: &[u8]) -> Option<LoginBody> {
 
 /// Where a successful form login sends the browser.
 ///
-/// `next` may only name a tab (`overview` / `logs` / `sessions` / `settings`).
-/// Anything else — an absolute URL, `//evil.example`, a path — is ignored,
-/// because a redirect target taken from a form field is an open redirect. The
-/// hash is re-attached so the console opens the tab the operator was looking at
-/// when the session expired.
+/// `next` may only name a tab (`overview` / `logs` / `sessions` / `settings`) or
+/// a session deep link (`sessions/<uuid>`). Anything else — an absolute URL,
+/// `//evil.example`, a path — is ignored, because a redirect target taken from a
+/// form field is an open redirect. The hash is re-attached so the console opens
+/// the tab the operator was looking at when the session expired.
 pub(crate) fn landing_path(next: Option<&str>) -> String {
-    const TABS: [&str; 4] = ["overview", "logs", "sessions", "settings"];
-    let tab = next
-        .map(|n| n.trim().trim_start_matches('#'))
-        .filter(|n| TABS.contains(n));
-    match tab {
-        Some(tab) => format!("/admin/#{tab}"),
+    match next_hash(next) {
+        Some(hash) => format!("/admin/#{hash}"),
         None => "/admin/".to_string(),
     }
 }
@@ -71,11 +67,35 @@ pub(crate) fn landing_path(next: Option<&str>) -> String {
 /// A rejected login must stay on the tab it came from: the operator retries the
 /// password, not the navigation. Same allow-list as [`landing_path`].
 pub(crate) fn next_tab_query(next: Option<&str>) -> String {
-    const TABS: [&str; 4] = ["overview", "logs", "sessions", "settings"];
-    next.map(|n| n.trim().trim_start_matches('#'))
-        .filter(|n| TABS.contains(n))
+    next_hash(next)
         .map(|n| format!("&next={n}"))
         .unwrap_or_default()
+}
+
+/// The bare tab name (plus `&next=` form) the allow-list accepts, if any.
+fn next_hash(next: Option<&str>) -> Option<String> {
+    let raw = next?.trim().trim_start_matches('#');
+    // A deep link to one conversation: `sessions/<uuid>`. This is the only
+    // multi-segment shape honoured, and only because the second segment must be
+    // a syntactically valid session id (strict lowercase hex UUID).
+    //
+    // Why accepting it does **not** widen the open-redirect surface: the two
+    // segments are matched as literals plus a validated UUID, so no input can
+    // express a scheme, a host, or a traversal (`sessions/../../etc` fails the
+    // UUID test, and so does an upper-case or non-UUID value). The result is
+    // always `/admin/#sessions/<uuid>` — an in-page hash on our own origin,
+    // never a redirect target the browser could leave the site for.
+    if let Some(id) = raw.strip_prefix("sessions/") {
+        if crate::claude_sessions::is_valid_session_id(id) {
+            return Some(format!("sessions/{id}"));
+        }
+        // An invalid id is not a fallback-to-`sessions`: the operator asked for
+        // a specific conversation, and landing on the bare list is exactly what
+        // no `next` at all already produces. Say nothing instead of guessing.
+        return None;
+    }
+    const TABS: [&str; 4] = ["overview", "logs", "sessions", "settings"];
+    TABS.contains(&raw).then(|| raw.to_string())
 }
 
 /// Minimal `%XX` decoder for form values.

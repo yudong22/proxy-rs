@@ -150,8 +150,12 @@ npm run build:ui && npm run check:dist && npm run smoke:dist   # 针对真正发
 
 - 点击标签、`window.switchTab('logs')`（托盘「显示日志」）、粘贴一个 `#sessions` 链接，都会写同一个 hash；`hashchange` 是浏览器前进/后退的入口。
 - 未知 hash（例如旧链接的 `#old`）回落到 `#overview`，不会出现「所有面板都隐藏」。
+- **会话还可以直接指向某一个会话**：`#sessions/<uuid>`。这是会话行「在浏览器打开」按钮使用的
+  地址，让一个会话可分享、可收藏，刷新后仍停在同一处。
 - 登录页也一样：`/admin/login#sessions` 登录成功后回到 `#sessions`；会话过期被踢到登录页时也会带上当前 hash。
-  登录表单里有一个隐藏的 `next` 字段，服务端**只接受四个已知标签名**——它是一个表单字段，绝不能变成开放重定向。
+  登录表单里有一个隐藏的 `next` 字段，服务端**只接受四个已知标签名**以及 `sessions/<uuid>`（uuid 必须是
+  严格的小写 hex UUID）——它是一个表单字段，绝不能变成开放重定向。多接受这一种形态并不放宽该约束：
+  它仍然无法表达 scheme、host 或路径穿越。
 
 ## 六、本地调试页面（连真实后端，不编译 Rust）
 

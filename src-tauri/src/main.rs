@@ -188,6 +188,72 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     }
 }
 
+/// Open the gateway's own console URL in the system default browser.
+///
+/// Same one-`cfg`-ladder shape as [`reveal_in_file_manager`]: the three
+/// platforms differ only in the launcher program, and keeping them side by side
+/// is what stops one of them from silently missing a fix.
+///
+/// ## The guard is the point
+///
+/// This function is the last hop before an OS program acts on a string. It
+/// therefore re-checks the **prefix** itself instead of trusting its caller:
+/// only `http://127.0.0.1:<port>/admin/…` may be spawned. Without this, any
+/// future caller — a new RPC arm, a refactor that forwards a front-end field —
+/// would turn the desktop into "open anything the console page asks for",
+/// including `file://` and remote sites, in the user's real browser.
+///
+/// Returning `Result` rather than spawning and forgetting: the RPC layer reports
+/// what happened, and a silently dropped `Err` here would look exactly like a
+/// successful open to the person clicking the button.
+pub(crate) fn open_url_in_browser(url: &str) -> Result<(), String> {
+    // 双保险：调用方本应只传 `desktop_hooks::session_console_url` 拼出的地址，
+    // 这里再独立校验一次。校验的是「方案 + 本机回环 + 控制台路径」，不是简单的
+    // 包含关系——`file://`、别的站点、`http://127.0.0.1.evil.example/` 都过不来。
+    if !proxy_rs::desktop_hooks::is_console_url(url) {
+        return Err(format!(
+            "拒绝打开非本机控制台地址（只允许 http://127.0.0.1:<端口>/admin/…）: {url}"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("调用 open 失败: {e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("调用 xdg-open 失败: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `start` is a `cmd` builtin, so it must be run through `cmd /C`.
+        //
+        // The first argument of `start` is the **window title**, not the target.
+        // Passing the URL there is the classic bug: with a title set, `start`
+        // treats the next token as the thing to open, and a URL containing `&`
+        // (or quotes) gets split by the command interpreter. The empty `""` is
+        // that title, and it must be there even when we believe the URL is
+        // clean — our URLs carry no query string precisely so this stays safe,
+        // but the shell does not know that.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map_err(|e| format!("调用 cmd start 失败: {e}"))?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        return Err(format!("当前平台不支持在浏览器中打开: {url}"));
+    }
+
+    Ok(())
+}
+
 // ── Client access accounts (inbound) ────────────────────────────────────────
 //
 // The GUI half of the same store the HTTP admin routes manage. Both go through
@@ -385,6 +451,26 @@ fn main() {
                         }
                         reveal_in_file_manager(&p);
                         Ok(format!("已在文件管理器中显示: {path}"))
+                    })),
+                    // The console's own port, which is what any URL for its pages
+                    // must carry. Deliberately **not** `bound_port`: that is the
+                    // data plane's port and the two differ by as little as 1, so
+                    // the wrong one produces "opened, but blank/404" rather than
+                    // an error anyone can act on.
+                    console_port: Some(std::sync::Arc::new({
+                        let ctx_port = ctx_for_hooks.clone();
+                        move || {
+                            ctx_port
+                                .console_port
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                        }
+                    })),
+                    // 「在浏览器打开此会话」的最后一跳。RPC 层只交出 id，由
+                    // `desktop_hooks::session_console_url` 拼出唯一允许的地址；
+                    // 这里再校验一次前缀，然后交给平台启动器。
+                    open_url: Some(std::sync::Arc::new(|url: String| {
+                        open_url_in_browser(&url)?;
+                        Ok("已在浏览器中打开".to_string())
                     })),
                 });
             }

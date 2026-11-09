@@ -16,6 +16,7 @@ import {
   formatTokens,
 } from '../../lib/format.js';
 import { pairResults, renderTimeline } from './entry.js';
+import { isBrowserHostedConsole } from './list.js';
 
 function tokensRow(t) {
   return html`
@@ -97,6 +98,28 @@ function calculateCacheHitPct(tokens) {
   return Math.round((read / total) * 100);
 }
 
+/**
+ * Render one row's "open in browser" affordance.
+ *
+ * Mirrors `rowActionMarkup` in `list.js` — same two flavours, same
+ * `sess-row-open` hook so one delegated handler can serve both — but sized to the
+ * topbar's button style instead of floating over a row.
+ */
+function headerOpenMarkup(id) {
+  if (isBrowserHostedConsole()) {
+    return html`
+      <button type="button" class="sess-topbar-btn sess-row-open" data-copy-id="${id}"
+              title="复制此会话的深链接" aria-label="复制此会话的深链接">
+        <span class="sess-icon">⧉</span> 复制链接
+      </button>`;
+  }
+  return html`
+    <button type="button" class="sess-topbar-btn sess-row-open" data-open-id="${id}"
+            title="在系统浏览器中打开此会话" aria-label="在浏览器打开此会话">
+      <span class="sess-icon">↗</span> 打开
+    </button>`;
+}
+
 /** Compact topbar: brief title, path, quick branch/size tags and an info trigger. */
 export function renderCompactHeader(detail) {
   const host = $('#session-detail-head');
@@ -114,6 +137,7 @@ export function renderCompactHeader(detail) {
       <div class="sess-topbar-meta">
         ${raw(s.git_branch ? html`<span class="badge-pill sess-badge-git">${s.git_branch}</span>` : '')}
         <span class="badge-pill">${formatBytes(s.size_bytes)}</span>
+        ${raw(headerOpenMarkup(s.id))}
         <button type="button" class="sess-topbar-btn" id="btn-sess-topbar-stats" title="展开完整指标与详情">
           <span class="sess-icon">📊</span> 详情
         </button>

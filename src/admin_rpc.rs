@@ -488,6 +488,31 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
                 .unwrap_or_default();
             crate::admin::claude_subagent_detail(id, agent_id, detail_args).await
         }
+        // 「在浏览器打开此会话」。
+        //
+        // ## 入参只有 id，URL 由后端拼 —— 这是本功能的安全边界
+        //
+        // 只读 `args["id"]`。**绝不**读客户端传来的 `url` / `host` / `port`：
+        // 这条命令的最终效果是让**用户的默认浏览器**去打开一个地址，而它在
+        // HTTP 上是对任何登录会话开放的。一旦接受调用方给的 URL，控制台页面里
+        // 的任何脚本（含将来某次 XSS）就能让浏览器打开 `file://` 本地文件或任意
+        // 钓鱼站点 —— 用户点的是一个自己信任的控制台按钮，落地却由攻击者决定。
+        // 所以客户端只能说「哪个会话」，其余由这里决定：
+        //
+        //     http://127.0.0.1:<console_port>/admin/#sessions/<uuid>
+        //
+        // 拼装、端口取值与双保险校验都在
+        // `desktop_hooks::open_session_in_browser`：它先确认这是桌面构建，
+        // 再用桌面注册的 `console_port`（**不是** `state.process.port()` ——
+        // 那是数据面端口，控制台在另一个端口上，两者常常只差 1，指错的表现是
+        // 「打开了但 404/空白」而不是报错），然后拼 URL、再校验一次前缀才交给
+        // 平台启动器。
+        "open_session_in_browser" => {
+            let id = req_str(&args, "id")?;
+            let (url, message) =
+                crate::desktop_hooks::open_session_in_browser(&id).map_err(|e| anyhow!(e))?;
+            Ok(json!({ "ok": true, "url": url, "opened": true, "message": message }))
+        }
 
         // Service lifecycle and the OS file manager: process state, not
         // business logic.
