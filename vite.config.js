@@ -242,6 +242,31 @@ function backendSwitch() {
       httpServer.on('request', (req, res) => {
         const proxy = server.config.server.proxy;
         const backend = wantsProd(req) ? 'prod' : 'dev';
+
+        // Send the bare root to the console before anything else.
+        //
+        // `ui-dev` prints `http://127.0.0.1:4300/` as its address, and that URL
+        // used to serve Vite's own copy of `ui/index.html` — the *source* page,
+        // which has no gateway bridge and is not under `/admin`. The console
+        // decides its transport from `location.pathname.startsWith('/admin')`
+        // (`core/ipc.js`), so from `/` every `invoke` fell through to the
+        // "[Tauri Mock]" no-op and answered `null`: the page rendered, and every
+        // panel was empty. That reads as "4300 is all mocks", which is exactly
+        // what it was — the mock branch, reached by opening the wrong URL.
+        //
+        // There is no console at `/`: the gateway serves the real page at
+        // `/admin/` only, and that path is also what carries the cookie
+        // (`Path=/admin`) and the auto-login. So `/` is redirected instead of
+        // being made to work, which keeps one entry point rather than two that
+        // behave differently.
+        const pathname = (req.url || '').split('?')[0];
+        if (req.method === 'GET' && (pathname === '/' || pathname === '')) {
+          res.statusCode = 302;
+          res.setHeader('location', `/admin/${req.url.slice(pathname.length)}`);
+          res.end();
+          return;
+        }
+
         // Two keys only; `proxy` is a literal in this file, not user config.
         proxy['/admin'].target = backend === 'prod' ? prodTarget('admin') : `${BACKEND_HOST}:${DEV_PORT}`;
         proxy['/api'].target = backend === 'prod' ? prodTarget('api') : `${BACKEND_HOST}:${DEV_PORT}`;
