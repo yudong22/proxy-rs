@@ -148,8 +148,24 @@ function autoLoginDev(req, res, fallthrough) {
  * Whether this request is one the auto-login should answer.
  *
  * Deliberately narrow: a **GET of the console page itself**, on the dev
- * backend, from loopback, with no session yet. Anything else — an RPC call, an
- * asset, a POST, the login endpoint — is left to the normal proxy path.
+ * backend, from loopback. Anything else — an RPC call, an asset, a POST, the
+ * login endpoint — is left to the normal proxy path.
+ *
+ * ## Why the session cookie is *validated*, not merely detected
+ *
+ * The first version skipped auto-login whenever a `proxy_rs_admin` cookie was
+ * present. That is wrong in exactly the case this feature exists for: the dev
+ * gateway keeps sessions in memory, so **restarting it invalidates every
+ * cookie it ever issued** while the browser keeps sending the old one. The
+ * candidate test then said "already logged in", auto-login never ran, the
+ * gateway answered the login page, and the operator was asked for a token that
+ * the loop had just been taught to supply — the same manual step, now with a
+ * misleading reason.
+ *
+ * So the cookie is only a hint. Presence short-circuits nothing; validity is
+ * asked of the gateway itself (`GET /admin/api/session`, which is 200 for a
+ * live session and 401 otherwise). That is one cheap loopback request on a page
+ * load, and it makes "restart the gateway, reload the page, you are in" true.
  */
 function isDevAutoLoginCandidate(req) {
   if (req.method !== 'GET') return false;
@@ -157,7 +173,6 @@ function isDevAutoLoginCandidate(req) {
   // Loopback only, re-checked rather than assumed from `server.host`.
   const remote = req.socket?.remoteAddress || '';
   if (!/^(::1|::ffff:127\.|127\.)/.test(remote)) return false;
-  if (adminCookie(req)) return false; // already has a session
 
   const url = (req.url || '').split('?')[0];
   // The console page is served at `/admin/` (and `/admin`), which the proxy
@@ -165,7 +180,33 @@ function isDevAutoLoginCandidate(req) {
   // match below — auto-logging-in *from* the login page would make it
   // impossible to look at that page, which is a worse trade than one manual
   // token entry in that one case.
-  return url === '/admin/' || url === '/admin';
+  if (url !== '/admin/' && url !== '/admin') return false;
+
+  // A cookie's *presence* is not evidence of a live session — see above. The
+  // caller resolves that (async) via `hasLiveSession`; this only narrows the
+  // request down to "a console page load that might need a login".
+  return true;
+}
+
+/**
+ * Ask the gateway whether the request's session cookie is still good.
+ *
+ * Returns `true` when it is, so auto-login stays out of the way; `false` when
+ * there is no cookie, or the gateway rejects it (401) — which is the case after
+ * a gateway restart, and the reason this exists at all.
+ */
+async function hasLiveSession(req) {
+  if (!adminCookie(req)) return false;
+  try {
+    const probe = await fetch(`${BACKEND_HOST}:${DEV_PORT}/admin/api/session`, {
+      headers: { cookie: adminCookie(req) ? `proxy_rs_admin=${adminCookie(req)}` : '' },
+    });
+    return probe.ok;
+  } catch {
+    // Gateway unreachable: report "no live session" so the normal path runs and
+    // the browser sees the real error (a proxy failure), not a silent skip.
+    return false;
+  }
 }
 
 /**
@@ -215,7 +256,13 @@ function backendSwitch() {
         // yet the page still comes back 200 with no `Set-Cookie`.) So the
         // decision lives on the same path that picks the upstream.
         if (backend === 'dev' && isDevAutoLoginCandidate(req)) {
-          void autoLoginDev(req, res, () => connectStack(req, res));
+          // A present-but-stale cookie is decided asynchronously (it needs one
+          // loopback round trip); a missing one is already known to need login.
+          // Either way nothing else touches `res` until one of them answers.
+          const needsLogin = adminCookie(req) ? hasLiveSession(req).then((live) => !live) : true;
+          Promise.resolve(needsLogin)
+            .then((needs) => (needs ? autoLoginDev(req, res, () => connectStack(req, res)) : connectStack(req, res)))
+            .catch(() => connectStack(req, res));
           return;
         }
         connectStack(req, res);
