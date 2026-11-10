@@ -194,6 +194,27 @@ export function formatLocalDateTime(ms) {
   return Number.isNaN(d.getTime()) ? '—' : dateTimeFmt.format(d);
 }
 
+/**
+ * Epoch milliseconds → 粗粒度相对时间（`刚刚` / `12 分钟前` / `3 小时前` / `5 天前`）。
+ *
+ * 只给组头用：组头要回答的是「这个项目最近还活着吗」，精确到分钟没有意义，而
+ * `MM-DD HH:mm` 在一年前和上周的目录上长得完全一样。超过 30 天退回日期，因为
+ * 「87 天前」不帮任何人判断，日期反而能。
+ *
+ * 未来时间（时钟漂移、mtime 被改过）按「刚刚」处理，不输出负值。
+ */
+export function formatRelativeTime(ms) {
+  const when = Number(ms);
+  if (!when) return '';
+  const diff = Date.now() - when;
+  if (!Number.isFinite(diff)) return '';
+  if (diff < 60 * 1000) return '刚刚';
+  if (diff < 60 * 60 * 1000) return `${Math.floor(diff / 60000)} 分钟前`;
+  if (diff < 24 * 60 * 60 * 1000) return `${Math.floor(diff / 3600000)} 小时前`;
+  if (diff < 30 * 24 * 60 * 60 * 1000) return `${Math.floor(diff / 86400000)} 天前`;
+  return formatLocalDateTime(when);
+}
+
 /** Epoch milliseconds → `HH:mm:ss`, viewer-local. */
 export function formatLocalTime(ms) {
   if (ms === null || ms === undefined) return '';

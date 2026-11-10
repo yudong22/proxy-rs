@@ -68,6 +68,7 @@ import { checkOverviewLayout } from './smoke/scenarios-overview.mjs';
 import { checkBootstrapPage } from './smoke/scenarios-bootstrap.mjs';
 import { checkEveryPaneRenders } from './smoke/scenarios-pages.mjs';
 import { checkClaudePermissionMode, checkClassifierSwitchPlacement } from './smoke/scenarios-claude-permission.mjs';
+import { checkSessionsGrouping, checkSessionsPersistence } from './smoke/scenarios-session-groups.mjs';
 import { checkEmptyStates, checkEmptySessionList } from './smoke/scenarios-states.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -251,7 +252,12 @@ try {
         if (window.__MOCK_ALL_NULL__) return Promise.resolve(null);
         const override = window.__MOCK_OVERRIDE__;
         if (override && Object.prototype.hasOwnProperty.call(override, cmd)) {
-          return Promise.resolve(override[cmd]);
+          // A function-valued override is called with the call's arguments, which
+          // is what lets one scenario answer differently per request: the grouped
+          // list pages by group=<key>, so a single static payload could never show
+          // "show the rest" actually adding the rest of the group.
+          const value = override[cmd];
+          return Promise.resolve(typeof value === 'function' ? value(args) : value);
         }
         // get_growth_progress is take-and-clear on the real backend: the
         // console drains the buffer and the next poll sees nothing new. The
@@ -306,6 +312,11 @@ try {
   await scenario('boot (derived)', () => checkBootDerived(ctx, b));
   await scenario('request logs', () => checkRequestLogs(ctx));
   await scenario('sessions', () => checkSessions(ctx));
+  // Both drive reloads and their own mock overrides, so they get the origin the
+  // page-replacing scenarios take (they cannot rely on the current document).
+  const pageCtx = { send, check, origin: `http://127.0.0.1:${PORT}` };
+  await scenario('sessions grouping', () => checkSessionsGrouping(pageCtx));
+  await scenario('sessions persistence', () => checkSessionsPersistence(pageCtx));
   await scenario('hash routing', () => checkHashRouting(ctx));
   await scenario('return to overview', () => returnToOverview(ctx));
 
@@ -342,6 +353,7 @@ try {
   console.log(`boot assertions: counts, text, credential rows, default identity`);
   console.log(`integration: palette + OAuth repaint + pool import/export + login recovery`);
   console.log(`pages + states: every pane, loading/empty, bootstrap start page`);
+  console.log(`sessions: project groups, folding, show-the-rest, address + restore`);
   console.log(`mock commands exercised: ${i?.called?.length ?? 'n/a'}`);
   if (failures.length === 0) {
     console.log('\nall assertions passed');

@@ -87,10 +87,16 @@ export async function checkEmptySessionList(ctx) {
   const { identifier } = await send('Page.addScriptToEvaluateOnNewDocument', {
     source: `
       window.__MOCK_OVERRIDE__ = {
-        claude_sessions_list: {
+        sessions_list: {
           available: true, reason: null, root: '/tmp/projects', sources: [],
           stats_available: false, gateway_error: null,
-          total: 0, offset: 0, limit: 50, sessions: [],
+          total: 0, offset: 0, limit: 50,
+          // Grouped shape, because the page always asks for it: groups is an
+          // empty array (not null) when the grouped read found nothing, and
+          // sessions stays an empty array beside it. A flat-looking mock here
+          // would test a response the server never sends to this page.
+          group_by: 'project', groups: [],
+          sessions: [],
         },
       };
     `,

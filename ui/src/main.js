@@ -38,6 +38,7 @@ import {
   loadSessions,
   renderSessions,
   consumeDeepLink,
+  restoreLastSession,
 } from './views/sessions/index.js';
 import { initSettings, loadSettings, renderSettings } from './views/settings/index.js';
 import { initPalette, close as closePalette } from './views/palette.js';
@@ -124,7 +125,16 @@ function applyTab(tabName) {
     // and a selection painted against a list that has not loaded yet would mark
     // no row and scroll nowhere. It re-reads the hash itself, so a `#sessions/x`
     // arrival and a plain `#sessions` click take the same path.
-    Promise.resolve(loadSessions()).then(consumeDeepLink, consumeDeepLink);
+    //
+    // `restoreLastSession` runs *after* `consumeDeepLink` and does nothing when the
+    // URL named a session, so the two sources of truth stay ordered: the address
+    // wins, the remembered session is the fallback. It is here (not inside
+    // `consumeDeepLink`) because that function means "apply what the hash says",
+    // and letting it read storage too would give the `hashchange` branch a second,
+    // hidden trigger for the same state (`main.js`, the listener below).
+    Promise.resolve(loadSessions())
+      .then(consumeDeepLink, consumeDeepLink)
+      .then(restoreLastSession);
   } else if (tabName === 'settings') {
     loadSettings();
   }

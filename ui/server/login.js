@@ -56,18 +56,38 @@ function showWarning(message) {
 const SESSION_ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 
 /**
+ * A source slug, for the current deep-link form `sessions/<slug>/<uuid>`.
+ *
+ * A character-class match, not an enum of the sources this build happens to know:
+ * the console owns the registry, and a login page that knew its own copy of it
+ * would silently drop links to any source added after it shipped. The server
+ * checks the same slug against the same registry anyway (`next_hash`), and "grey
+ * out what this build cannot read" is the console's job, not the login page's.
+ */
+const SOURCE_SLUG = '[a-z][a-z0-9_]{0,15}';
+
+/**
  * Landing targets this page will carry through a (re)login.
  *
- * A bare tab, or a deep link into one session. Both are closed shapes: neither
- * can express a host, a scheme or a traversal, so accepting the longer one does
- * not turn this into an open redirect — the server re-validates the same way
- * (`landing_path`), and that is the real boundary.
+ * A bare tab, or a deep link into one session in either of its two shapes:
+ *
+ * - `sessions/<uuid>` — what 3.5.5 handed out; always Claude Code.
+ * - `sessions/<slug>/<uuid>` — the current shape.
+ *
+ * All of them are closed shapes: none can express a host, a scheme or a traversal,
+ * so accepting the longer ones does not turn this into an open redirect — the
+ * server re-validates the same way (`landing_path`), and that is the real
+ * boundary. Missing the three-segment form here would be the quiet version of a
+ * broken link: the operator logs in and lands on an empty session list, with
+ * nothing on screen to say the session was dropped.
  *
  * The deep link is here at all because otherwise the operator's whole reason for
  * visiting this page ("log in, then show me that session") would be lost the
  * moment the cookie had expired.
  */
-const LANDING = new RegExp(`^(?:(?:overview|logs|sessions|settings)|sessions/${SESSION_ID})$`);
+const LANDING = new RegExp(
+  `^(?:(?:overview|logs|sessions|settings)|sessions/${SESSION_ID}|sessions/${SOURCE_SLUG}/${SESSION_ID})$`,
+);
 
 /**
  * The tab to return to after (re)login.

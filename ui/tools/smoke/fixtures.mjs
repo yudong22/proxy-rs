@@ -72,40 +72,60 @@ const MOCK = {
     provider_exists: true, model_count: 4, base_url: 'http://127.0.0.1:3457/v1',
     credential_present: true, session_header: true,
   },
-  // 会话 view. One row, one transcript. The timeline's text deliberately
-  // contains markup: the assertion below proves it renders as text (the
-  // transcript is model output, and this is the UI's largest injection surface).
-  claude_sessions_list: {
+  // 会话 view. One group with one row, one transcript. The timeline's text
+  // deliberately contains markup: the assertion below proves it renders as text
+  // (the transcript is model output, and this is the UI's largest injection
+  // surface).
+  //
+  // The shape is the *grouped* one (3.5.6): the page always asks for
+  // `group_by=project`, so `groups` is present and top-level `sessions` is an
+  // empty array — the server does not copy the rows twice. `group_by: null` /
+  // `groups: null` is the flat response, which `renderList` must still paint; a
+  // separate override scenario covers that degradation.
+  sessions_list: {
     available: true,
     reason: null,
     root: '/Users/test/.claude/projects',
     sources: [
-      { kind: 'claude_local', label: 'Claude Code', available: true, note: null },
-      { kind: 'dsh_local', label: 'DSH', available: false, note: 'DSH 会话是 zstd 压缩的本地存档，暂不支持浏览' },
+      { kind: 'claude_local', slug: 'claude', label: 'Claude Code', available: true, note: null },
+      { kind: 'dsh_local', slug: 'dsh', label: 'DSH', available: false, note: 'DSH 会话是 zstd 压缩的本地存档，暂不支持浏览' },
     ],
     stats_available: true,
     gateway_error: null,
     total: 1,
     offset: 0,
     limit: 50,
-    // Flattened exactly like `SessionRow` (serde flatten): summary fields sit
-    // at the top level, beside `gateway`.
-    sessions: [{
-      id: 'b9c3800a-311e-4c89-9a38-c533d8969b5d',
-      encoded_project: '-Users-test-project', cwd: '/Users/test/project',
-      title: '会话页测试', first_seen_ms: 1794000000000, last_seen_ms: 1794000100000,
-      file_mtime_ms: 1794000100000, size_bytes: 2048, git_branch: 'main', version: '2.1.277',
-      turns: 1, assistant_turns: 2, tool_calls: 1, subagents: 0,
-      last_model: 'deepseek-v4.1-flash', counts_partial: false,
-      gateway: { session_id: 'claude:b9c3800a-311e-4c89-9a38-c533d8969b5d',
-                 requests: 3, input_tokens: 1200, output_tokens: 340,
-                 cache_read_tokens: 900, cache_write_tokens: 10,
-                 first_at: '2026-11-06 10:00:00', last_at: '2026-11-06 10:05:00',
-                 models: ['deepseek-v4.1-flash'] },
-      gateway_error: null,
+    group_by: 'project',
+    groups: [{
+      key: 'claude:-Users-test-project',
+      label: 'project',
+      cwd: '/Users/test/project',
+      sources: ['claude'],
+      count: 1,
+      last_seen_ms: 1794000100000,
+      size_bytes: 2048,
+      more: false,
+      // Flattened exactly like `SessionRow` (serde flatten): summary fields sit
+      // at the top level, beside `source` and `gateway`.
+      sessions: [{
+        source: 'claude',
+        id: 'b9c3800a-311e-4c89-9a38-c533d8969b5d',
+        encoded_project: '-Users-test-project', cwd: '/Users/test/project',
+        title: '会话页测试', first_seen_ms: 1794000000000, last_seen_ms: 1794000100000,
+        file_mtime_ms: 1794000100000, size_bytes: 2048, git_branch: 'main', version: '2.1.277',
+        turns: 1, assistant_turns: 2, tool_calls: 1, subagents: 0,
+        last_model: 'deepseek-v4.1-flash', counts_partial: false,
+        gateway: { session_id: 'claude:b9c3800a-311e-4c89-9a38-c533d8969b5d',
+                   requests: 3, input_tokens: 1200, output_tokens: 340,
+                   cache_read_tokens: 900, cache_write_tokens: 10,
+                   first_at: '2026-11-06 10:00:00', last_at: '2026-11-06 10:05:00',
+                   models: ['deepseek-v4.1-flash'] },
+        gateway_error: null,
+      }],
     }],
+    sessions: [],
   },
-  claude_sessions_detail: {
+  sessions_detail: {
     summary: { id: 'b9c3800a-311e-4c89-9a38-c533d8969b5d', encoded_project: '-Users-test-project',
                cwd: '/Users/test/project', title: '会话页测试', first_seen_ms: 1794000000000,
                last_seen_ms: 1794000100000, file_mtime_ms: 1794000100000, size_bytes: 2048,
@@ -143,7 +163,7 @@ const MOCK = {
   // so a scenario can prove the front-end asked by id and let Rust do the rest.
   open_session_in_browser: {
     ok: true,
-    url: 'http://127.0.0.1:3457/admin/#sessions/b9c3800a-311e-4c89-9a38-c533d8969b5d',
+    url: 'http://127.0.0.1:3457/admin/#sessions/claude/b9c3800a-311e-4c89-9a38-c533d8969b5d',
     opened: true,
   },
   get_logs: { entries: [] },

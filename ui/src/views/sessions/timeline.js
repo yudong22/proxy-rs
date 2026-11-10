@@ -105,23 +105,31 @@ function calculateCacheHitPct(tokens) {
  * `sess-row-open` hook so one delegated handler can serve both — but sized to the
  * topbar's button style instead of floating over a row.
  */
-function headerOpenMarkup(id) {
+function headerOpenMarkup(source, id) {
   if (isBrowserHostedConsole()) {
     return html`
       <button type="button" class="sess-topbar-btn sess-row-open" data-copy-id="${id}"
+              data-copy-source="${source}"
               title="复制此会话的深链接" aria-label="复制此会话的深链接">
         <span class="sess-icon">⧉</span> 复制链接
       </button>`;
   }
   return html`
     <button type="button" class="sess-topbar-btn sess-row-open" data-open-id="${id}"
+            data-open-source="${source}"
             title="在系统浏览器中打开此会话" aria-label="在浏览器打开此会话">
       <span class="sess-icon">↗</span> 打开
     </button>`;
 }
 
-/** Compact topbar: brief title, path, quick branch/size tags and an info trigger. */
-export function renderCompactHeader(detail) {
+/**
+ * Compact topbar: brief title, path, quick branch/size tags and an info trigger.
+ *
+ * `source` is threaded through from the caller rather than read off `detail`: a
+ * detail carries no source of its own (the same transcript could in principle be
+ * reachable from two sources), and the view knows which one it asked for.
+ */
+export function renderCompactHeader(detail, { source = 'claude' } = {}) {
   const host = $('#session-detail-head');
   if (!host) return;
   const s = detail.summary;
@@ -137,7 +145,7 @@ export function renderCompactHeader(detail) {
       <div class="sess-topbar-meta">
         ${raw(s.git_branch ? html`<span class="badge-pill sess-badge-git">${s.git_branch}</span>` : '')}
         <span class="badge-pill">${formatBytes(s.size_bytes)}</span>
-        ${raw(headerOpenMarkup(s.id))}
+        ${raw(headerOpenMarkup(source, s.id))}
         <button type="button" class="sess-topbar-btn" id="btn-sess-topbar-stats" title="展开完整指标与详情">
           <span class="sess-icon">📊</span> 详情
         </button>
@@ -289,8 +297,8 @@ export function renderTimelineBody(detail, { replace } = {}) {
 }
 
 /** First paint of a session: compact header, footer stats, modal data, timeline, scrolled to bottom. */
-export function renderDetail(detail) {
-  renderCompactHeader(detail);
+export function renderDetail(detail, { source = 'claude' } = {}) {
+  renderCompactHeader(detail, { source });
   renderFooterStats(detail);
   renderDetailModal(detail);
   renderTimelineBody(detail, { replace: true });

@@ -73,6 +73,19 @@ export async function checkSessions(ctx) {
       // in the same wrapper as the row it acts on.
       const openBtns = [...document.querySelectorAll('#sessions-rows .sess-row-wrap .sess-row-open')];
       const openId = openBtns[0]?.dataset.openId || '';
+      // The grouped list must still be a *list of sessions*: the group header is
+      // a fold control, not a row. These two counts are what makes that checkable
+      // rather than a promise in a comment.
+      const groupHeads = [...document.querySelectorAll('#sessions-rows .sess-group-head')];
+      const headsWithRowClass = groupHeads.filter((h) => h.classList.contains('sess-row')).length;
+      const nestedRows = [...document.querySelectorAll('#sessions-rows .sess-row-wrap.is-nested .sess-row')];
+      const pagerHidden = document.querySelector('.sess-pager')?.hasAttribute('hidden') ?? null;
+      // The 60px row height is the sidebar's rhythm and the title's right padding
+      // is reserved for the row shortcut; the group indent may not touch either.
+      const rowBox = rows[0] ? rows[0].getBoundingClientRect() : null;
+      const titlePadRight = rows[0]
+        ? getComputedStyle(rows[0].querySelector('.sess-row-title')).paddingRight
+        : '';
 
       // Click the shortcut *before* the row and record what it did. The order
       // matters: the detail read is only expected to be caused by the row click
@@ -91,7 +104,7 @@ export async function checkSessions(ctx) {
         title: rows[0]?.querySelector('.sess-row-title')?.textContent,
         gatewayBadge: !!rows[0]?.querySelector('.sess-badge'),
         dshDisabled: !!dsh && dsh.disabled,
-        detailCalled: window.__CALLS__.includes('claude_sessions_detail'),
+        detailCalled: window.__CALLS__.includes('sessions_detail'),
         timelineEntries: document.querySelectorAll('#session-timeline .sess-turn').length,
         toolName: document.querySelector('#session-timeline .sess-tool-name')?.textContent || '',
         innerScrollers: [...document.querySelectorAll('#session-timeline .sess-pre')].filter((p) => p.scrollHeight > p.clientHeight + 2).length,
@@ -105,14 +118,39 @@ export async function checkSessions(ctx) {
         openArgId: openArgs?.id ?? null,
         // Event isolation: the shortcut must not also select the row, which
         // would fire a detail read the user never asked for.
-        openSelectedRow: callsAfterOpen.includes('claude_sessions_detail'),
+        openSelectedRow: callsAfterOpen.includes('sessions_detail'),
         // Consistency: the detail topbar carries the same affordance.
         headerOpenId: document.querySelector('#session-detail-head .sess-row-open')?.dataset.openId || '',
+        // ── 二级列表（项目分组） ──
+        groupHeads: groupHeads.length,
+        headsWithRowClass,
+        groupLabel: groupHeads[0]?.querySelector('.sess-group-label')?.textContent || '',
+        groupCount: groupHeads[0]?.querySelector('.sess-group-count')?.textContent || '',
+        nestedRows: nestedRows.length,
+        pagerHidden,
+        rowHeight: rowBox ? Math.round(rowBox.height) : 0,
+        titlePadRight,
+        groupMoreButtons: document.querySelectorAll('#sessions-rows .sess-group-more').length,
+        rowSource: openBtns[0]?.dataset.openSource || '',
       };
     })()`,
   });
   const sv = sess.result.value;
   check('sessions list renders one row', sv.rowCount, 1);
+  // The fixture's group has exactly one session, so the grouped list must be one
+  // header plus that row -- and the header must NOT be a `.sess-row`: that class
+  // is the "one row = one session" contract, and a header wearing it would make
+  // `rowCount` above meaningless.
+  check('grouped list renders one project header', sv.groupHeads, 1);
+  check('the group header is not a session row', sv.headsWithRowClass, 0);
+  check('the group header shows the project label', sv.groupLabel, 'project');
+  check('the group header shows the exact group count', sv.groupCount, '1');
+  check('the group row is nested under the header', sv.nestedRows, 1);
+  check('the global pager is hidden while grouped', sv.pagerHidden, true);
+  check('nested rows keep the 60px row height', sv.rowHeight, 60);
+  check('nested rows keep the title padding for the row shortcut', sv.titlePadRight, '26px');
+  check('no "show the rest" control when the group fits', sv.groupMoreButtons, 0);
+  check('the row shortcut carries its source', sv.rowSource, 'claude');
   check('sessions row title', sv.title, '会话页测试');
   check('sessions row shows the gateway badge', sv.gatewayBadge, true);
   check('DSH source is disabled', sv.dshDisabled, true);
@@ -186,7 +224,7 @@ export async function checkSessions(ctx) {
   check('server console: the action says it copies', sf.label.includes('复制'), true);
   check(
     'server console: the copied link is this console’s deep link',
-    sf.copied.endsWith(`/admin/#sessions/${FIXTURE_SESSION_ID}`) &&
+    sf.copied.endsWith(`/admin/#sessions/claude/${FIXTURE_SESSION_ID}`) &&
       sf.copied.startsWith('http://127.0.0.1:'),
     true,
   );
@@ -236,16 +274,40 @@ export async function checkHashRouting(ctx) {
       await new Promise((r) => setTimeout(r, 150));
       const unknown = document.querySelector('.tab.active')?.dataset.tab;
 
+      // The legacy two-segment shape: everything 3.5.5 ever handed out. It must
+      // keep working and is *defined* to mean Claude Code.
       location.hash = 'sessions/${FIXTURE_SESSION_ID}';
       await new Promise((r) => setTimeout(r, 500));
       const deepTab = document.querySelector('.tab.active')?.dataset.tab;
       const deepHashKept = location.hash.includes('${FIXTURE_SESSION_ID}');
       const deepSelected = document.querySelector('#sessions-rows .sess-row.active')?.dataset.id || '';
 
-      location.hash = 'sessions/not-a-uuid';
+      // The current three-segment shape.
+      location.hash = 'sessions/claude/${FIXTURE_SESSION_ID}';
+      await new Promise((r) => setTimeout(r, 500));
+      const threeSegmentSelected =
+        document.querySelector('#sessions-rows .sess-row.active')?.dataset.id || '';
+      const threeSegmentHash = location.hash;
+      const threeSegmentAsksClaude =
+        window.__INVOKE_ARGS__?.sessions_detail?.source === 'claude';
+
+      // Unknown source, malformed id, and a fourth segment are all just "no deep
+      // link" -- the tab still resolves, nothing is selected.
+      location.hash = 'sessions/nope/${FIXTURE_SESSION_ID}';
+      await new Promise((r) => setTimeout(r, 300));
+      const badSource = {
+        tab: document.querySelector('.tab.active')?.dataset.tab,
+        selected: document.querySelector('#sessions-rows .sess-row.active')?.dataset.id || '',
+      };
+      location.hash = 'sessions/claude/NOT-A-UUID';
       await new Promise((r) => setTimeout(r, 300));
       const badIdTab = document.querySelector('.tab.active')?.dataset.tab;
-      return { afterClick, afterHash, unknown, deepTab, deepHashKept, deepSelected, badIdTab };
+      location.hash = 'sessions/not-a-uuid';
+      await new Promise((r) => setTimeout(r, 300));
+      const badLegacyTab = document.querySelector('.tab.active')?.dataset.tab;
+      return { afterClick, afterHash, unknown, deepTab, deepHashKept, deepSelected,
+               threeSegmentSelected, threeSegmentHash, threeSegmentAsksClaude,
+               badSource, badIdTab, badLegacyTab };
     })()`,
   });
   const hi = hashInfo.result.value;
@@ -255,7 +317,17 @@ export async function checkHashRouting(ctx) {
   check('a #sessions/<uuid> link opens the sessions tab', hi.deepTab, 'sessions');
   check('a deep link keeps its session id in the hash', hi.deepHashKept, true);
   check('a deep link selects that session', hi.deepSelected, FIXTURE_SESSION_ID);
-  check('a malformed session id still resolves the tab', hi.badIdTab, 'sessions');
+  check('a #sessions/<source>/<id> link selects that session', hi.threeSegmentSelected, FIXTURE_SESSION_ID);
+  check('a three-segment link is not rewritten on arrival', hi.threeSegmentHash,
+    `#sessions/claude/${FIXTURE_SESSION_ID}`);
+  check('a three-segment link asks its own source', hi.threeSegmentAsksClaude, true);
+  check('an unknown source resolves the tab', hi.badSource.tab, 'sessions');
+  // The previous case already selected this one session. An unknown source must
+  // change nothing at all -- treating it as a link would mean trusting an id we
+  // cannot validate against any rule.
+  check('an unknown source leaves the current selection alone', hi.badSource.selected, FIXTURE_SESSION_ID);
+  check('a malformed id under a known source still resolves the tab', hi.badIdTab, 'sessions');
+  check('a malformed legacy session id still resolves the tab', hi.badLegacyTab, 'sessions');
 }
 
 /** Return to the overview so the later scenarios find their elements. */
