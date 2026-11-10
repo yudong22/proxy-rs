@@ -107,11 +107,29 @@ pub fn build_admin_router(state: Arc<AdminState>) -> Router<()> {
         .route("/admin/api/stats", get(stats))
         .route("/admin/api/request-logs", get(request_logs))
         .route("/admin/api/session-metrics", get(session_metrics))
-        .route("/admin/api/claude-sessions", get(claude_sessions))
-        .route("/admin/api/claude-sessions/:id", get(claude_session))
+        // The 3.5.6 paths: same handlers as below, with the source as a segment.
+        .route("/admin/api/sessions", get(sessions_list))
+        .route("/admin/api/sessions/:id", get(session_detail_default))
+        .route(
+            "/admin/api/sessions/:source/:id",
+            get(session_detail_sourced),
+        )
+        .route(
+            "/admin/api/sessions/:source/:id/subagents/:agent",
+            get(session_subagent_sourced),
+        )
+        // The 3.5.5 paths, kept verbatim — same handlers with the default source.
+        // `docs/admin-api.md` promises these to scripts, so they can only ever be
+        // added to, never renamed; dropping them would break every existing
+        // consumer at once, silently.
+        .route("/admin/api/claude-sessions", get(sessions_list))
+        .route(
+            "/admin/api/claude-sessions/:id",
+            get(session_detail_default),
+        )
         .route(
             "/admin/api/claude-sessions/:id/subagents/:agent",
-            get(claude_subagent),
+            get(session_subagent_default),
         )
         .route("/admin/api/logs", get(logs_get))
         .route("/admin/api/logs/clear", post(logs_clear))

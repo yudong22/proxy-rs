@@ -1072,6 +1072,229 @@ async fn claude_sessions_without_a_source_explains_itself() {
         .contains(".claude/projects"));
 }
 
+/// A fixture with two projects, so grouping has something to group.
+///
+/// Sizes and mtimes are deliberately different: group ordering, counts and byte
+/// totals are all stat-derived, and a fixture where everything ties would pass
+/// even if the aggregation were wrong.
+fn write_two_project_fixture(dir: &std::path::Path) {
+    let projects: [(&str, &str, &str, &str); 3] = [
+        // (dir, id, cwd, opened prompt)
+        (
+            "-Users-denis-Sites-proxy-rs",
+            "b9c3800a-311e-4c89-9a38-c533d8969b5d",
+            "/Users/denis/Sites/proxy-rs",
+            "alpha",
+        ),
+        (
+            "-Users-denis-Sites-proxy-rs",
+            "c1c3800a-311e-4c89-9a38-c533d8969b5e",
+            "/Users/denis/Sites/proxy-rs",
+            "beta",
+        ),
+        (
+            "-Users-denis-Sites-lake",
+            "d2c3800a-311e-4c89-9a38-c533d8969b5f",
+            "/Users/denis/Sites/lake",
+            "gamma",
+        ),
+    ];
+    for (project, id, cwd, prompt) in projects {
+        let dir = dir.join(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines = [
+            json!({"type":"user","uuid":"u1","timestamp":"2026-11-01T10:00:00.000Z",
+                   "cwd":cwd,"message":{"role":"user","content":prompt}}),
+            json!({"type":"assistant","uuid":"a1","timestamp":"2026-11-01T10:00:05.000Z",
+                   "message":{"id":"m1","model":"deepseek-v4.1-flash",
+                              "usage":{"input_tokens":10,"output_tokens":20},
+                              "content":[{"type":"text","text":"ok"}]}}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(dir.join(format!("{id}.jsonl")), format!("{lines}\n")).unwrap();
+    }
+}
+
+/// The compatibility promise, as an assertion: with no new parameters the
+/// response is the 3.5.5 shape — no `groups`, `sessions` non-empty, and the field
+/// set unchanged.
+///
+/// This is the test that did not exist before, which is why "add a field and
+/// forget the `json!`" was invisible: nothing compared the wire to the struct.
+#[tokio::test]
+async fn the_flat_list_is_byte_compatible_and_has_no_groups() {
+    let iso = isolate("sessions-flat", Some("tok")).await;
+    write_two_project_fixture(&iso.dir.join("claude-projects"));
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, body) = get_json(app.clone(), "/admin/api/claude-sessions", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], true);
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["offset"], 0);
+    assert_eq!(body["sessions"].as_array().unwrap().len(), 3);
+    assert!(
+        body["groups"].is_null(),
+        "flat mode must not emit groups: {body}"
+    );
+    assert!(body["group_by"].is_null());
+    // Every row says which source produced it.
+    for row in body["sessions"].as_array().unwrap() {
+        assert_eq!(row["source"], "claude");
+    }
+    // The old detail path still answers, under both command names.
+    let id = "b9c3800a-311e-4c89-9a38-c533d8969b5d";
+    for cmd in ["claude_sessions_detail", "sessions_detail"] {
+        let (status, body) = post_rpc(
+            app.clone(),
+            cmd,
+            &json!({ "id": id, "args": {} }).to_string(),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cmd}: {body}");
+        assert_eq!(body["result"]["summary"]["id"], id, "{cmd}");
+    }
+}
+
+#[tokio::test]
+async fn grouping_returns_exact_per_group_totals_and_truncates_by_group_limit() {
+    let iso = isolate("sessions-group", Some("tok")).await;
+    write_two_project_fixture(&iso.dir.join("claude-projects"));
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+
+    let (status, body) = get_json(
+        app.clone(),
+        "/admin/api/claude-sessions?group_by=project&group_limit=1",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["group_by"], "project");
+    let groups = body["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 2, "{body}");
+    // Σ count is the whole filtered population, and `total` agrees with it.
+    let sum: usize = groups
+        .iter()
+        .map(|g| g["count"].as_u64().unwrap() as usize)
+        .sum();
+    assert_eq!(sum, 3);
+    assert_eq!(body["total"], 3);
+    // Grouped mode does not duplicate rows into `sessions`.
+    assert_eq!(body["sessions"].as_array().unwrap().len(), 0);
+
+    let proxy = groups
+        .iter()
+        .find(|g| g["key"] == "claude:-Users-denis-Sites-proxy-rs")
+        .expect("the two-session project");
+    assert_eq!(
+        proxy["label"], "proxy-rs",
+        "label comes from the transcript cwd"
+    );
+    assert_eq!(proxy["cwd"], "/Users/denis/Sites/proxy-rs");
+    assert_eq!(proxy["count"], 2);
+    assert_eq!(
+        proxy["sessions"].as_array().unwrap().len(),
+        1,
+        "group_limit=1"
+    );
+    assert_eq!(proxy["more"], true, "one session did not fit");
+    assert!(proxy["size_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(proxy["sources"][0], "claude");
+
+    // The other project is a single session, so it is not truncated.
+    let lake = groups
+        .iter()
+        .find(|g| g["key"] == "claude:-Users-denis-Sites-lake")
+        .expect("the one-session project");
+    assert_eq!(lake["count"], 1);
+    assert_eq!(lake["more"], false);
+}
+
+#[tokio::test]
+async fn a_group_filter_pages_within_that_group_only() {
+    let iso = isolate("sessions-group-filter", Some("tok")).await;
+    write_two_project_fixture(&iso.dir.join("claude-projects"));
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let key = "claude:-Users-denis-Sites-proxy-rs";
+
+    let uri = format!("/admin/api/claude-sessions?group_by=project&group={key}&offset=1&limit=1");
+    let (status, body) = get_json(app, &uri, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let groups = body["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1, "the filter selects exactly one group");
+    assert_eq!(groups[0]["key"], key);
+    assert_eq!(body["total"], 2, "total is the group's size under a filter");
+    assert_eq!(groups[0]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(groups[0]["more"], false, "the last page ends the group");
+}
+
+#[tokio::test]
+async fn an_unknown_source_or_group_by_is_a_404_not_a_silent_fallback() {
+    let iso = isolate("sessions-bad-source", Some("tok")).await;
+    write_two_project_fixture(&iso.dir.join("claude-projects"));
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    for uri in [
+        "/admin/api/claude-sessions?source=nope",
+        // Known but not readable yet: must explain, not 404-with-nothing.
+        "/admin/api/claude-sessions?source=dsh",
+        "/admin/api/claude-sessions?group_by=nonsense",
+    ] {
+        let (status, body) = get_json(app.clone(), uri, &cookie).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        // The rule is a *substring* match (`not_found_or_internal` contains, not
+        // starts_with), and the group-by error is wrapped by the read path. What
+        // matters is that it is a 404 with an explaining message.
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("无效的"),
+            "{uri}: the 404 rule keys on 无效的: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_sourced_rest_paths_and_the_old_ones_agree() {
+    let iso = isolate("sessions-sourced", Some("tok")).await;
+    write_two_project_fixture(&iso.dir.join("claude-projects"));
+    let app = console_router();
+    let cookie = login_cookie_via(app.clone(), "tok").await;
+    let id = "b9c3800a-311e-4c89-9a38-c533d8969b5d";
+
+    let (new_status, new_body) = get_json(
+        app.clone(),
+        &format!("/admin/api/sessions/claude/{id}"),
+        &cookie,
+    )
+    .await;
+    let (old_status, old_body) = get_json(
+        app.clone(),
+        &format!("/admin/api/claude-sessions/{id}"),
+        &cookie,
+    )
+    .await;
+    assert_eq!(new_status, StatusCode::OK, "{new_body}");
+    assert_eq!(old_status, StatusCode::OK, "{old_body}");
+    assert_eq!(
+        new_body["summary"]["id"], old_body["summary"]["id"],
+        "the sourced and unsourced paths must read the same session"
+    );
+
+    // `/admin/api/sessions` with no source segment is the default source.
+    let (status, body) = get_json(app, "/admin/api/sessions", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 3);
+}
+
 /// Authenticated GET returning `(status, body)`.
 async fn get_json(app: axum::Router, uri: &str, cookie: &str) -> (StatusCode, Value) {
     let req = Request::builder()

@@ -160,15 +160,43 @@ pub type PortHook = std::sync::Arc<dyn Fn() -> u16 + Send + Sync>;
 ///    URL would be read as a command separator; keeping the URL query-free keeps
 ///    that from ever mattering.
 pub fn session_console_url(session_id: &str, console_port: u16) -> Result<String, String> {
+    session_console_url_for(None, session_id, console_port)
+}
+
+/// The same, for a named source.
+///
+/// `None` means the default source, and that is the shape the old address
+/// (`#sessions/<id>`) already carries — it is still produced, so a URL minted by
+/// 3.5.5 keeps working. A named source adds one segment:
+/// `#sessions/<slug>/<id>`.
+///
+/// The two inputs that reach the URL are still only an enumerated slug and an
+/// id validated by that source's own checker, so the "no scheme, host or query
+/// can be expressed" argument is unchanged. `is_console_url` is deliberately not
+/// touched: it validates up to `/admin/` and never looked at the hash.
+pub fn session_console_url_for(
+    source: Option<&str>,
+    session_id: &str,
+    console_port: u16,
+) -> Result<String, String> {
     if console_port == 0 {
         return Err("控制台未就绪：控制台端口尚未绑定，无法打开会话页面".to_string());
     }
-    if !crate::claude_sessions::is_valid_session_id(session_id) {
+    let src = match source {
+        None => crate::sessions::default_source(),
+        Some(slug) => crate::sessions::by_slug(slug).map_err(|e| e.to_string())?,
+    };
+    if !src.is_valid_id(session_id) {
         return Err(format!("会话 id 无效: {session_id}"));
     }
-    Ok(format!(
-        "http://127.0.0.1:{console_port}/admin/#sessions/{session_id}"
-    ))
+    Ok(match source {
+        // The default source keeps the historical two-segment shape, so a link
+        // handed out by 3.5.5 (or by a script that hardcoded it) still resolves.
+        None => format!("http://127.0.0.1:{console_port}/admin/#sessions/{session_id}"),
+        Some(slug) => {
+            format!("http://127.0.0.1:{console_port}/admin/#sessions/{slug}/{session_id}")
+        }
+    })
 }
 
 /// Whether `url` is the one shape [`session_console_url`] produces.
@@ -292,6 +320,19 @@ pub fn console_port() -> Option<u16> {
 /// 5. **Then** invoke the desktop's launcher (which checks the prefix a third
 ///    time before spawning).
 pub fn open_session_in_browser(session_id: &str) -> Result<(String, String), String> {
+    open_session_in_browser_for(None, session_id)
+}
+
+/// The same, for a named source.
+///
+/// The extra input is a **source slug**, not a URL: the caller still cannot
+/// express a scheme, a host, a port or a query, which is the entire reason this
+/// boundary exists. The slug is looked up in the registry (an enum, not a free
+/// string) and the id is then validated by that source's own checker.
+pub fn open_session_in_browser_for(
+    source: Option<&str>,
+    session_id: &str,
+) -> Result<(String, String), String> {
     let guard = slot().lock().unwrap_or_else(|p| p.into_inner());
     let Some(registered) = guard.as_ref() else {
         // No hooks at all: this is a server deployment, where the console the
@@ -304,7 +345,7 @@ pub fn open_session_in_browser(session_id: &str) -> Result<(String, String), Str
         return Err("当前运行环境不支持在浏览器中打开会话".to_string());
     };
     let port = registered.console_port.as_ref().map(|f| f()).unwrap_or(0);
-    let url = session_console_url(session_id, port)?;
+    let url = session_console_url_for(source, session_id, port)?;
     // Second check, independent of how `url` was produced. See the doc comment.
     if !is_console_url(&url) {
         return Err(format!(

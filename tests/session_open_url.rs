@@ -144,6 +144,71 @@ fn the_session_url_is_always_the_local_console_deep_link() {
     assert!(url.contains("/admin/#sessions/"), "{url}");
 }
 
+/// A named source adds one segment and nothing else.
+///
+/// The point of this test is what did **not** change: the scheme, host and port
+/// are still literals, the hash is still the only place the input lands, and the
+/// source is a registry slug rather than a caller-supplied string. An unknown slug
+/// is refused *before* composition, so there is no path where a caller's text
+/// reaches the URL.
+#[test]
+fn a_named_source_adds_a_segment_and_an_unknown_one_is_refused() {
+    let url = desktop_hooks::session_console_url_for(Some("claude"), SESSION_ID, CONSOLE_PORT)
+        .expect("the registered source");
+    assert_eq!(
+        url,
+        format!("http://127.0.0.1:{CONSOLE_PORT}/admin/#sessions/claude/{SESSION_ID}")
+    );
+
+    // The default (no source) form is unchanged, so a 3.5.5-minted link resolves.
+    let plain = desktop_hooks::session_console_url(SESSION_ID, CONSOLE_PORT).unwrap();
+    assert_eq!(
+        plain,
+        format!("http://127.0.0.1:{CONSOLE_PORT}/admin/#sessions/{SESSION_ID}")
+    );
+
+    for bad in ["nope", "dsh", "", "../claude", "CLAUDE", "claude/x"] {
+        let err = desktop_hooks::session_console_url_for(Some(bad), SESSION_ID, CONSOLE_PORT)
+            .expect_err("only a registered slug may be used");
+        assert!(!err.contains("http"), "an error must not leak a URL: {err}");
+    }
+    // The id is validated by the *named* source's checker, not a shared one.
+    assert!(
+        desktop_hooks::session_console_url_for(Some("claude"), "not-a-uuid", CONSOLE_PORT).is_err()
+    );
+
+    // `is_console_url` still accepts both shapes: it never inspected the hash,
+    // which is precisely why adding a segment neither needed nor weakened it.
+    assert!(desktop_hooks::is_console_url(&url));
+}
+
+/// The RPC accepts a source slug and still ignores anything URL-shaped.
+#[tokio::test]
+async fn the_rpc_takes_a_source_slug_but_still_never_a_url() {
+    let _hooks = take_hook_table().await;
+    let (captured, _port) = register_capturing_desktop(CONSOLE_PORT);
+
+    let result = call_rpc(json!({
+        "id": SESSION_ID,
+        "source": "claude",
+        "url": "file:///etc/passwd",
+        "host": "evil.example",
+        "port": 9999,
+    }))
+    .await
+    .expect("a registered source is legitimate");
+
+    let expected = format!("http://127.0.0.1:{CONSOLE_PORT}/admin/#sessions/claude/{SESSION_ID}");
+    assert_eq!(result["url"], expected, "{result}");
+    assert_eq!(captured.lock().unwrap().clone(), vec![expected]);
+
+    // An unregistered source is refused rather than interpolated.
+    let err = call_rpc(json!({ "id": SESSION_ID, "source": "nope" }))
+        .await
+        .expect_err("an unknown source must not open anything");
+    assert!(err.to_string().contains("无效的"), "{err}");
+}
+
 /// A console that has not bound yet is an error, not a `:0` URL.
 ///
 /// The port is read from a hook at call time, so this is the "desktop is up but
@@ -260,6 +325,45 @@ async fn the_deep_link_allow_list_is_not_an_open_redirect() {
         "/admin/logs",
         "sessions/b9c3a1d4-0e5f-4a7b-8c9d-1e2f3a4b5c6d?x=1",
         "sessions/b9c3a1d4-0e5f-4a7b-8c9d-1e2f3a4b5c6d#x",
+    ] {
+        let body = format!("password=tok&next={}", evil.replace(' ', "%20"));
+        let (status, location) = post_form_login(&body).await;
+        assert_eq!(status, axum::http::StatusCode::SEE_OTHER, "{evil}");
+        assert_eq!(
+            location.as_deref(),
+            Some("/admin/"),
+            "{evil} must not become a redirect target"
+        );
+    }
+}
+
+/// The sourced deep link survives the login round trip, and the allow-list still
+/// cannot express a host, a scheme or a traversal.
+#[tokio::test]
+async fn landing_path_honours_a_sourced_deep_link() {
+    let resp = post_form_login(&format!("password=tok&next=sessions/claude/{SESSION_ID}")).await;
+    assert_eq!(resp.0, axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.1.as_deref(),
+        Some(format!("/admin/#sessions/claude/{SESSION_ID}").as_str()),
+        "a sourced deep link must survive login"
+    );
+
+    for evil in [
+        // A source that is not registered.
+        "sessions/nope/".to_string() + SESSION_ID,
+        // Registered but not readable: refusing is the honest answer, and it
+        // must land on the console root rather than on a page that would then
+        // fail to load the session.
+        format!("sessions/dsh/{SESSION_ID}"),
+        // The id is checked by *that source's* validator.
+        "sessions/claude/not-a-uuid".to_string(),
+        // Upper case, traversal, and a fourth segment all stay out.
+        format!("sessions/CLAUDE/{SESSION_ID}"),
+        format!("sessions/../{SESSION_ID}"),
+        format!("sessions/claude/{SESSION_ID}/extra"),
+        format!("sessions/claude/{SESSION_ID}?x=1"),
+        "https://evil.example/admin/#sessions/claude/x".to_string(),
     ] {
         let body = format!("password=tok&next={}", evil.replace(' ', "%20"));
         let (status, location) = post_form_login(&body).await;

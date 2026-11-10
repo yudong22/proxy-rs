@@ -73,29 +73,62 @@ pub(crate) fn next_tab_query(next: Option<&str>) -> String {
 }
 
 /// The bare tab name (plus `&next=` form) the allow-list accepts, if any.
+///
+/// ## The open-redirect argument, restated for two shapes
+///
+/// Three shapes are honoured, all of them closed:
+///
+/// * a bare tab name, matched against a literal list;
+/// * `sessions/<id>` — the 3.5.5 deep link, default source;
+/// * `sessions/<slug>/<id>` — the 3.5.6 deep link.
+///
+/// The long forms are safe for the same reason as before: the slug must be a
+/// **registered** source (an enum, not free text), and the id must pass that
+/// source's own validator. Neither segment can carry a `/`, a scheme, a host or a
+/// query once those checks are applied, so the result is always an in-page hash on
+/// our own origin. Widening this to a second shape does not widen that: an input
+/// that fails either check produces no `next` at all rather than a fallback,
+/// because "you asked for a specific conversation" must not silently become "the
+/// list page".
 fn next_hash(next: Option<&str>) -> Option<String> {
     let raw = next?.trim().trim_start_matches('#');
-    // A deep link to one conversation: `sessions/<uuid>`. This is the only
-    // multi-segment shape honoured, and only because the second segment must be
-    // a syntactically valid session id (strict lowercase hex UUID).
-    //
-    // Why accepting it does **not** widen the open-redirect surface: the two
-    // segments are matched as literals plus a validated UUID, so no input can
-    // express a scheme, a host, or a traversal (`sessions/../../etc` fails the
-    // UUID test, and so does an upper-case or non-UUID value). The result is
-    // always `/admin/#sessions/<uuid>` — an in-page hash on our own origin,
-    // never a redirect target the browser could leave the site for.
-    if let Some(id) = raw.strip_prefix("sessions/") {
-        if crate::claude_sessions::is_valid_session_id(id) {
-            return Some(format!("sessions/{id}"));
+
+    if let Some(rest) = raw.strip_prefix("sessions/") {
+        // Two segments: the old shape, whose only possible meaning is the default
+        // source. An invalid id yields nothing rather than a bare `sessions`.
+        if !rest.contains('/') {
+            return default_source_accepts(rest).then(|| format!("sessions/{rest}"));
         }
-        // An invalid id is not a fallback-to-`sessions`: the operator asked for
-        // a specific conversation, and landing on the bare list is exactly what
-        // no `next` at all already produces. Say nothing instead of guessing.
-        return None;
+        // Three segments: `<slug>/<id>`.
+        let (slug, id) = rest.split_once('/')?;
+        if !is_valid_slug(slug) || id.contains('/') {
+            return None;
+        }
+        let source = crate::sessions::by_slug(slug).ok()?;
+        return source
+            .is_valid_id(id)
+            .then(|| format!("sessions/{slug}/{id}"));
     }
+
     const TABS: [&str; 4] = ["overview", "logs", "sessions", "settings"];
     TABS.contains(&raw).then(|| raw.to_string())
+}
+
+/// Whether the default source would accept this id.
+fn default_source_accepts(id: &str) -> bool {
+    crate::sessions::default_source().is_valid_id(id)
+}
+
+/// The slug charset, checked before the registry lookup so a malformed segment
+/// never reaches it (and so the failure is a rejection, not a lookup miss that
+/// happens to also be a rejection).
+fn is_valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 16
+        && slug.starts_with(|c: char| c.is_ascii_lowercase())
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Minimal `%XX` decoder for form values.

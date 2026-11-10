@@ -453,9 +453,17 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
         "apply_dsh_config" => crate::admin::apply_dsh_config(state).await,
 
         // ── Local sessions (会话 page) ──────────────────────────────────
-        // Argument names mirror the Tauri signatures: `args` is the paging
-        // object, and the detail commands take a bare `id` (+ `agentId`).
-        "claude_sessions_list" => {
+        //
+        // 3.5.6 renamed these to `sessions_*` because the page is no longer
+        // Claude-Code-only. The `claude_sessions_*` names stay as aliases for one
+        // release: they are called by the shipped console JS of 3.5.5 (a browser
+        // holding a cached bundle while the gateway is newer) and by
+        // `ui/tools/admin-smoke.mjs`. Keeping them costs three match arms;
+        // removing them turns every one of those callers into "未知命令" at once.
+        //
+        // `source` is optional everywhere: absent means the default source, which
+        // is exactly what a 3.5.5 caller means.
+        "sessions_list" | "claude_sessions_list" => {
             let list_args = args
                 .get("args")
                 .cloned()
@@ -463,10 +471,11 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
                 .transpose()
                 .map_err(|e| anyhow!("会话参数无效: {e}"))?
                 .unwrap_or_default();
-            crate::admin::claude_sessions_list(Some(state.stats.clone()), list_args).await
+            crate::admin::sessions_list(Some(state.stats.clone()), list_args).await
         }
-        "claude_sessions_detail" => {
+        "sessions_detail" | "claude_sessions_detail" => {
             let id = req_str(&args, "id")?;
+            let source = opt_str(&args, "source");
             let detail_args = args
                 .get("args")
                 .cloned()
@@ -474,11 +483,12 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
                 .transpose()
                 .map_err(|e| anyhow!("会话参数无效: {e}"))?
                 .unwrap_or_default();
-            crate::admin::claude_session_detail(Some(state.stats.clone()), id, detail_args).await
+            crate::admin::session_detail(Some(state.stats.clone()), source, id, detail_args).await
         }
-        "claude_sessions_subagent" => {
+        "sessions_subagent" | "claude_sessions_subagent" => {
             let id = req_str(&args, "id")?;
             let agent_id = req_str(&args, "agentId")?;
+            let source = opt_str(&args, "source");
             let detail_args = args
                 .get("args")
                 .cloned()
@@ -486,7 +496,7 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
                 .transpose()
                 .map_err(|e| anyhow!("会话参数无效: {e}"))?
                 .unwrap_or_default();
-            crate::admin::claude_subagent_detail(id, agent_id, detail_args).await
+            crate::admin::session_subagent_detail(source, id, agent_id, detail_args).await
         }
         // 「在浏览器打开此会话」。
         //
@@ -509,8 +519,13 @@ pub async fn dispatch(state: &Arc<AdminState>, command: &str, args: &Value) -> R
         // 平台启动器。
         "open_session_in_browser" => {
             let id = req_str(&args, "id")?;
+            // `source` is optional and is a **slug**, never a URL: see the long
+            // note above. An unknown slug is refused by the registry lookup
+            // rather than being concatenated into the address.
+            let source = opt_str(&args, "source");
             let (url, message) =
-                crate::desktop_hooks::open_session_in_browser(&id).map_err(|e| anyhow!(e))?;
+                crate::desktop_hooks::open_session_in_browser_for(source.as_deref(), &id)
+                    .map_err(|e| anyhow!(e))?;
             Ok(json!({ "ok": true, "url": url, "opened": true, "message": message }))
         }
 
@@ -562,6 +577,18 @@ fn req_str(args: &Map<String, Value>, name: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| anyhow!("缺少参数 {name}"))
+}
+
+/// An optional string argument.
+///
+/// Absent and `null` both mean "not given", which is what an older caller sends —
+/// distinguishing them here would turn `{"source": null}` into an error over a
+/// field whose absence is the documented default.
+fn opt_str(args: &Map<String, Value>, name: &str) -> Option<String> {
+    args.get(name)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn req_bool(args: &Map<String, Value>, name: &str) -> Result<bool> {

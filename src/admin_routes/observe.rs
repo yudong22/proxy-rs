@@ -64,7 +64,12 @@ pub(crate) async fn session_metrics(
     Ok(Json(json!({ "sessions": rows })))
 }
 
-/// Local Claude Code sessions, for scripts as well as the console.
+/// Local sessions, for scripts as well as the console.
+///
+/// The `无效的` / `不存在` → 404 rule below is a **contract**, not a convenience:
+/// every "the caller asked for something that does not exist" message must start
+/// with one of those two substrings, or a client error turns into a 500. New
+/// source errors follow it (see `sessions::by_slug`).
 pub(crate) fn not_found_or_internal(err: anyhow::Error) -> ApiError {
     let msg = err.to_string();
     if msg.contains("不存在") || msg.contains("无效的") {
@@ -74,53 +79,110 @@ pub(crate) fn not_found_or_internal(err: anyhow::Error) -> ApiError {
     }
 }
 
-pub(crate) async fn claude_sessions(
+pub(crate) async fn sessions_list(
     Extension(state): Extension<Arc<AdminState>>,
-    Query(q): Query<ClaudeSessionsQuery>,
+    Query(q): Query<SessionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let args = crate::claude_sessions::ListArgs {
-        limit: q.limit,
-        offset: q.offset,
-    };
-    crate::admin::claude_sessions_list(Some(state.stats.clone()), args)
+    let args = q.list_args();
+    crate::admin::sessions_list(Some(state.stats.clone()), args)
         .await
         .map(Json)
         .map_err(not_found_or_internal)
 }
 
-pub(crate) async fn claude_session(
+/// The detail for a route with **no** source segment.
+///
+/// Two routes land here (`/admin/api/sessions/:id` and the 3.5.5
+/// `/admin/api/claude-sessions/:id`) and both mean the default source — those
+/// URLs could only ever have referred to the one source that existed when they
+/// were published.
+pub(crate) async fn session_detail_default(
     Extension(state): Extension<Arc<AdminState>>,
     Path(id): Path<String>,
-    Query(q): Query<ClaudeSessionsQuery>,
+    Query(q): Query<SessionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let args = crate::claude_sessions::DetailArgs {
-        limit: q.limit,
-        offset: q.offset,
-    };
-    crate::admin::claude_session_detail(Some(state.stats.clone()), id, args)
+    let args = q.detail_args();
+    crate::admin::session_detail(Some(state.stats.clone()), None, id, args)
         .await
         .map(Json)
         .map_err(not_found_or_internal)
 }
 
-pub(crate) async fn claude_subagent(
+/// The detail for `/admin/api/sessions/:source/:id`.
+///
+/// A separate handler rather than `Path<(Option<String>, String)>`: axum's path
+/// extractors do not support optional segments, and the failure mode is a 500
+/// with an empty body — which reads as "the backend crashed" rather than "the
+/// route was declared wrong". Two handlers with plain extractors cannot fail that
+/// way.
+pub(crate) async fn session_detail_sourced(
+    Extension(state): Extension<Arc<AdminState>>,
+    Path((source, id)): Path<(String, String)>,
+    Query(q): Query<SessionsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let args = q.detail_args();
+    crate::admin::session_detail(Some(state.stats.clone()), Some(source), id, args)
+        .await
+        .map(Json)
+        .map_err(not_found_or_internal)
+}
+
+pub(crate) async fn session_subagent_default(
     Path((id, agent)): Path<(String, String)>,
-    Query(q): Query<ClaudeSessionsQuery>,
+    Query(q): Query<SessionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let args = crate::claude_sessions::DetailArgs {
-        limit: q.limit,
-        offset: q.offset,
-    };
-    crate::admin::claude_subagent_detail(id, agent, args)
+    let args = q.detail_args();
+    crate::admin::session_subagent_detail(None, id, agent, args)
         .await
         .map(Json)
         .map_err(not_found_or_internal)
 }
 
+pub(crate) async fn session_subagent_sourced(
+    Path((source, id, agent)): Path<(String, String, String)>,
+    Query(q): Query<SessionsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let args = q.detail_args();
+    crate::admin::session_subagent_detail(Some(source), id, agent, args)
+        .await
+        .map(Json)
+        .map_err(not_found_or_internal)
+}
+
+/// Query string of every session endpoint.
+///
+/// One struct for both list and detail because the REST surface has always
+/// accepted `limit`/`offset` on both, and a second near-identical type would be
+/// two places to add the next paging knob to. The extra list-only fields are
+/// simply ignored by the detail handlers.
 #[derive(Debug, Deserialize)]
-pub(crate) struct ClaudeSessionsQuery {
+pub(crate) struct SessionsQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+    group_by: Option<String>,
+    group: Option<String>,
+    group_limit: Option<usize>,
+    source: Option<String>,
+}
+
+impl SessionsQuery {
+    fn list_args(&self) -> crate::claude_sessions::ListArgs {
+        crate::claude_sessions::ListArgs {
+            limit: self.limit,
+            offset: self.offset,
+            group_by: self.group_by.clone(),
+            group: self.group.clone(),
+            group_limit: self.group_limit,
+            source: self.source.clone(),
+        }
+    }
+
+    fn detail_args(&self) -> crate::claude_sessions::DetailArgs {
+        crate::claude_sessions::DetailArgs {
+            limit: self.limit,
+            offset: self.offset,
+        }
+    }
 }
 
 pub(crate) async fn logs_get(Extension(state): Extension<Arc<AdminState>>) -> Json<Value> {
