@@ -162,16 +162,24 @@ npm run build:ui && npm run check:dist && npm run smoke:dist   # 针对真正发
 改 UI（布局、CSS、会话页）时不必每次起 Tauri 窗口。
 
 ```bash
-task dev-server      # 终端一：起一个真实网关（$HOME/.proxy-rs-dev，token=dev）
-task ui-dev          # 终端二：Vite 热更新，端口 4300
+npm run dev-server   # 终端一：起一个真实网关（$HOME/.proxy-rs-dev，token=dev）
+npm run dev-hmr      # 终端二：Vite 热更新，端口 4300
 ```
+
+> 用 `task dev-server` / `task ui-dev` 也一样，但 `task`（go-task）不是默认安装的。
+> 缺了它的表现和「后端挂了」完全一样：页面能打开，而每个读 `/api/*` 的面板都报
+> `ECONNREFUSED 127.0.0.1:4457`。所以两条启动命令都有 npm 版本，npm 本来就是
+> `npm ci` 的前置。
 
 - Vite 托管 `ui/`，**热模块替换**——改 JS 模块即时生效，改 CSS 不刷新页面；
 - `/admin/*`、`/api/*` 代理到真实网关：登录、会话列表（`~/.claude/projects`）、
   RPC 全部是真实数据；
-- 首次访问会落到网关的登录页，登录后 cookie 落在 4300 这个 origin 上，之后照常使用。
+- **测试后端会自动登录**，不用手动输 token。`vite.config.js` 在代理之前用一个
+  `POST /admin/login`（token 就是 `dev`）把网关自己的会话 cookie 转发给浏览器。
+  只对测试后端、只对 loopback、只在还没有会话时生效；`DEV_AUTO_LOGIN=0` 可以关掉
+  它去看真实登录页（比如你正在改登录页本身）。
 
-换后端：`BACKEND=http://127.0.0.1:3456 task ui-dev`。
+换后端：`BACKEND=http://127.0.0.1:3456 npm run dev-hmr`。
 
 **这里没有 mock。** 旧版 `dev.mjs` 自带一套 JS 会话解析器，它总会和
 `src/claude_sessions.rs` 差一个字段，而且「mock 能过、真实网关会失败」的 bug 在这里

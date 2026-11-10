@@ -29,9 +29,144 @@ const PLACEHOLDER = `${BACKEND_HOST}:${DEV_PORT}`;
 /** The installed app's listener for one prefix. */
 const prodTarget = (kind) => `${BACKEND_HOST}:${kind === 'admin' ? PROD_CONSOLE_PORT : PROD_PORT}`;
 
+/**
+ * The token `task dev-server` starts the test gateway with.
+ *
+ * `Taskfile.yaml` hard-codes `PROXY_API_TOKEN=dev` for that instance; this file
+ * has to agree with it, because the auto-login below submits it. Kept next to
+ * the port constants for the same reason they are here: the two sides of the
+ * dev loop must not each carry their own copy of the number.
+ *
+ * Only ever used against the **test** backend. The production app has no token
+ * at all (the process is the operator), so there is nothing to submit.
+ */
+const DEV_API_TOKEN = process.env.DEV_API_TOKEN || 'dev';
+
 /** `proxy_rs_backend=prod` in the cookie jar means the installed app. */
 const wantsProd = (req) =>
   /(?:^|;\s*)proxy_rs_backend=prod(?:;|$)/.test(req.headers?.cookie || '');
+
+/** The `proxy_rs_admin=<value>` the browser sent, or `''`. */
+function adminCookie(req) {
+  const m = /(?:^|;\s*)proxy_rs_admin=([^;]+)/.exec(req.headers?.cookie || '');
+  return m ? m[1] : '';
+}
+
+/**
+ * Auto-login the **test** backend, so `ui-dev` opens a working console.
+ *
+ * ## The problem this removes
+ *
+ * The headless gateway requires `PROXY_API_TOKEN` (it is a server, and
+ * `require_session` refuses every RPC without a session). So every fresh Vite
+ * origin — a new port, or a cleared cookie jar — lands on the login page and
+ * asks for a token that only `Taskfile.yaml` knows: `dev`. That is a manual
+ * step in a hot-reload loop, paid again on every `npm run dev` restart, and it
+ * is what "dev 环境登录问题" means in practice.
+ *
+ * ## Why a login POST rather than minting a cookie directly
+ *
+ * The Vite process cannot fabricate a valid session: sessions live in the
+ * gateway's memory (`AdminSessions`), and the only two ways to get one are the
+ * login endpoint and the desktop-only `desktop-boot`. So this performs the real
+ * login — one form POST with the dev token — and hands the gateway's own
+ * `Set-Cookie` through to the browser. Nothing is bypassed; the dev loop simply
+ * supplies the token it already knows.
+ *
+ * ## Why it is safe
+ *
+ *  * **dev backend only.** `wantsProd(req)` short-circuits first, so the
+ *    production console is never auto-logged-in (it has no token to submit, and
+ *    its `desktop-boot` path already exists).
+ *  * **loopback only.** `/admin/` is reachable from the network when someone
+ *    runs Vite with a wider bind; auto-login there would hand a session to a
+ *    stranger. `host: '127.0.0.1'` above is the first gate, and this checks the
+ *    same thing again rather than trusting config.
+ *  * **opt-out.** `DEV_AUTO_LOGIN=0` disables it for someone who wants to see
+ *    the real login page (e.g. to work on that page).
+ *  * It never runs in a build. There is no `apply` here because this is a plain
+ *    function, not a plugin: its only caller is the serve-only request wrapper
+ *    in `backendSwitch` (`apply: 'serve'`), so a build has no code path to it.
+ *    `npm run build:ui` output contains none of it.
+ *
+ * The cookie is only minted when the request carries **no** `proxy_rs_admin`:
+ * once the browser has a session, this stays out of the way entirely, including
+ * after a logout (`clear_cookie_header` removes the cookie, so the next load
+ * logs in again — which is what a dev loop should do).
+ */
+function autoLoginDev(req, res, fallthrough) {
+  // Opt-out is a plain env check, not a plugin toggle: the caller decides
+  // whether to route here, so there is no half-registered state to reason about.
+  if (process.env.DEV_AUTO_LOGIN === '0') return fallthrough();
+
+  const target = `${BACKEND_HOST}:${DEV_PORT}`;
+  // No `next`: the browser never leaves the URL it asked for, so the hash
+  // (`#sessions/<uuid>`, `#logs`, …) is still in the address bar when the page
+  // loads. Passing a tab through the form would *lose* it — a fragment is never
+  // sent to the server, so the server cannot echo it back, and the redirect
+  // would land on `/admin/` stripped of the very deep link the request was for.
+  const body = `token=${encodeURIComponent(DEV_API_TOKEN)}`;
+
+  // The POST is async but the request listener is not; the answer is written
+  // when it resolves. Until then nothing else touches this `res`, which is what
+  // keeps the ordering safe without making the whole stack async.
+  fetch(`${target}/admin/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body,
+    redirect: 'manual', // we need the `Set-Cookie`, not the navigation
+  })
+    .then((upstream) => {
+      const setCookie = upstream.headers.get('set-cookie');
+      // **A successful login answers `303`, so `upstream.ok` is false.**
+      //
+      // That is the whole point of the endpoint: it is consumed by a real form
+      // submission, and the browser needs a redirect, not a JSON body
+      // (`login_handler` answers 303 for a form post and a JSON 200 only for a
+      // script). Testing `ok` here silently discarded the cookie on every
+      // attempt — the page then rendered the login page as if auto-login had
+      // never been written, which reads exactly like "the feature does not
+      // work" rather than "the status check was wrong".
+      //
+      // What is checked instead: the response carries our session cookie. That
+      // is the actual evidence of success, and it is what gets forwarded.
+      const accepted = upstream.status === 303 || upstream.status === 302 || upstream.ok;
+      if (!accepted || !setCookie) return fallthrough();
+
+      res.statusCode = 302;
+      res.setHeader('set-cookie', setCookie);
+      // Back to the exact URL requested; the freshly set cookie makes the retry
+      // succeed, and the fragment survives because the browser never navigated
+      // away from it.
+      res.setHeader('location', req.url || '/admin/');
+      res.end();
+    })
+    .catch(() => fallthrough());
+}
+
+/**
+ * Whether this request is one the auto-login should answer.
+ *
+ * Deliberately narrow: a **GET of the console page itself**, on the dev
+ * backend, from loopback, with no session yet. Anything else — an RPC call, an
+ * asset, a POST, the login endpoint — is left to the normal proxy path.
+ */
+function isDevAutoLoginCandidate(req) {
+  if (req.method !== 'GET') return false;
+  if (wantsProd(req)) return false;
+  // Loopback only, re-checked rather than assumed from `server.host`.
+  const remote = req.socket?.remoteAddress || '';
+  if (!/^(::1|::ffff:127\.|127\.)/.test(remote)) return false;
+  if (adminCookie(req)) return false; // already has a session
+
+  const url = (req.url || '').split('?')[0];
+  // The console page is served at `/admin/` (and `/admin`), which the proxy
+  // entry forwards to the gateway. `/admin/login` is excluded by the exact
+  // match below — auto-logging-in *from* the login page would make it
+  // impossible to look at that page, which is a worse trade than one manual
+  // token entry in that one case.
+  return url === '/admin/' || url === '/admin';
+}
 
 /**
  * Retarget the two proxy entries per request, from the `proxy_rs_backend`
@@ -69,6 +204,20 @@ function backendSwitch() {
         // Two keys only; `proxy` is a literal in this file, not user config.
         proxy['/admin'].target = backend === 'prod' ? prodTarget('admin') : `${BACKEND_HOST}:${DEV_PORT}`;
         proxy['/api'].target = backend === 'prod' ? prodTarget('api') : `${BACKEND_HOST}:${DEV_PORT}`;
+
+        // Auto-login has to be decided **here**, not in a plugin middleware.
+        //
+        // A plugin's `configureServer` middleware also runs inside this stack,
+        // but `connectStack` is invoked by the line below — by the time that
+        // middleware sees the request, the proxy entry with this request's
+        // target has already been consulted and the page answered. (Measured:
+        // registering a second plugin and logging inside it shows it running,
+        // yet the page still comes back 200 with no `Set-Cookie`.) So the
+        // decision lives on the same path that picks the upstream.
+        if (backend === 'dev' && isDevAutoLoginCandidate(req)) {
+          void autoLoginDev(req, res, () => connectStack(req, res));
+          return;
+        }
         connectStack(req, res);
       });
     },

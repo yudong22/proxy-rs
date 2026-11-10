@@ -7,6 +7,8 @@
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "dev-server": "node ui/tools/dev-server.mjs",
+    "dev-hmr": "node ui/tools/dev.mjs",
     "build": "tauri build -b app",
     "build:dmg": "tauri build -b dmg",
     "build:ui": "vite build",

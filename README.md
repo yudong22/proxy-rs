@@ -171,7 +171,7 @@ sequenceDiagram
 
 ### 常用命令
 
-使用 Task：
+使用 Task（可选，`task` 需自行安装）：
 ```bash
 task install     # 构建并安装到 /Applications (运行中自动热重启；会自动 setup → build)
 task ui-dev      # 前端热更新循环，连真实网关（另开一个终端先跑 task dev-server）
@@ -180,6 +180,13 @@ task dev-server  # 本地起一个 headless 网关，供 ui-dev 使用
 
 Taskfile 只保留这几个日常用的任务；`setup` / `build` 是 `install` 的依赖。
 其余检查请直接运行命令（见下）或交给 CI。
+
+不装 task 也能跑开发循环（`task` 缺失时的报错看起来像「后端挂了」，所以这两条 npm 脚本是等价的）：
+
+```bash
+npm run dev-server   # 终端一：headless 网关（$HOME/.proxy-rs-dev，token=dev）
+npm run dev-hmr      # 终端二：Vite 热更新，端口 4300，自动登录测试后端
+```
 
 使用 npm / cargo：
 ```bash
