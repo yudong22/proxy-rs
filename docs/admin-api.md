@@ -160,9 +160,12 @@
 | `GET` | `/admin/api/logs` | 内存日志缓冲 |
 | `POST` | `/admin/api/logs/clear` | 清空日志缓冲 |
 | `GET` | `/admin/api/session-metrics` | 会话速度对比 |
-| `GET` | `/admin/api/claude-sessions?limit=&offset=` | 本机 Claude Code 会话列表（按 mtime 降序），每行带按 `claude:<uuid>` 关联的网关用量 |
-| `GET` | `/admin/api/claude-sessions/:id?limit=&offset=` | 单个会话的详情与时间线（默认返回最新 200 条，`offset` 向前翻） |
-| `GET` | `/admin/api/claude-sessions/:id/subagents/:agent` | 某个子代理的对话记录 |
+| `GET` | `/admin/api/sessions?limit=&offset=&group_by=&group=&group_limit=&source=` | 本机会话列表（按 mtime 降序），每行带按 `<source>:<id>` 关联的网关用量；`group_by=project` 时按项目二级聚合（3.5.6） |
+| `GET` | `/admin/api/sessions/:id?limit=&offset=` | 单个会话的详情与时间线（默认返回最新 200 条，`offset` 向前翻） |
+| `GET` | `/admin/api/sessions/:source/:id?limit=&offset=` | 同上，来源显式指定（3.5.6） |
+| `GET` | `/admin/api/claude-sessions?limit=&offset=` | **兼容路径**，等价于 `/admin/api/sessions`（默认来源） |
+| `GET` | `/admin/api/claude-sessions/:id?limit=&offset=` | **兼容路径**，等价于 `/admin/api/sessions/:id` |
+| `GET` | `/admin/api/claude-sessions/:id/subagents/:agent` | 某个子代理的对话记录（兼容路径） |
 
 ### 本地会话（会话页）
 
@@ -177,8 +180,41 @@
 - **DSH 会话暂不支持**：其存档是 zstd 压缩的 `session.vN.jsonl.zstd`。列表响应的 `sources`
   里 DSH 条目 `available: false` 并附原因，前端据此渲染为禁用项。
 
-对应的控制台命令（`/admin/api/rpc/<name>`，与桌面端 Tauri 命令同名）：
-`claude_sessions_list`、`claude_sessions_detail`、`claude_sessions_subagent`。
+#### 来源与二级聚合（3.5.6）
+
+列表响应新增两个字段，**不带 `group_by` 时它们都是 `null`**，此时响应与 3.5.5 完全一致：
+
+```jsonc
+{
+  "total": 31, "offset": 0, "limit": 50, "sessions": [ /* 每行含 "source": "claude" */ ],
+  "group_by": "project",              // 未分组时为 null
+  "groups": [                         // 未分组时为 null；分组时 sessions 为 []
+    { "key": "claude:-Users-a-proj",  // 不透明串，回传 group= 用
+      "label": "proj",                // cwd 末段（取该组最新会话的头 64 KiB）
+      "cwd": "/Users/a/proj",         // 规范化绝对路径；未知为 ""
+      "sources": ["claude"],
+      "count": 10,                    // 整组条数（stat，精确）
+      "last_seen_ms": 1794332000000,  // 整组最新 mtime（stat，精确）
+      "size_bytes": 8101888,          // 整组字节数（stat，精确）
+      "more": false,                  // count > sessions.length
+      "sessions": [ /* 与扁平模式同构 */ ] }
+  ]
+}
+```
+
+- `group_by`：`project` 是唯一取值；未知值返回 **404**（`无效的…`），不静默退回扁平列表。
+- `group`：按上面返回的 `key` 过滤，`offset`/`limit` 随之改为**组内**切片；此时 `total` 是该组条数。
+- `group_limit`：每组返回多少条，缺省 10、clamp 1–200。`more` 表示该组被截断。
+- `source`：来源 slug（当前只有 `claude`）。未知 slug 与 `dsh`（已知但暂不可读）都是 **404**。
+- 组头三个数字来自 `stat`，**不需要打开会话文件**；只有被选中的行才读转写。
+
+`open_session_in_browser` 的 RPC 入参新增可选 `source`（slug，非 URL）。地址两种形态都支持：
+`#sessions/<uuid>`（旧，恒等于默认来源）与 `#sessions/<source>/<uuid>`。
+
+对应的控制台命令（`/admin/api/rpc/<name>`）：
+`sessions_list`、`sessions_detail`、`sessions_subagent`。
+**旧名 `claude_sessions_list` / `claude_sessions_detail` / `claude_sessions_subagent` 保留为别名**，
+将在 3.6.0 移除。
 
 ### 配置
 
