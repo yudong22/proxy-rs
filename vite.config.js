@@ -283,14 +283,27 @@ function backendSwitch() {
         // So the response is captured and rewritten here, in the one place that
         // sees both the request (to know it is a page GET) and the gateway's
         // HTML (to append to it). Everything else streams through untouched.
-        if (backend === 'dev' && isConsolePageGet(req)) {
-          const needsLogin = adminCookie(req) ? hasLiveSession(req).then((live) => !live) : true;
-          Promise.resolve(needsLogin)
-            .then((needs) => {
-              if (needs) return autoLoginDev(req, res, () => proxyWithBadge(req, res, connectStack));
-              proxyWithBadge(req, res, connectStack);
-            })
-            .catch(() => connectStack(req, res));
+        //
+        // **Both backends get the badge, not just `dev`.** The badge carries the
+        // only way back to the test backend, so injecting it on the dev page
+        // alone made the switch one-way: flip to 生产, the next page load had no
+        // control and the test backend became unreachable from the UI — a
+        // one-click trap. The condition is therefore "is this the console page",
+        // not "which backend answered it".
+        if (isConsolePageGet(req)) {
+          // Auto-login stays dev-only; production mints its own session through
+          // `desktop-boot` and has no token to submit.
+          if (backend === 'dev') {
+            const needsLogin = adminCookie(req) ? hasLiveSession(req).then((live) => !live) : true;
+            Promise.resolve(needsLogin)
+              .then((needs) => {
+                if (needs) return autoLoginDev(req, res, () => proxyWithBadge(req, res, connectStack));
+                proxyWithBadge(req, res, connectStack);
+              })
+              .catch(() => connectStack(req, res));
+            return;
+          }
+          proxyWithBadge(req, res, connectStack);
           return;
         }
         connectStack(req, res);
