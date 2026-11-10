@@ -109,6 +109,24 @@ mod tests {
             ClaudeSessionsSource::new(&self.root)
         }
 
+        /// List through the one implementation, pinned to this fixture's root.
+        ///
+        /// The listing itself now lives in `crate::sessions` (it is the same code
+        /// for every source), so the format tests below have to go through it
+        /// rather than call a Claude-only copy — otherwise they would be checking
+        /// a path the console no longer takes.
+        fn list(&self, args: ListArgs) -> ListPage {
+            let source = crate::sessions::claude::ClaudeSourceAt {
+                root: self.root.clone(),
+            };
+            crate::sessions::list_page(&[&source as &dyn crate::sessions::SessionSource], &args)
+                .unwrap()
+        }
+
+        fn list_default(&self) -> ListPage {
+            self.list(ListArgs::default())
+        }
+
         fn write(&self, project: &str, file: &str, lines: &[String]) -> PathBuf {
             let dir = self.root.join(project);
             fs::create_dir_all(&dir).unwrap();
@@ -185,7 +203,7 @@ mod tests {
             &[user("x", "2026-11-01T10:00:00.000Z", "x")],
         );
         f.write(PROJ, "memory/MEMORY.md", &[]);
-        let page = list_sessions(&f.src(), &ListArgs::default()).unwrap();
+        let page = f.list_default();
         assert_eq!(page.total, 1);
         assert_eq!(page.sessions[0].summary.id, SID);
     }
@@ -198,7 +216,7 @@ mod tests {
             &format!("{SID}.jsonl"),
             &[user("u1", "2026-11-01T10:00:00.000Z", "hi")],
         );
-        let page = list_sessions(&f.src(), &ListArgs::default()).unwrap();
+        let page = f.list_default();
         // The transcript says /Users/denis/Sites/proxy-rs, which the dir name cannot encode.
         assert_eq!(page.sessions[0].summary.cwd, "/Users/denis/Sites/proxy-rs");
     }
@@ -216,7 +234,7 @@ mod tests {
                 title("third"),
             ],
         );
-        let page = list_sessions(&f.src(), &ListArgs::default()).unwrap();
+        let page = f.list_default();
         assert_eq!(page.sessions[0].summary.title, "third");
 
         let f2 = Fixture::new("title-fallback");
@@ -225,7 +243,7 @@ mod tests {
             &format!("{SID}.jsonl"),
             &[user("u1", "2026-11-01T10:00:00.000Z", "hello world")],
         );
-        let page = list_sessions(&f2.src(), &ListArgs::default()).unwrap();
+        let page = f2.list_default();
         assert_eq!(page.sessions[0].summary.title, "hello world");
     }
 
@@ -366,7 +384,7 @@ mod tests {
         lines.push(user("u_last", "2026-11-01T12:00:00.000Z", "closing"));
         let path = f.write(PROJ, &format!("{SID}.jsonl"), &lines);
         assert!(fs::metadata(&path).unwrap().len() > HEAD_TAIL_BYTES * 2);
-        let page = list_sessions(&f.src(), &ListArgs::default()).unwrap();
+        let page = f.list_default();
         let s = &page.sessions[0].summary;
         assert_eq!(s.title, "tail title");
         assert!(s.counts_partial);
@@ -562,9 +580,9 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let ids = gateway_ids(&rows);
+        let ids = crate::sessions::gateway_ids(&rows);
         let totals = db.session_usage_totals_for(&ids).unwrap();
-        attach_gateway(&mut rows, &totals);
+        crate::sessions::attach_gateway(&mut rows, &totals);
         assert_eq!(rows[0].gateway.as_ref().unwrap().requests, 1);
         assert_eq!(rows[0].gateway.as_ref().unwrap().output_tokens, 50);
         assert!(rows[1].gateway.is_none(), "unknown id is absent, not zero");

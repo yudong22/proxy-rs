@@ -108,7 +108,12 @@ pub fn resolve_session_path(src: &ClaudeSessionsSource, id: &str) -> Result<Path
 
 // ── Pure helpers ────────────────────────────────────────────────────────
 
-pub(crate) fn candidates(root: &Path) -> Vec<Candidate> {
+/// The directory walk, labelled with the source that owns `root`.
+///
+/// The label is passed in rather than read from a global so the grouping code can
+/// be driven by a synthetic source (see `sessions`' tests) without depending on
+/// this module at all.
+pub(crate) fn candidates_for(root: &Path, source: &str) -> Vec<Candidate> {
     let mut out = Vec::new();
     let walk = walkdir::WalkDir::new(root)
         .min_depth(1)
@@ -144,11 +149,40 @@ pub(crate) fn candidates(root: &Path) -> Vec<Candidate> {
                 path: child.path(),
                 encoded_project: name.clone(),
                 mtime: file_mtime_ms(&meta),
+                // The scan already stat'ed the file; group totals reuse it
+                // instead of paying a second pass over every session.
+                size_bytes: meta.len(),
                 id: stem.to_string(),
+                source: source.to_string(),
             });
         }
     }
     out
+}
+
+/// The absolute working directory recorded in the head of one transcript.
+///
+/// Read only until the first line that carries a `cwd` (`GROUP_CWD_PROBE_BYTES`
+/// at most). Used solely to label a project group — the directory name cannot be
+/// decoded back into a path (`-` is a legal path segment too), so the group's
+/// display name has to come from the transcript itself.
+pub(crate) fn probe_cwd(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file.take(GROUP_CWD_PROBE_BYTES));
+    let mut found = None;
+    read_lines(reader.by_ref(), |line| {
+        if found.is_some() {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        if let Some(cwd) = str_of(&v, "cwd").filter(|s| !s.is_empty()) {
+            found = Some(cwd.to_string());
+        }
+    })
+    .ok()?;
+    found
 }
 
 // ── Public API ──────────────────────────────────────────────────────────

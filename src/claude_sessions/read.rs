@@ -2,60 +2,6 @@
 
 use super::*;
 
-/// All sessions, newest activity first (mtime), paginated.
-///
-/// Only the rows on the requested page are opened; the rest cost one `stat`.
-pub fn list_sessions(src: &ClaudeSessionsSource, args: &ListArgs) -> Result<ListPage> {
-    let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let offset = args.offset.unwrap_or(0);
-    let mut all = candidates(&src.projects_root);
-    all.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| b.id.cmp(&a.id)));
-    let total = all.len();
-    let mut sessions = Vec::new();
-    for c in all.into_iter().skip(offset).take(limit) {
-        match summary_from_file(&c.path, &c.encoded_project) {
-            Ok(summary) => sessions.push(SessionRow {
-                summary,
-                ..SessionRow::default()
-            }),
-            Err(err) => {
-                // One unreadable transcript must not blank the page.
-                tracing::debug!(path = %c.path.display(), error = %err, "skip unreadable session");
-            }
-        }
-    }
-    Ok(ListPage {
-        available: true,
-        reason: None,
-        root: src.projects_root.display().to_string(),
-        stats_available: false,
-        total,
-        offset,
-        limit,
-        sessions,
-    })
-}
-
-/// The namespaced ids for a page's rows, ready for [`crate::stats::StatsDb::session_usage_totals_for`].
-pub fn gateway_ids(rows: &[SessionRow]) -> Vec<String> {
-    rows.iter()
-        .map(|r| format!("{GATEWAY_PREFIX}{}", r.summary.id))
-        .collect()
-}
-
-/// Attach gateway totals by namespaced id. Ids with no rows get `None`, which
-/// the UI renders as "网关未记录", not as zero.
-pub fn attach_gateway(rows: &mut [SessionRow], totals: &[GatewayUsage]) {
-    let mut by_id: HashMap<&str, &GatewayUsage> = HashMap::new();
-    for t in totals {
-        by_id.insert(t.session_id.as_str(), t);
-    }
-    for row in rows.iter_mut() {
-        let key = format!("{GATEWAY_PREFIX}{}", row.summary.id);
-        row.gateway = by_id.get(key.as_str()).map(|t| (*t).clone());
-    }
-}
-
 /// Full parse of one session: exact summary plus the last `offset+limit`
 /// timeline entries.
 pub fn read_session(

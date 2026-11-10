@@ -9,6 +9,29 @@ pub const DEFAULT_LIMIT: usize = 50;
 
 pub const MAX_LIMIT: usize = 200;
 
+/// How many sessions of each project group the grouped list returns by default.
+///
+/// Ten is the number that makes the grouped response cost the *same* as the flat
+/// one on real data: this machine's group sizes are `[10, 8, 4, 2, 2, 1, 1, 1,
+/// 1, 1]`, so a cap of ten opens exactly the 31 files the flat `limit=50` opens
+/// today. It is a measurement, not a guess about screen height.
+pub const DEFAULT_GROUP_LIMIT: usize = 10;
+
+/// The one group-by value the wire accepts for now.
+///
+/// An unknown value is an "无效的" error rather than a silent fallback to the
+/// flat list: a client that asked for grouping and silently got rows would
+/// render a half-empty sidebar with nothing to explain it.
+pub const GROUP_BY_PROJECT: &str = "project";
+
+/// How much of a group's newest transcript is read to learn its `cwd`.
+///
+/// Only the head, and only up to the first line carrying a `cwd`. On real data
+/// the first `cwd` sits at byte 188 (median 507, max 52 491), so 64 KiB covers
+/// every file on this machine with room to spare — while staying far away from
+/// "read the whole session just to label a group".
+pub(crate) const GROUP_CWD_PROBE_BYTES: u64 = 64 * 1024;
+
 /// Head and tail window for the list view. The list only needs the first lines
 /// (`cwd`, `version`, the opening prompt) and the last ones (`ai-title`,
 /// `cost-state`, the latest timestamp), so a 10 MB transcript is read at most
@@ -164,10 +187,24 @@ pub struct IgnoreCounts {
     pub malformed: u32,
 }
 
+/// One list request.
+///
+/// Every new field is `Option` and defaults to "3.5.5 behaviour", which is what
+/// makes the grouped list a pure addition: a caller that sends none of them gets
+/// a byte-identical response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListArgs {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// `None` (or `"none"`) = flat list, exactly as before. `"project"` groups.
+    pub group_by: Option<String>,
+    /// Restrict to one group, by the opaque `key` a previous response returned.
+    /// Only meaningful with `group_by`; `offset`/`limit` then apply *within* it.
+    pub group: Option<String>,
+    /// Sessions returned per group in grouped mode. Clamped like `limit`.
+    pub group_limit: Option<usize>,
+    /// Source slug (`claude`, …). `None` = every readable source.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -184,11 +221,50 @@ pub type GatewayUsage = SessionUsageTotal;
 pub struct SessionRow {
     #[serde(flatten)]
     pub summary: SessionSummary,
-    /// Gateway totals joined by `claude:<id>`; `None` = not recorded, which is
+    /// Which source produced this row (`claude`, …).
+    ///
+    /// Belongs to the row, not the summary: it answers "who gave me this", which
+    /// is a property of the transport that found the file, while `SessionSummary`
+    /// is a property of the conversation itself.
+    pub source: String,
+    /// Gateway totals joined by `<source>:<id>`; `None` = not recorded, which is
     /// not the same claim as zero requests.
     pub gateway: Option<GatewayUsage>,
     /// Gateway query failed; the local row is still shown.
     pub gateway_error: Option<String>,
+}
+
+/// One project group in the grouped list.
+///
+/// `count` / `last_seen_ms` / `size_bytes` come from `stat` only — they are exact
+/// for the whole group, which is what the group header promises ("12 个会话 ·
+/// 2 小时前"). Per-row `turns` / `tool_calls` stay "only for the rows we opened",
+/// because computing those for a whole group means reading every file in it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionGroup {
+    /// Opaque to the client; pass it back as `group=`.
+    pub key: String,
+    /// Display name — the last segment of `cwd` when known.
+    pub label: String,
+    /// Normalised absolute path from the group's newest transcript; `""` when
+    /// no line carried one.
+    ///
+    /// Carried separately from `key` because the key is a *directory name*, and
+    /// Claude Code's encoding of `/` to `-` is lossy: `/a/b/c` and `/a-b-c`
+    /// encode alike. A future cross-source merge needs the real path, so it goes
+    /// on the wire now even though 3.5.6 never merges.
+    pub cwd: String,
+    /// Source slugs that produced sessions in this group, ascending, deduped.
+    pub sources: Vec<String>,
+    /// Sessions in the group (stat; exact).
+    pub count: usize,
+    /// Newest transcript mtime in the group (stat; exact).
+    pub last_seen_ms: i64,
+    /// Sum of the group's transcript sizes (stat; exact).
+    pub size_bytes: u64,
+    /// `count > sessions.len()` — the group was truncated by `group_limit`.
+    pub more: bool,
+    pub sessions: Vec<SessionRow>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -202,6 +278,10 @@ pub struct ListPage {
     pub offset: usize,
     pub limit: usize,
     pub sessions: Vec<SessionRow>,
+    /// `None` when the request did not ask for grouping. That is what keeps the
+    /// 3.5.5 response byte-identical for callers that send no `group_by`.
+    pub group_by: Option<String>,
+    pub groups: Option<Vec<SessionGroup>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -226,9 +306,19 @@ pub struct SessionDetail {
     pub gateway_error: Option<String>,
 }
 
+/// One transcript file found by a source's directory scan, before it is opened.
+///
+/// `pub(crate)` on purpose: this is the cheapest injection point for everything
+/// the grouped list needs, and changing it cannot break the wire. `size_bytes`
+/// is filled from the `stat` the scan already did, so group totals cost no extra
+/// I/O.
+#[derive(Debug, Clone)]
 pub(crate) struct Candidate {
     pub(crate) path: PathBuf,
     pub(crate) encoded_project: String,
     pub(crate) mtime: i64,
+    pub(crate) size_bytes: u64,
     pub(crate) id: String,
+    /// Source slug this candidate came from (`claude`, …).
+    pub(crate) source: String,
 }

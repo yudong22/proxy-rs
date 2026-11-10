@@ -32,6 +32,7 @@ pub mod scheduler_state;
 pub mod service;
 pub mod session;
 pub mod session_pool;
+pub mod sessions;
 pub mod settings;
 pub mod stats;
 pub mod translate;
