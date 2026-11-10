@@ -271,22 +271,25 @@ function backendSwitch() {
         proxy['/admin'].target = backend === 'prod' ? prodTarget('admin') : `${BACKEND_HOST}:${DEV_PORT}`;
         proxy['/api'].target = backend === 'prod' ? prodTarget('api') : `${BACKEND_HOST}:${DEV_PORT}`;
 
-        // Auto-login has to be decided **here**, not in a plugin middleware.
+        // Inject the DEV badge into the console page.
         //
-        // A plugin's `configureServer` middleware also runs inside this stack,
-        // but `connectStack` is invoked by the line below — by the time that
-        // middleware sees the request, the proxy entry with this request's
-        // target has already been consulted and the page answered. (Measured:
-        // registering a second plugin and logging inside it shows it running,
-        // yet the page still comes back 200 with no `Set-Cookie`.) So the
-        // decision lives on the same path that picks the upstream.
-        if (backend === 'dev' && isDevAutoLoginCandidate(req)) {
-          // A present-but-stale cookie is decided asynchronously (it needs one
-          // loopback round trip); a missing one is already known to need login.
-          // Either way nothing else touches `res` until one of them answers.
+        // It **cannot** be a `transformIndexHtml` hook: the page at `/admin/` is
+        // served by the *gateway*, not by Vite, so Vite's HTML pipeline never
+        // sees it. (`transformIndexHtml` only runs for `ui/index.html` at `/`,
+        // which now redirects.) A hook there injected the badge into a document
+        // nothing ever loaded, which is why the switch silently disappeared once
+        // `/` started redirecting.
+        //
+        // So the response is captured and rewritten here, in the one place that
+        // sees both the request (to know it is a page GET) and the gateway's
+        // HTML (to append to it). Everything else streams through untouched.
+        if (backend === 'dev' && isConsolePageGet(req)) {
           const needsLogin = adminCookie(req) ? hasLiveSession(req).then((live) => !live) : true;
           Promise.resolve(needsLogin)
-            .then((needs) => (needs ? autoLoginDev(req, res, () => connectStack(req, res)) : connectStack(req, res)))
+            .then((needs) => {
+              if (needs) return autoLoginDev(req, res, () => proxyWithBadge(req, res, connectStack));
+              proxyWithBadge(req, res, connectStack);
+            })
             .catch(() => connectStack(req, res));
           return;
         }
@@ -294,6 +297,62 @@ function backendSwitch() {
       });
     },
   };
+}
+
+/** A GET of the console page itself (the only response carrying the badge). */
+function isConsolePageGet(req) {
+  if (req.method !== 'GET') return false;
+  const pathname = (req.url || '').split('?')[0];
+  return pathname === '/admin/' || pathname === '/admin';
+}
+
+/**
+ * Forward the request, then append the DEV badge to the returned page.
+ *
+ * Only HTML is rewritten; every other response (a redirect, the login page, an
+ * error, a streamed asset) is passed through byte-for-byte. The capture is
+ * bounded by the fact that this only ever wraps a single console page load —
+ * not assets, not `/api/*`, not RPC.
+ *
+ * If the gateway answers with something that is not a 2xx HTML document (a 302
+ * to the login page, say), the badge is not injected: there is no console to
+ * put it on, and adding it to the login page would offer a backend switch that
+ * cannot take effect.
+ */
+function proxyWithBadge(req, res, connectStack) {
+  const chunks = [];
+  const originalWrite = res.write.bind(res);
+  const originalEnd = res.end.bind(res);
+
+  // `selfHandleResponse` is not used: interception here keeps http-proxy's own
+  // streaming intact for the initial pass and only buffers this one page.
+  res.write = (chunk, encoding, cb) => {
+    if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding));
+    if (typeof encoding === 'function') encoding();
+    else if (typeof cb === 'function') cb();
+    return true;
+  };
+  res.end = (chunk, encoding, cb) => {
+    if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding));
+    const body = Buffer.concat(chunks).toString('utf8');
+    const type = String(res.getHeader('content-type') || '');
+    const isHtml = type.includes('text/html');
+    if (isHtml && res.statusCode >= 200 && res.statusCode < 300 && body.includes('</body>')) {
+      const patched = body.replace('</body>', `${DEV_BADGE_MARKUP}\n</body>`);
+      // The length header was computed for the original body; a stale one makes
+      // the browser truncate the page (and the badge) at the original size.
+      res.removeHeader('content-length');
+      res.setHeader('content-length', String(Buffer.byteLength(patched)));
+      res.write = originalWrite;
+      res.end = originalEnd;
+      return originalEnd(patched, 'utf8', cb);
+    }
+    res.write = originalWrite;
+    res.end = originalEnd;
+    return originalEnd(Buffer.concat(chunks), cb);
+  };
+
+  connectStack(req, res);
 }
 
 /**
@@ -462,9 +521,11 @@ export default defineConfig({
        * changed one transport would show data from two backends at once.
        */
       apply: 'serve',
-      transformIndexHtml(html) {
-        return html.replace('</body>', `${DEV_BADGE_MARKUP}\n</body>`);
-      },
+      // **No `transformIndexHtml`.** The console page is served by the gateway,
+      // not by Vite, so a hook here only ever saw `ui/index.html` at `/` — a
+      // document `ui-dev` no longer opens (`/` redirects to `/admin/`). The
+      // badge is injected into the proxied response instead; see
+      // `proxyWithBadge` in `backendSwitch`.
     },
   ],
 
